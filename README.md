@@ -51,6 +51,17 @@ For direct text input, the optional adapter applies that template and decodes ID
 
 `flint eval` emits all vocabulary logits for every supplied token. It is diagnostic output, not an efficient serving protocol. `inspect` validates configuration only, not the complete checkpoint payload.
 
+### Use as Codegraff's local model
+
+`tools/codegraff_adapter.py` exposes loopback OpenAI chat/function-tool endpoints
+backed by one persistent native `flint session`. It uses the checkpoint's own
+local tokenizer/template, preserves exact native KV prefixes across compatible
+tool turns, and explicitly reports resets when history changes. All inference
+remains Zig/Metal; Python is only the transport/tokenizer/protocol bridge.
+See [Codegraff setup and verification](docs/CODEGRAFF.md) and the
+[project-router example](examples/codegraff-router.json). SSE is buffered, not
+token-live streaming. Full context allocation is not a filled-window benchmark.
+
 ## Performance and correctness
 
 The optimized staged configuration is selected explicitly with **`--staged-row-tile 2`**; tile 1 remains the default. A validated pre-extraction run of these kernels on an **M3 Ultra, 60 GPU cores, 256 GB unified memory** measured:

@@ -1,0 +1,8 @@
+{
+  "id": "nanoattention",
+  "name": "nanoattention native Flint",
+  "base_url": "http://127.0.0.1:8080/v1",
+  "env_key": "NANOATTENTION_API_KEY",
+  "default_model": "flint",
+  "takes_effort": false
+}
