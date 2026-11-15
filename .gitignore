@@ -1,0 +1,15 @@
+.zig-cache/
+zig-out/
+.lake/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+.graff/
+.harness/
+models/
+weights/
+*.safetensors
+*.gguf

@@ -1,0 +1,153 @@
+{
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "gpu_cores": 60,
+    "unified_memory_gib": 256
+  },
+  "build": {
+    "zig": "0.17.0",
+    "lean": "4.35.0",
+    "optimization": "ReleaseSafe",
+    "activation_and_kv_dtype": "FP32"
+  },
+  "checkpoint": {
+    "model": "RecursiveSI/flint",
+    "format": "affine INT4 export",
+    "mapped_bytes": 22568912600,
+    "shards": 5,
+    "weights_included": false
+  },
+  "execution": {
+    "mode": "staged",
+    "resident_workers": 0,
+    "resident_row_tile": 1,
+    "staged_row_tile": 2
+  },
+  "workload": {
+    "prompt_tokens": 21,
+    "decode_tokens": 64,
+    "repeats": 3,
+    "warmup_decode_tokens": 8,
+    "decode_protocol": "Identical teacher-forced code token IDs; reset caches; GPU completion and synchronous CPU greedy readback per token.",
+    "excluded": "Model loading, cache reset/creation, dtype conversion, warmup.",
+    "prefill_note": "Native serial per-token; MLX batched prompt."
+  },
+  "engines": {
+    "zig_fp32": {
+      "median_prefill_seconds": 0.157453,
+      "median_decode_seconds": 0.531578,
+      "prefill_tokens_per_second": 133.3731335700177,
+      "decode_tokens_per_second": 120.39625417154208,
+      "prefill_run_seconds": [
+        0.157852,
+        0.156666,
+        0.157453
+      ],
+      "decode_run_seconds": [
+        0.53252,
+        0.531578,
+        0.528391
+      ],
+      "submissions_per_token": [
+        1,
+        1,
+        1
+      ],
+      "dispatches_per_token": [
+        489,
+        489,
+        489
+      ],
+      "prefill_gpu_seconds": [
+        0.141209875,
+        0.140682792,
+        0.140662542
+      ],
+      "decode_gpu_seconds": [
+        0.476947625,
+        0.476710125,
+        0.476385542
+      ]
+    },
+    "mlx_fp32": {
+      "median_prefill_seconds": 0.03907004091888666,
+      "median_decode_seconds": 0.6609101669164374,
+      "prefill_tokens_per_second": 537.4962376824257,
+      "decode_tokens_per_second": 96.8361559614075,
+      "prefill_run_seconds": [
+        0.03907004091888666,
+        0.03902795899193734,
+        0.03917879203800112
+      ],
+      "decode_run_seconds": [
+        0.6762352091027424,
+        0.6595980410929769,
+        0.6609101669164374
+      ]
+    },
+    "mlx_bf16": {
+      "median_prefill_seconds": 0.03189958306029439,
+      "median_decode_seconds": 0.6959861250361428,
+      "prefill_tokens_per_second": 658.3158143574243,
+      "decode_tokens_per_second": 91.95585615543192,
+      "prefill_run_seconds": [
+        0.03189958306029439,
+        0.03184616600628942,
+        0.03323850000742823
+      ],
+      "decode_run_seconds": [
+        0.6817871249513701,
+        0.7155624169390649,
+        0.6959861250361428
+      ]
+    }
+  },
+  "standalone_verification": {
+    "unit_kernel_tests_passed": 42,
+    "lean_binding_tests_passed": 6,
+    "proof_verifier_tests_passed": 6,
+    "synthetic_checkpoint_cases_passed": 7,
+    "synthetic_max_absolute_logit_error": 1.37e-06,
+    "exact_generated_binding_check": "passed"
+  },
+  "full_checkpoint_parity": {
+    "scope": "Pre-extraction run; all native source and Lean proof files are byte-identical in this standalone extraction.",
+    "reference": "unsteered FP32 MLX",
+    "allclose_rtol": 0.002,
+    "allclose_atol": 0.002,
+    "results": {
+      "coding": {
+        "prompt_tokens": 21,
+        "generated_tokens": 16,
+        "evaluated_positions": 36,
+        "greedy_decode_agreement": 16,
+        "max_absolute_logit_error": 0.00028228759765625,
+        "rms_logit_error": 1.4823295714450069e-05,
+        "top1_agreement": 36
+      },
+      "heldout": {
+        "prompt_tokens": 13,
+        "generated_tokens": 16,
+        "evaluated_positions": 28,
+        "greedy_decode_agreement": 16,
+        "max_absolute_logit_error": 0.00026702880859375,
+        "rms_logit_error": 1.8945025658467785e-05,
+        "top1_agreement": 28
+      }
+    }
+  },
+  "comparison_limits": "Not a matched comparison against rec. No long-context, production-server, broad quality, bitwise, or overall MLX parity claim.",
+  "upstream_rec": {
+    "source": "https://github.com/recursive-oss/rec/blob/main/.github/assets/throughput.svg",
+    "chip": "Apple M4 Pro",
+    "unified_memory_gib": 48,
+    "weight_bits": 4,
+    "context_tokens_min_label": "1K",
+    "context_tokens_max_label": "252K",
+    "output_steps": 1024,
+    "repeats": 5,
+    "prefill_excluded": true,
+    "decode_tokens_per_second_at_1k": 131.2,
+    "decode_tokens_per_second_at_252k": 22.6
+  }
+}

@@ -1,0 +1,49 @@
+import ResidentProofs
+
+-- Optional proof-trust audit. Only Lean's standard logical axioms may occur;
+-- in particular there must be no sorryAx or executable/native-decision axiom.
+#print axioms Resident.binding_limits
+#print axioms Resident.router_register_ownership
+#print axioms Resident.router_register_bounds
+#print axioms Resident.dense_geometry
+#print axioms Resident.dense_column_coverage
+#print axioms Resident.dense_column_unique
+#print axioms Resident.dense_guarded_bounds
+#print axioms Resident.dense_column_advance
+#print axioms Resident.one_arrival_per_worker_bound
+#print axioms Resident.schedule_certificate
+#print axioms Resident.supported_layer_instruction
+#print axioms Resident.supported_length_bounds
+#print axioms Resident.instruction_bounds_certificate
+#print axioms Resident.row_worker_coverage
+#print axioms Resident.row_worker_unique
+#print axioms Resident.barrier_phase_advance_iff_last
+#print axioms Resident.barrier_last_resets
+#print axioms Resident.row_tile_admissible
+#print axioms Resident.row_tile_bounds
+#print axioms Resident.tiled_row_coverage
+#print axioms Resident.guarded_tiled_coverage
+#print axioms Resident.tiled_row_unique
+#print axioms Resident.tiled_row_guard
+#print axioms Resident.guarded_tiled_row_bounds
+#print axioms Resident.tiled_row_result
+#print axioms Resident.staged_row_coverage
+#print axioms Resident.staged_row_u32_bounds
+#print axioms Resident.qkv_interval_ownership
+#print axioms Resident.qkv_local_bounds
+#print axioms Resident.qkv_inverse_coverage
+#print axioms Resident.qkv_u32_bounds
+#print axioms Resident.qkv_staged_row_coverage
+#print axioms Resident.launch_simd_bounds
+#print axioms Resident.tiled_u32_bounds
+#print axioms Resident.tiled_iteration_u32
+#print axioms Resident.int4_code_bounds
+#print axioms Resident.int4_low_nibble_first
+#print axioms Resident.int4_chunk_indices
+#print axioms Resident.int4_group_word_bounds
+#print axioms Resident.int4_pair_indices
+#print axioms Resident.int4_pair_group
+#print axioms Resident.int4_pair_word_bounds
+#print axioms Resident.int4_split_reconstruction
+#print axioms Resident.int4_word_reconstruction
+#print axioms Resident.int4_affine_sum

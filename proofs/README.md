@@ -1,0 +1,218 @@
+# Resident execution-plan certificate
+
+This standalone Lean 4.35.0 project uses only `Std`: no packages, downloads,
+extra axioms, `sorry`, `admit`, `native_decide`, or unsafe proof shortcuts.
+
+From the repository root:
+
+```sh
+python3 tools/check_resident_proofs.py --generate  # intentional regeneration
+python3 tools/check_resident_proofs.py             # build proofs + exact drift check
+PYTHONDONTWRITEBYTECODE=1 python3 proofs/test_verifier.py
+zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig
+(cd proofs && lake env lean Audit.lean)            # inspect proof axiom dependencies
+```
+
+The verifier invokes `lake build` in this directory, executes the built Lean
+emitter once per language, and byte-compares both outputs without rewriting
+anything in verification mode. A missing/stale binding causes a nonzero exit.
+The native resident build should run this verifier before compilation. Neither
+binding should be reformatted independently of the Lean emitter.
+
+## Bound interface
+
+`Main.lean` emits `src/resident_plan.zig` and `src/resident_plan.metal` from the
+same definitions in `ResidentProofs.lean` that the kernel checks. The Zig module
+exports `threadgroup_size = 256`, `max_workers = 32`, `spin_limit = 10000000`,
+`max_layers = 49`, `row_tiles = [_]u32{1, 2, 4, 8}`,
+`router_lanes = 32`, `router_slots = 8`, `cached_router_experts = 256`,
+`dense_simds = 8`, `dense_max_cols = 8192`,
+`validRowTile(tile: u32) bool`, enum `Op`, and
+`program(layers: u32) ?[]const u32`.
+`program` returns a distinct immutable static array for each count **1..49**
+and `null` otherwise. The Metal binding exports matching
+`RESIDENT_THREADGROUP_SIZE`, `RESIDENT_MAX_WORKERS`, `RESIDENT_SPIN_LIMIT`,
+`RESIDENT_MAX_LAYERS`, `RESIDENT_ROW_TILE_1/2/4/8` (each expands to its
+numeric tile size), `STAGED_ROUTER_LANES`, `STAGED_ROUTER_SLOTS`,
+`STAGED_CACHED_ROUTER_EXPERTS`, and enum `ResidentOp`. The tile list and Zig predicate
+are emitted from `rowTiles`, the same definition used by `validRowTile` and
+`row_tile_admissible`. Unsupported sizes return false, including zero.
+The existing 1..49 schedules and all previous exported APIs are unchanged.
+
+The actual schedule, not an opaque hash, is generated:
+
+```
+[1] ++ concat(layer in 0..layers-1: [layer*256+2, ..., layer*256+11]) ++ [12,13]
+```
+
+Opcodes: embedding=1, input_norm=2, qkv=3, qk_rope_cache=4, attention=5,
+output_projection=6, residual_post_norm=7, router=8, route_topk=9,
+gate_up=10, down_reduce=11, final_norm=12, head=13. Dense layers keep 8/9
+as no-ops so their control schedule is identical. The interpreter must consume
+this array and perform its inter-worker barrier after **every** instruction.
+
+## Kernel-checked facts
+
+* `layerProgram_length`, `layerPrograms_length`, `makePlan_length`: exactly
+  ten instructions per layer and **10*layers+3** per program.
+  `supported_length_bounds` establishes **13..493** instructions for 1..49 layers;
+  `boundary_instructions` fixes embedding and the final normalization/head positions.
+* `schedule_certificate`, `supported_schedule`: for every supported count,
+  the concatenated plan equals an independently indexed specification. The
+  finite certificate actually covers 0..49; the exported API excludes zero.
+* `indexed_layer_instruction`, `supported_instruction_at`, and
+  `supported_layer_instruction`: layer `l` opcode `o` (2..11) occupies zero-based
+  position `10*l+o-1` in the actual emitted plan. `dependencies_in_layer` and
+  `dependencies_between_layers` order all layer stages and adjacent layers.
+* `instruction_bounds` proves byte decoding and UInt32 representability for
+  layer instructions. `instruction_bounds_certificate` and
+  `supported_instruction_bounds` cover **every** emitted instruction, including
+  embedding/final/head: nonzero opcode at most 13, layer less than 49,
+  unsigned 32-bit representability.
+* `row_worker_coverage`, `row_worker_unique`: every row has exactly one
+  worker/iteration decomposition `row = worker + iteration*workers` with
+  `worker < workers`, provided `workers > 0`. These facts have no fixed row
+  limit and use mathematical natural numbers, not wrapping machine arithmetic.
+* `barrier_phase_advance_iff_last`, `barrier_nonlast_preserves_phase`,
+  `barrier_last_resets`: an abstract arrival counter advances phase only on
+  the last arrival and resets its count. `OneArrivalPerWorker` explicitly
+  requires a duplicate-free list of valid worker IDs and a fresh, valid next
+  arrival; the theorem also assumes the counter equals that list's length.
+  `one_arrival_per_worker_bound` derives the counter bound from these premises.
+  The simple counter transition itself does **not** track worker identity or
+  prove that the native implementation maintains those premises.
+* `binding_limits` checks the four interface constants and
+  `opcode_table_complete` checks the numeric opcode table is exactly 1..13.
+
+## Register-cached routing bounds
+
+`router_register_ownership` proves that every expert below the generated
+capacity has a valid lane/slot decomposition, with lane `< 32`, slot `< 8`,
+and exact reconstruction `lane + slot*32 = expert`. `router_register_bounds`
+proves the converse index bound for each valid lane/slot. The host uses the
+emitted capacity to select the cached kernel or the generic fallback; the
+shader's arrays and iteration limits use the matching emitted macros.
+
+These facts certify the integer register layout, not top-k selection semantics,
+sigmoid arithmetic, Metal shuffles, or compiler register allocation. Those are
+checked empirically against the CPU reference and legacy GPU routing, including
+ties, partial expert counts, full-capacity selection, and nonfinite inputs.
+
+## Fused QKV and split dense projection certificates
+
+The staged INT4 QKV launch concatenates independently rounded-up Q, K, and V
+tile ranges. `Main.lean` renders `staged_qkv_projection` and
+`staged_qkv_local_tile` directly from the expression definitions checked in
+`ResidentProofs.lean`; Zig exports matching `stagedQkvProjection` and
+`stagedQkvLocalTile`. Certificates establish half-open interval ownership,
+local bounds, inverse coverage, reconstruction, and nonwrapping prefix sums
+under the explicit total-tile bound. Existing tiled-row proofs then cover each
+projection's guarded partial row tile. The shader consumes these helpers;
+weights remain separate mapped tensors.
+
+The split dense reduction uses eight SIMDs of 32 lanes, with columns
+`simd * 32 + lane + iteration * 256`. Lean proves constructive coverage,
+unique ownership, guarded read bounds, and nonwrapping advancement for widths
+at most 8192. Generated `STAGED_DENSE_SIMDS` / `STAGED_DENSE_MAX_COLS` and the
+matching Zig constants bind shader geometry and host eligibility. Compile-time
+assertions tie eight SIMDs to the existing 256-thread launch constant.
+
+Neither certificate proves FP32 reduction equivalence, Metal memory ordering,
+compiler behavior, or throughput. The split reduction changes summation
+association; CPU/GPU and full-model MLX comparisons remain separate empirical
+obligations. Binding tests cover empty projection ranges, independently partial
+QKV tiles, dense exact-once ownership, and integer boundary cases.
+
+## Tiled row and packed INT4 certificates
+
+For an abstract launch of **1..32 workers**, each with 256 threads and 32-lane
+SIMDs, there are `simds = workers*8`, hence **8..256 SIMDs**. The worker maximum
+bounds the currently admitted experiments; it does not certify simultaneous
+residency, device-memory coherence, or eventual barrier completion. A global SIMD index
+`s < simds` owns this tile in iteration `k`:
+
+```
+row0 = s*R + k*(simds*R)
+row = row0 + j           # 0 <= j < R; access only when row < rows
+R in {1,2,4,8}
+```
+
+* `row_tile_admissible` proves the checked predicate accepts exactly those
+  four sizes; `row_tile_bounds` gives `0 < R <= 8`.
+* `tiled_row_coverage` constructs the owner of any natural-number row:
+  `s = (row/R)%simds`, `k = (row/R)/simds`, `j = row%R`.
+  `guarded_tiled_coverage` additionally shows that a valid output row's
+  owner passes the outer `row0 < rows` loop test, so the row guard cannot
+  exclude a valid row. `tiled_row_unique` proves all three coordinates unique when
+  `simds > 0`, `R > 0`, `s < simds`, and `j < R`.
+  Together these give neither omissions nor duplicate ownership, including
+  partial final tiles. They do not assert that hardware executes each owner.
+* `tiled_row_guard` identifies the exact partial-tile mask
+  `j < rows-row0` for a tested `row0 < rows`.
+  `guarded_tiled_row_bounds` derives an output index below `rows` and `2^32`
+  when `rows <= 1048576`. Native code must actually apply the guard.
+* `staged_row_coverage` proves that `ceil(rows/R)` staged SIMDs cover every
+  valid output row, including the final partial tile. `staged_row_u32_bounds`
+  proves nonwrapping tile starts/candidates for `rows <= 1048576`; the final
+  `candidate < rows` guard remains mandatory. Staged grids do not inherit the
+  resident worker-count cap or require simultaneous group residency.
+* `launch_simd_bounds` derives the positive SIMD count and its upper bound
+  from the supported worker count. `tiled_u32_bounds` assumes
+  `rows <= 1048576`, `simds <= 256`, a valid tile, `s < simds`,
+  `start < rows`, and `j < R`. It proves stride at most **2048**, the initial
+  `s*R` representable, and both `start+j` and the **next** loop start
+  `start+simds*R` below `2^32` (also at most `rows+simds*R`).
+  `tiled_iteration_u32` bounds the multiplication `k*(simds*R)` and its sum
+  with `s*R` for an iteration whose tile start is below `rows`.
+  These are natural-number bounds supporting a nonwrapping implementation,
+  not a blanket theorem about arbitrary UInt32 counter expressions.
+* `tiled_row_result` transports **any opaque per-row result function** through
+  the ownership mapping unchanged. It justifies rescheduling the same row
+  computation, not changing its evaluation order or combining row reductions.
+* `int4_chunk_indices` proves that a 64-weight group contains eight packed
+  words of eight weights, with word/nibble quotient-remainder reconstruction.
+  `int4_group_word_bounds` bounds group and word indices assuming
+  `column < columns` and `columns % 64 = 0`.
+* `int4_pair_indices`, `int4_pair_group`, and `int4_pair_word_bounds` check
+  the 16-input/two-packed-word lane layout: exact word/column reconstruction,
+  one shared group-64 scale/bias pair for the entire segment, and bounded word
+  loads under the aligned-column premise. These are integer properties, not
+  proof that changing lane/reduction association preserves IEEE754 rounding.
+* `int4Code word lane = (word / 16^lane) % 16` specifies low-nibble-first
+  extraction. `int4_code_bounds` gives **0..15** for every lane;
+  `int4_low_nibble_first` fixes lane zero to `word%16`.
+  `int4_split_reconstruction` gives exact quotient/remainder reconstruction
+  at any nibble boundary. `int4_word_reconstruction` proves all eight
+  extracted nibbles reconstruct a word when `word < 2^32`.
+* `int4_affine_sum` proves exact distributivity for any list of mathematical
+  integer `(code, activation)` pairs, including lists of length eight:
+  `sum((scale*code+bias)*x) = scale*sum(code*x)+bias*sum(x)`.
+  **It is not an IEEE754 equivalence and does not authorize reassociation
+  of native floating-point operations.**
+
+## Assumptions and nonclaims
+
+These are integer schedule and abstract control-state theorems, **not a proof
+of the shader or a proof of performance**. Native code must use the generated
+values/schedules faithfully, decode instructions correctly, implement each
+opcode correctly, preserve the one-arrival-per-worker invariant, and barrier
+between instructions. The tiled row-index bounds and ideal INT4 packing facts above are conditional
+certificates, not proofs of arbitrary shader accesses. Device allocation sizes,
+row/column strides and address arithmetic, the correspondence of Metal bitwise
+shifts/masks to `int4Code`, actual threadgroup/lane configuration, all other
+integer counters, and spin-limit failure handling remain implementation
+obligations.
+
+The generated native emitter and textual artifact check remain part of the
+binding trust boundary: Lean does not prove the behavior of Zig/Metal parsers
+or the operating system's file writes. `Audit.lean` reports the standard Lean
+logical axioms used by generic tactic proofs; the two finite schedule/bounds
+certificates themselves depend on no axioms.
+
+The model does not establish Metal acquire/release semantics, visibility of
+non-atomic device buffers after atomic operations, compiler correctness,
+float/half rounding or numerical agreement, lack of data races, sufficient
+simultaneously resident threadgroups, GPU scheduling fairness, eventual
+arrival, or successful completion before the spin limit. There is no
+unconditional GPU-residency/liveness theorem. On-device execution, numerical
+checks, timeout handling and performance measurements remain necessary.

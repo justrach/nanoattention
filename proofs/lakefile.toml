@@ -1,0 +1,10 @@
+name = "residentProofs"
+version = "0.1.0"
+defaultTargets = ["ResidentProofs", "resident_emit"]
+
+[[lean_lib]]
+name = "ResidentProofs"
+
+[[lean_exe]]
+name = "resident_emit"
+root = "Main"
