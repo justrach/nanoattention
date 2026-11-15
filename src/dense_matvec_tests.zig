@@ -140,6 +140,103 @@ test "dense dtype-specialized matvec matches CPU and original with row tails and
     }
 }
 
+test "matched dense floating router 256x2048 matches independent FP64 with offsets and guards" {
+    const ctx = try metal.Context.initMatched(true);
+    defer ctx.deinit();
+    const rows = 256;
+    const n = 2048;
+    const guard = 4;
+    const w = try ctx.alloc(rows * n + guard);
+    defer w.deinit();
+    const x = try ctx.alloc(n + guard);
+    defer x.deinit();
+    const out = try ctx.alloc(rows + guard);
+    defer out.deinit();
+    const weights = try std.testing.allocator.alloc(f32, rows * n);
+    defer std.testing.allocator.free(weights);
+    const input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    var expected: [rows]f32 = undefined;
+    fillInput(input);
+    @memset(x.floats(), sentinel);
+    @memcpy(x.floats()[0..n], input);
+    for (split_kernels, 0..) |kernel, dtype| {
+        // Nonzero byte offsets, including half types not aligned to four bytes.
+        const offset: usize = if (dtype == 0) 12 else 2;
+        const width: usize = if (dtype == 0) 4 else 2;
+        fillWeights(weights);
+        packWeights(w.structs(u8), offset, @intCast(dtype), weights);
+        // Independent serial FP64 reference over the represented dtype values;
+        // do not mirror the shader's lane ownership or reduction tree.
+        cpuMatvec(weights, input, &expected);
+        @memset(out.floats(), sentinel);
+        const p: metal.Params = .{ .offset = offset, .n = n, .m = rows, .dtype = 99 };
+        // Preserve the production 256-thread/row launch, including excess groups
+        // that must return without touching guards or waiting at a barrier.
+        try ctx.dispatch(kernel, &.{ w, x, out }, p, (rows + guard) * 256, 256);
+        try ctx.finish();
+        for (out.floats()[0..rows]) |value| try std.testing.expect(std.math.isFinite(value));
+        try expectClose(&expected, out.floats()[0..rows], 2e-4);
+        for (out.floats()[rows..]) |value| try std.testing.expectEqual(sentinel, value);
+        try std.testing.expectEqualSlices(f32, input, x.floats()[0..n]);
+        for (x.floats()[n..]) |value| try std.testing.expectEqual(sentinel, value);
+        for (w.structs(u8)[0..offset]) |byte| try std.testing.expectEqual(byte_sentinel, byte);
+        for (w.structs(u8)[offset + rows * n * width ..]) |byte| try std.testing.expectEqual(byte_sentinel, byte);
+    }
+}
+
+test "matched FP32 packed router is bitwise identical to 256-thread rows with offsets and guards" {
+    const ctx = try metal.Context.initMatched(true);
+    defer ctx.deinit();
+    const rows = 256;
+    const n = 2048;
+    // Eight excess SIMDs form whole groups for every tested launch size.
+    const guard = 8;
+    const w = try ctx.alloc(rows * n + guard);
+    defer w.deinit();
+    const x = try ctx.alloc(n + guard);
+    defer x.deinit();
+    const original = try ctx.alloc(rows + guard);
+    defer original.deinit();
+    const out = try ctx.alloc(rows + guard);
+    defer out.deinit();
+    const weights = try std.testing.allocator.alloc(f32, rows * n);
+    defer std.testing.allocator.free(weights);
+    const input = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(input);
+    var expected: [rows]f32 = undefined;
+    fillWeights(weights);
+    fillInput(input);
+    @memset(x.floats(), sentinel);
+    @memcpy(x.floats()[0..n], input);
+    for ([_]usize{ 0, 12 }) |offset| {
+        packWeights(w.structs(u8), offset, 0, weights);
+        // Independent FP64 reference, not a CPU copy of the SIMD arithmetic.
+        cpuMatvec(weights, input, &expected);
+        const p: metal.Params = .{ .offset = offset, .n = n, .m = rows, .dtype = 99 };
+        @memset(original.floats(), sentinel);
+        try ctx.dispatch("dense_matvec_split_f32", &.{ w, x, original }, p, (rows + guard) * 256, 256);
+        try ctx.finish();
+        try expectClose(&expected, original.floats()[0..rows], 2e-4);
+        for ([_]usize{ 32, 64, 128, 256 }) |group| {
+            @memset(out.floats(), sentinel);
+            // 128 threads packs four actual rows, rather than retaining the
+            // split kernel's one-row-per-threadgroup group.x mapping.
+            try ctx.dispatch("dense_matvec_router_f32", &.{ w, x, out }, p, (rows + guard) * 32, group);
+            try ctx.finish();
+            try std.testing.expectEqualSlices(u32, original.structs(u32)[0..rows], out.structs(u32)[0..rows]);
+            for (out.floats()[0..rows]) |value| try std.testing.expect(std.math.isFinite(value));
+            try expectClose(&expected, out.floats()[0..rows], 2e-4);
+            for (original.floats()[rows..]) |value| try std.testing.expectEqual(sentinel, value);
+            for (out.floats()[rows..]) |value| try std.testing.expectEqual(sentinel, value);
+            try std.testing.expectEqualSlices(f32, input, x.floats()[0..n]);
+            for (x.floats()[n..]) |value| try std.testing.expectEqual(sentinel, value);
+            for (w.structs(u8)[0..offset]) |byte| try std.testing.expectEqual(byte_sentinel, byte);
+            for (w.structs(u8)[offset + rows * n * @sizeOf(f32) ..]) |byte| try std.testing.expectEqual(byte_sentinel, byte);
+        }
+    }
+}
+
 test "dense split matvec matches CPU and original kernels with fixed 256-thread groups" {
     const ctx = try metal.Context.init();
     defer ctx.deinit();

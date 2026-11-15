@@ -35,8 +35,10 @@ const Scratch = struct {
     k: Buffer,
     v: Buffer,
     attention: Buffer,
+    attention_scores: Buffer,
     projection: Buffer,
     activation: Buffer,
+    down_outputs: ?Buffer = null,
     router: Buffer,
     route_ids: Buffer,
     route_weights: Buffer,
@@ -65,6 +67,13 @@ pub const Model = struct {
     failed: bool = false,
     resident_execution: ?resident.Execution = null,
     staged_row_tile: u32 = 1,
+    head_row_tile: u32 = 0,
+    packed_router: bool = false,
+    parallel_down: bool = false,
+    down_row_tile: u32 = 0,
+    attention_chunk: u32 = 0,
+    mlx_attention: bool = false,
+    trace_position: ?u32 = null,
 
     pub fn init(gpa: std.mem.Allocator, ctx: metal.Context, directory: []const u8, context: u32) !Model {
         const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -166,6 +175,10 @@ pub const Model = struct {
             .k = try self.alloc(kvsize),
             .v = try self.alloc(kvsize),
             .attention = try self.alloc(qsize),
+            .attention_scores = try self.alloc(if (self.splitAttentionSupported())
+                @as(usize, cfg.num_attention_heads) * @max(context, resident.certified.mlxLargeDeviceBlocks(context) * resident.certified.mlx_attention_state_stride)
+            else
+                1),
             .projection = try self.alloc(hidden),
             .activation = try self.alloc(intermediate),
             .router = try self.alloc(cfg.num_experts),
@@ -213,12 +226,15 @@ pub const Model = struct {
         };
     }
     fn matvec(self: *const Model, w: Weight, x: Buffer, out: Buffer) !void {
+        return self.matvecTiled(w, x, out, self.staged_row_tile);
+    }
+    fn matvecTiled(self: *const Model, w: Weight, x: Buffer, out: Buffer, row_tile: u32) !void {
         var p = w.params();
         p.m = @intCast(w.tensor.shape[0]);
         p.n = @intCast(w.tensor.shape[1]);
         if (w.quant) |q| {
             const fast = q.bits == 4 and q.group_size == 64 and p.n % 64 == 0 and p.offset % 4 == 0;
-            const tile = if (fast) self.staged_row_tile else 1;
+            const tile = if (fast) row_tile else 1;
             const kernel: [:0]const u8 = if (!fast) "qmatvec" else switch (tile) {
                 2 => "staged_qmatvec_t2",
                 4 => "staged_qmatvec_t4",
@@ -227,8 +243,9 @@ pub const Model = struct {
             };
             try self.ctx.dispatch(kernel, &.{ w.buffer, q.scales, q.biases, x, out }, p, ((@as(usize, p.m) + tile - 1) / tile) * 32, 128);
         } else {
+            const packed_router = self.packed_router and self.mlx_attention and p.dtype == 0 and p.m == 256 and p.n == 2048;
             const split = p.m <= 256 and p.n >= 512 and p.n <= resident.certified.dense_max_cols and p.dtype <= 2;
-            const kernel: [:0]const u8 = if (split) switch (p.dtype) {
+            const kernel: [:0]const u8 = if (packed_router) "dense_matvec_router_f32" else if (split) switch (p.dtype) {
                 0 => "dense_matvec_split_f32",
                 1 => "dense_matvec_split_f16",
                 2 => "dense_matvec_split_bf16",
@@ -239,8 +256,8 @@ pub const Model = struct {
                 2 => "dense_matvec_bf16",
                 else => "matvec",
             };
-            const group: usize = if (split) resident.certified.threadgroup_size else 128;
-            const row_threads: usize = if (split) resident.certified.threadgroup_size else 32;
+            const group: usize = if (packed_router) 128 else if (split) resident.certified.threadgroup_size else 128;
+            const row_threads: usize = if (split and !packed_router) resident.certified.threadgroup_size else 32;
             try self.ctx.dispatch(kernel, &.{ w.buffer, x, out }, p, @as(usize, p.m) * row_threads, group);
         }
     }
@@ -271,7 +288,9 @@ pub const Model = struct {
         p.m = heads;
         p.n = dim;
         p.eps = @floatCast(self.cfg.rms_norm_eps);
-        if (heads == 1 and dim >= 512 and dim <= 8192) {
+        if (self.mlx_attention and heads == 1 and dim == resident.certified.aligned_norm_dim) {
+            try self.ctx.dispatch("rmsnorm_aligned", &.{ w.buffer, x, out }, p, resident.certified.aligned_norm_threads, resident.certified.aligned_norm_threads);
+        } else if (heads == 1 and dim >= 512 and dim <= 8192) {
             try self.ctx.dispatch("rmsnorm_parallel", &.{ w.buffer, x, out }, p, 256, 256);
         } else {
             try self.ctx.dispatch("rmsnorm", &.{ w.buffer, x, out }, p, @as(usize, heads) * 32, 32);
@@ -283,6 +302,12 @@ pub const Model = struct {
     fn describe(mlp: MLP) metal.MLP {
         return .{ .gate = mlp.gate.matrix(), .up = mlp.up.matrix(), .down = mlp.down.matrix() };
     }
+    /// Allocate candidate-only scratch outside inference timing. Default serving
+    /// retains its original fused-down path and does not allocate this buffer.
+    pub fn prepareParallelDown(self: *Model) !void {
+        if (self.scratch.down_outputs == null)
+            self.scratch.down_outputs = try self.alloc(try std.math.mul(usize, @as(usize, self.cfg.num_experts_per_tok) + 1, self.cfg.hidden_size));
+    }
     fn fusedMLP(self: *const Model, layer: Layer, routed: u32, shared_index: u32, stride: u32) !void {
         const s = self.scratch;
         const p: metal.Params = .{ .n = routed, .m = shared_index, .k = stride, .dim = self.cfg.hidden_size };
@@ -293,14 +318,27 @@ pub const Model = struct {
             8 => "staged_gate_up_t8",
             else => "fused_gate_up",
         };
-        const down: [:0]const u8 = switch (tile) {
+        const down_tile = if (self.down_row_tile == 0) tile else self.down_row_tile;
+        const down: [:0]const u8 = switch (down_tile) {
             2 => "staged_down_t2",
             4 => "staged_down_t4",
             8 => "staged_down_t8",
             else => "fused_down_reduce",
         };
         try self.ctx.dispatch(gate, &.{ layer.descriptors, s.norm, s.route_ids, s.activation }, p, (@as(usize, routed) + 1) * ((@as(usize, stride) + tile - 1) / tile) * 32, 128);
-        try self.ctx.dispatch(down, &.{ layer.descriptors, s.activation, s.route_ids, s.route_weights, s.x }, p, ((@as(usize, self.cfg.hidden_size) + tile - 1) / tile) * 32, 128);
+        if (self.parallel_down and self.mlx_attention and routed != 0) {
+            const parallel: [:0]const u8 = switch (down_tile) {
+                2 => "staged_down_parallel_t2",
+                4 => "staged_down_parallel_t4",
+                8 => "staged_down_parallel_t8",
+                else => "staged_down_parallel_t1",
+            };
+            const temporary = s.down_outputs orelse return error.ParallelDownNotPrepared;
+            try self.ctx.dispatch(parallel, &.{ layer.descriptors, s.activation, s.route_ids, s.route_weights, temporary }, p, (@as(usize, routed) + 1) * ((@as(usize, self.cfg.hidden_size) + down_tile - 1) / down_tile) * 32, 128);
+            try self.ctx.dispatch("staged_down_merge", &.{ temporary, s.route_weights, s.x }, p, self.cfg.hidden_size, 128);
+        } else {
+            try self.ctx.dispatch(down, &.{ layer.descriptors, s.activation, s.route_ids, s.route_weights, s.x }, p, ((@as(usize, self.cfg.hidden_size) + down_tile - 1) / down_tile) * 32, 128);
+        }
     }
     /// Opt-in resident execution. The Lean-certified program is consumed directly
     /// by one kernel; GPU residency and floating-point behavior are tested, not proved.
@@ -376,6 +414,24 @@ pub const Model = struct {
         };
         self.resident_execution = .{ .descriptor = descriptor, .layers = layer_buffer, .program = program, .control = try self.alloc(@sizeOf(resident.Control) / 4), .workers = workers };
     }
+    fn splitAttentionSupported(self: *const Model) bool {
+        return self.context <= resident.certified.attention_max_context and
+            self.cfg.num_attention_heads <= resident.certified.attention_max_heads and
+            self.cfg.num_key_value_heads <= resident.certified.attention_max_heads and
+            self.cfg.head_dim <= resident.certified.attention_max_dim;
+    }
+    pub fn enableMlxAttention(self: *Model) !void {
+        if (self.cfg.head_dim != resident.certified.mlx_attention_dim or !self.splitAttentionSupported() or self.cfg.num_attention_heads / self.cfg.num_key_value_heads > resident.certified.mlx_attention_max_gqa) return error.UnsupportedAttentionShape;
+        if (self.context >= 16384 and (!self.ctx.isM3Ultra() or self.cfg.num_attention_heads / self.cfg.num_key_value_heads != 8)) return error.UnsupportedLongContextAttentionDevice;
+        if (self.position != 0 or self.failed or self.resident_execution != null or self.attention_chunk != 0) return error.ConflictingAttentionMode;
+        self.mlx_attention = true;
+    }
+    pub fn setAttentionChunk(self: *Model, chunk: u32) !void {
+        if (chunk != 0 and !resident.certified.validAttentionChunk(chunk)) return error.InvalidAttentionChunk;
+        if (self.position != 0 or self.failed) return error.AttentionTuningNeedsFreshSequence;
+        if (self.resident_execution != null) return error.AttentionTuningRequiresStaged;
+        self.attention_chunk = chunk;
+    }
     pub fn setStagedRowTile(self: *Model, tile: u32) !void {
         if (!resident.certified.validRowTile(tile)) return error.InvalidStagedRowTile;
         if (self.position != 0 or self.failed) return error.ResidentModeNeedsFreshSequence;
@@ -423,7 +479,34 @@ pub const Model = struct {
         self.failed = false;
         // No memset required: every cache entry is written before it can be read.
     }
+    fn trace(self: *Model, layer: usize, stage: []const u8, buffer: Buffer, count: usize) !void {
+        if (self.trace_position == null or self.trace_position.? != self.position) return;
+        try self.ctx.finish();
+        if (std.mem.eql(u8, stage, "route_ids")) {
+            try @import("diagnostics.zig").emit(self.position, layer, stage, buffer.structs(u32)[0..count]);
+        } else {
+            try @import("diagnostics.zig").emit(self.position, layer, stage, buffer.floats()[0..count]);
+        }
+        // A diagnostic completion starts a new encoder; GPU-address weights
+        // must be declared resident again before subsequent indirect accesses.
+        try self.store.resident(self.ctx);
+    }
+    /// Append every prefix token to KV, but materialize vocabulary logits only
+    /// for the final token. The resident plan remains unchanged and falls back
+    /// to its full forward; staged execution omits only the terminal norm/head.
+    pub fn prefill(self: *Model, tokens: []const u32) ![]const f32 {
+        if (self.failed) return error.ModelNeedsReset;
+        if (tokens.len == 0) return error.EmptyPrompt;
+        for (tokens) |token| if (token >= self.cfg.vocab_size) return error.InvalidToken;
+        if (@as(u64, self.position) + tokens.len > self.context) return error.ContextExhausted;
+        var logits: []const f32 = &.{};
+        for (tokens, 0..) |token, i| logits = try self.forwardImpl(token, i + 1 == tokens.len);
+        return logits;
+    }
     pub fn forward(self: *Model, token: u32) ![]const f32 {
+        return self.forwardImpl(token, true);
+    }
+    fn forwardImpl(self: *Model, token: u32, emit_logits: bool) ![]const f32 {
         if (self.failed) return error.ModelNeedsReset;
         if (token >= self.cfg.vocab_size) return error.InvalidToken;
         if (self.position >= self.context) return error.ContextExhausted;
@@ -442,9 +525,15 @@ pub const Model = struct {
         } else {
             try self.ctx.dispatch("embedding", &.{ self.embedding.buffer, s.x }, ep, c.hidden_size, 128);
         }
+        try self.trace(0, "embedding", s.x, c.hidden_size);
         for (self.layers, 0..) |layer, i| {
+            try self.trace(i, "input", s.x, c.hidden_size);
             try self.norm(layer.input_norm, s.x, s.norm, 1, c.hidden_size);
+            try self.trace(i, "input_norm", s.norm, c.hidden_size);
             try self.qkv(layer);
+            try self.trace(i, "q_raw", s.q, c.num_attention_heads * c.head_dim);
+            try self.trace(i, "k_raw", s.k, c.num_key_value_heads * c.head_dim);
+            try self.trace(i, "v_raw", s.v, c.num_key_value_heads * c.head_dim);
             var qp = layer.q_norm.params();
             qp.scale_offset = layer.k_norm.tensor.offset;
             qp.scale_dtype = @backingInt(layer.k_norm.tensor.dtype);
@@ -454,9 +543,11 @@ pub const Model = struct {
             qp.pos = self.position;
             qp.capacity = layer.capacity;
             qp.eps = @floatCast(c.rms_norm_eps);
-            qp.theta = @floatCast(c.rope_theta);
+            qp.theta = if (self.mlx_attention) @log2(@as(f32, @floatCast(c.rope_theta))) else @floatCast(c.rope_theta);
             qp.bits = @intFromBool(c.rope(i));
-            try self.ctx.dispatch("qk_rope_cache_fused", &.{ s.q, s.k, s.v, layer.q_norm.buffer, layer.k_norm.buffer, layer.keys, layer.values }, qp, @as(usize, c.num_attention_heads + c.num_key_value_heads) * 32, 32);
+            try self.ctx.dispatch(if (self.mlx_attention and c.head_dim == resident.certified.aligned_head_dim) "qk_rope_cache_aligned" else "qk_rope_cache_fused", &.{ s.q, s.k, s.v, layer.q_norm.buffer, layer.k_norm.buffer, layer.keys, layer.values }, qp, @as(usize, c.num_attention_heads + c.num_key_value_heads) * 32, 32);
+            try self.trace(i, "q", s.q, c.num_attention_heads * c.head_dim);
+            try self.trace(i, "k", s.k, c.num_key_value_heads * c.head_dim);
             var ap = layer.sink.params();
             ap.n = c.num_key_value_heads * c.head_dim;
             ap.pos = self.position;
@@ -466,36 +557,67 @@ pub const Model = struct {
             ap.dim = c.head_dim;
             ap.window = if (c.sliding(i)) c.sliding_window else 0;
             ap.scale = 1 / @sqrt(@as(f32, @floatFromInt(c.head_dim)));
-            const parallel_attention = self.position >= 4;
-            const attention_group: usize = if (parallel_attention) 256 else 32;
-            try self.ctx.dispatch(if (parallel_attention) "attention_parallel" else "attention", &.{ s.q, layer.keys, layer.values, layer.sink.buffer, s.attention }, ap, @as(usize, c.num_attention_heads) * attention_group, attention_group);
+            const length = if (ap.window == 0) self.position + 1 else @min(self.position + 1, ap.window);
+            if (self.mlx_attention and c.head_dim == 128 and c.num_attention_heads / c.num_key_value_heads <= 32) {
+                if (length >= 1024) {
+                    // MLX's applegpu_g15d GQA8 schedule changes at 16K and 64K.
+                    ap.k = resident.certified.mlxLargeDeviceBlocks(length);
+                    const threads: usize = resident.certified.mlx_attention_lanes * (c.num_attention_heads / c.num_key_value_heads);
+                    try self.ctx.dispatch("attention_mlx_split", &.{ s.q, layer.keys, layer.values, layer.sink.buffer, s.attention_scores }, ap, @as(usize, c.num_key_value_heads) * ap.k * threads, threads);
+                    try self.ctx.dispatch("attention_mlx_merge", &.{ s.attention_scores, s.attention }, ap, @as(usize, c.num_attention_heads) * (resident.certified.mlx_attention_lanes * resident.certified.mlx_attention_merge_simds), resident.certified.mlx_attention_lanes * resident.certified.mlx_attention_merge_simds);
+                } else {
+                    try self.ctx.dispatch("attention_mlx_single", &.{ s.q, layer.keys, layer.values, layer.sink.buffer, s.attention }, ap, @as(usize, c.num_attention_heads) * (resident.certified.mlx_attention_lanes * resident.certified.mlx_attention_single_simds), resident.certified.mlx_attention_lanes * resident.certified.mlx_attention_single_simds);
+                }
+            } else if (self.attention_chunk != 0 and length >= 512 and self.splitAttentionSupported()) {
+                ap.bits = self.attention_chunk;
+                ap.k = (length + ap.bits - 1) / ap.bits;
+                const threads = resident.certified.attention_simds * resident.certified.attention_lanes;
+                try self.ctx.dispatch("attention_scores", &.{ s.q, layer.keys, s.attention_scores }, ap, @as(usize, c.num_attention_heads) * ap.k * threads, threads);
+                try self.ctx.dispatch("attention_ordered_values", &.{ s.attention_scores, layer.values, layer.sink.buffer, s.attention }, ap, @as(usize, c.num_attention_heads) * threads, threads);
+            } else {
+                const parallel_attention = self.position >= 4;
+                const attention_group: usize = if (parallel_attention) 256 else 32;
+                try self.ctx.dispatch(if (parallel_attention) "attention_parallel" else "attention", &.{ s.q, layer.keys, layer.values, layer.sink.buffer, s.attention }, ap, @as(usize, c.num_attention_heads) * attention_group, attention_group);
+            }
+            try self.trace(i, "attention", s.attention, c.num_attention_heads * c.head_dim);
             try self.matvec(layer.o, s.attention, s.projection);
+            try self.trace(i, "projection", s.projection, c.hidden_size);
             if (c.hidden_size <= 8192) {
                 var np = layer.post_norm.params();
                 np.n = c.hidden_size;
                 np.eps = @floatCast(c.rms_norm_eps);
-                try self.ctx.dispatch("residual_norm", &.{ layer.post_norm.buffer, s.x, s.projection, s.norm }, np, 256, 256);
+                const aligned = self.mlx_attention and c.hidden_size == resident.certified.aligned_norm_dim;
+                const norm_threads: usize = if (aligned) resident.certified.aligned_norm_threads else 256;
+                try self.ctx.dispatch(if (aligned) "residual_norm_aligned" else "residual_norm", &.{ layer.post_norm.buffer, s.x, s.projection, s.norm }, np, norm_threads, norm_threads);
             } else {
                 try self.add(s.x, s.projection, 1);
                 try self.norm(layer.post_norm, s.x, s.norm, 1, c.hidden_size);
             }
+            try self.trace(i, "residual", s.x, c.hidden_size);
+            try self.trace(i, "post_norm", s.norm, c.hidden_size);
             if (layer.dense != null) {
                 try self.fusedMLP(layer, 0, 0, c.intermediate_size);
             } else {
                 try self.matvec(layer.router.?, s.norm, s.router);
+                try self.trace(i, "router", s.router, c.num_experts);
                 const route_kernel: [:0]const u8 = if (c.num_experts <= resident.certified.cached_router_experts) "route_topk_cached" else "route_topk";
                 try self.ctx.dispatch(route_kernel, &.{ s.router, layer.bias.?, s.route_ids, s.route_weights, s.route_error }, .{ .n = c.num_experts_per_tok, .m = c.num_experts }, 32, 32);
+                try self.trace(i, "route_ids", s.route_ids, c.num_experts_per_tok);
+                try self.trace(i, "route_weights", s.route_weights, c.num_experts_per_tok);
                 try self.fusedMLP(layer, c.num_experts_per_tok, c.num_experts, @max(c.moe_intermediate_size, c.shared_expert_intermediate_size));
             }
+            try self.trace(i, "output", s.x, c.hidden_size);
         }
-        try self.norm(self.final_norm, s.x, s.norm, 1, c.hidden_size);
-        try self.matvec(self.head, s.norm, s.logits);
+        if (emit_logits) {
+            try self.norm(self.final_norm, s.x, s.norm, 1, c.hidden_size);
+            try self.matvecTiled(self.head, s.norm, s.logits, if (self.head_row_tile == 0) self.staged_row_tile else self.head_row_tile);
+        }
         try self.ctx.finish();
         const after = self.ctx.stats();
         self.last_execution = .{ .submissions = after.submissions - before.submissions, .dispatches = after.dispatches - before.dispatches, .barriers = after.barriers - before.barriers, .gpu_seconds = after.gpu_seconds - before.gpu_seconds };
         if (s.route_error.structs(u32)[0] != 0) return error.NonFiniteLogits;
         self.position += 1;
-        return s.logits.floats();
+        return if (emit_logits) s.logits.floats() else &.{};
     }
 };
 

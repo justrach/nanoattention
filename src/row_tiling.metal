@@ -22,12 +22,25 @@ inline void matrix_dot_rows(Matrix m, device const float *x,
     device const uint *packed = (device const uint *)m.w;
     for (uint segment = lane; segment < m.cols / 16; segment += 32) {
         float values[16], input_sum = 0;
+#if FLINT_MLX_MATH
+        #pragma unroll
+        for (uint j = 0; j < 16; j += 4) {
+            float value0 = x[segment * 16 + j], value1 = x[segment * 16 + j + 1];
+            float value2 = x[segment * 16 + j + 2], value3 = x[segment * 16 + j + 3];
+            input_sum += value0 + value1 + value2 + value3;
+            values[j] = value0;
+            values[j + 1] = value1 / 16.0f;
+            values[j + 2] = value2 / 256.0f;
+            values[j + 3] = value3 / 4096.0f;
+        }
+#else
         #pragma unroll
         for (uint j = 0; j < 16; ++j) {
             float value = x[segment * 16 + j];
             input_sum += value;
             values[j] = value * (1.0f / float(1u << ((j & 3u) * 4)));
         }
+#endif
         #pragma unroll
         for (uint r = 0; r < Rows; ++r) {
             uint row = first + r;
@@ -38,6 +51,18 @@ inline void matrix_dot_rows(Matrix m, device const float *x,
             float scale = weight(m.scales, 0, m.scale_dtype, group);
             float bias = weight(m.biases, 0, m.bias_dtype, group);
             float dot = 0;
+#if FLINT_MLX_MATH
+            #pragma unroll
+            for (uint j = 0; j < 16; j += 4) {
+                uint codes = j < 8 ? codes0 : codes1;
+                uint half_word = (j & 7u) < 4 ? codes : codes >> 16;
+                dot += (values[j] * float(half_word & 0x000fu) +
+                        values[j + 1] * float(half_word & 0x00f0u) +
+                        values[j + 2] * float(half_word & 0x0f00u) +
+                        values[j + 3] * float(half_word & 0xf000u));
+            }
+            sums[r] += scale * dot + input_sum * bias;
+#else
             #pragma unroll
             for (uint j = 0; j < 16; ++j) {
                 uint codes = j < 8 ? codes0 : codes1;
@@ -45,6 +70,7 @@ inline void matrix_dot_rows(Matrix m, device const float *x,
                 dot += float(half_word & (15u << ((j & 3u) * 4))) * values[j];
             }
             sums[r] += scale * dot + bias * input_sum;
+#endif
         }
     }
 }
@@ -135,12 +161,25 @@ inline void matrix_gate_up_rows(Matrix gate, Matrix up, device const float *x,
     device const uint *uw = (device const uint *)up.w;
     for (uint segment = lane; segment < gate.cols / 16; segment += 32) {
         float values[16], input_sum = 0;
+#if FLINT_MLX_MATH
+        #pragma unroll
+        for (uint j = 0; j < 16; j += 4) {
+            float value0 = x[segment * 16 + j], value1 = x[segment * 16 + j + 1];
+            float value2 = x[segment * 16 + j + 2], value3 = x[segment * 16 + j + 3];
+            input_sum += value0 + value1 + value2 + value3;
+            values[j] = value0;
+            values[j + 1] = value1 / 16.0f;
+            values[j + 2] = value2 / 256.0f;
+            values[j + 3] = value3 / 4096.0f;
+        }
+#else
         #pragma unroll
         for (uint j = 0; j < 16; ++j) {
             float value = x[segment * 16 + j];
             input_sum += value;
             values[j] = value * (1.0f / float(1u << ((j & 3u) * 4)));
         }
+#endif
         #pragma unroll
         for (uint r = 0; r < Rows; ++r) {
             uint row = first + r;
@@ -149,6 +188,26 @@ inline void matrix_gate_up_rows(Matrix gate, Matrix up, device const float *x,
             uint g0 = gw[base], g1 = gw[base + 1], u0 = uw[base], u1 = uw[base + 1];
             uint group = row * row_groups + segment / 4;
             float gd = 0, ud = 0;
+#if FLINT_MLX_MATH
+            #pragma unroll
+            for (uint j = 0; j < 16; j += 4) {
+                uint gc = j < 8 ? g0 : g1, uc = j < 8 ? u0 : u1;
+                uint gh = (j & 7u) < 4 ? gc : gc >> 16;
+                uint uh = (j & 7u) < 4 ? uc : uc >> 16;
+                gd += (values[j] * float(gh & 0x000fu) +
+                       values[j + 1] * float(gh & 0x00f0u) +
+                       values[j + 2] * float(gh & 0x0f00u) +
+                       values[j + 3] * float(gh & 0xf000u));
+                ud += (values[j] * float(uh & 0x000fu) +
+                       values[j + 1] * float(uh & 0x00f0u) +
+                       values[j + 2] * float(uh & 0x0f00u) +
+                       values[j + 3] * float(uh & 0xf000u));
+            }
+            gates[r] += weight(gate.scales, 0, gate.scale_dtype, group) * gd +
+                        input_sum * weight(gate.biases, 0, gate.bias_dtype, group);
+            ups[r] += weight(up.scales, 0, up.scale_dtype, group) * ud +
+                      input_sum * weight(up.biases, 0, up.bias_dtype, group);
+#else
             #pragma unroll
             for (uint j = 0; j < 16; ++j) {
                 uint gc = j < 8 ? g0 : g1, uc = j < 8 ? u0 : u1;
@@ -162,6 +221,7 @@ inline void matrix_gate_up_rows(Matrix gate, Matrix up, device const float *x,
                         weight(gate.biases, 0, gate.bias_dtype, group) * input_sum;
             ups[r] += weight(up.scales, 0, up.scale_dtype, group) * ud +
                       weight(up.biases, 0, up.bias_dtype, group) * input_sum;
+#endif
         }
     }
 }
@@ -182,7 +242,7 @@ inline void staged_gate_up(device const MLP *experts, device const float *x,
     for (uint r = 0; r < Rows; ++r) {
         float gate = simd_sum(gates[r]), up = simd_sum(ups[r]);
         if (lane == 0 && first + r < mlp.gate.rows)
-            activation[route * p.k + first + r] = (gate / (1.0f + exp(-gate))) * up;
+            activation[route * p.k + first + r] = swiglu_product(gate, up);
     }
 }
 template<uint Rows>
@@ -193,7 +253,13 @@ inline void staged_down(device const MLP *experts, device const float *activatio
     if (first >= p.dim) return;
     float outputs[Rows];
     #pragma unroll
-    for (uint r = 0; r < Rows; ++r) outputs[r] = lane == 0 && first + r < p.dim ? residual[first + r] : 0;
+    for (uint r = 0; r < Rows; ++r) {
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+        outputs[r] = 0;
+#else
+        outputs[r] = lane == 0 && first + r < p.dim ? residual[first + r] : 0;
+#endif
+    }
     for (uint route = 0; route <= p.n; ++route) {
         uint expert = route < p.n ? ids[route] : p.m;
         float sums[Rows];
@@ -201,12 +267,18 @@ inline void staged_down(device const MLP *experts, device const float *activatio
         #pragma unroll
         for (uint r = 0; r < Rows; ++r) {
             float sum = simd_sum(sums[r]);
-            if (lane == 0) outputs[r] += sum * (route < p.n ? weights[route] : 1.0f);
+            if (lane == 0) outputs[r] += mixture_product(sum, route < p.n ? weights[route] : 1.0f);
         }
     }
     #pragma unroll
     for (uint r = 0; r < Rows; ++r)
-        if (lane == 0 && first + r < p.dim) residual[first + r] = outputs[r];
+        if (lane == 0 && first + r < p.dim) {
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+            residual[first + r] = residual[first + r] + outputs[r];
+#else
+            residual[first + r] = outputs[r];
+#endif
+        }
 }
 #define STAGED_TILE_ENTRY(Rows) \
 kernel void staged_qmatvec_t##Rows(device const uchar *w [[buffer(0)]], device const uchar *scales [[buffer(1)]], \
@@ -234,3 +306,59 @@ STAGED_TILE_ENTRY(2)
 STAGED_TILE_ENTRY(4)
 STAGED_TILE_ENTRY(8)
 #undef STAGED_TILE_ENTRY
+
+// Independent expert-major down projections. Keep the existing per-row dot
+// helper and SIMD reduction unchanged; materialize raw (unweighted) results so
+// the following dispatch can retain the serial mixture's exact route order.
+// Buffer ABI matches staged_down; buffer 4 is now route-major temporary storage.
+template<uint Rows>
+inline void staged_down_parallel(device const MLP *experts, device const float *activation,
+                                 device const uint *ids, device float *temporary,
+                                 constant P &p, uint i, uint lane) {
+    if (p.dim == 0) return;
+    uint tiles_per_route = (p.dim + Rows - 1) / Rows;
+    uint tile = i / 32, route = tile / tiles_per_route;
+    if (route > p.n) return;
+    uint first = (tile % tiles_per_route) * Rows;
+    if (first >= p.dim) return;
+    uint expert = route < p.n ? ids[route] : p.m;
+    float sums[Rows];
+    matrix_dot_rows<Rows>(experts[expert].down, activation + route * p.k, first, lane, sums);
+    #pragma unroll
+    for (uint r = 0; r < Rows; ++r) {
+        float sum = simd_sum(sums[r]);
+        if (lane == 0 && first + r < p.dim)
+            temporary[route * p.dim + first + r] = sum;
+    }
+}
+#define STAGED_DOWN_PARALLEL_ENTRY(Rows) \
+kernel void staged_down_parallel_t##Rows(device const MLP *experts [[buffer(0)]], \
+    device const float *activation [[buffer(1)]], device const uint *ids [[buffer(2)]], \
+    device const float *weights [[buffer(3)]], device float *temporary [[buffer(4)]], \
+    constant P &p [[buffer(8)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
+    staged_down_parallel<Rows>(experts, activation, ids, temporary, p, i, lane); \
+}
+STAGED_DOWN_PARALLEL_ENTRY(1)
+STAGED_DOWN_PARALLEL_ENTRY(2)
+STAGED_DOWN_PARALLEL_ENTRY(4)
+STAGED_DOWN_PARALLEL_ENTRY(8)
+#undef STAGED_DOWN_PARALLEL_ENTRY
+
+kernel void staged_down_merge(device const float *temporary [[buffer(0)]],
+                              device const float *weights [[buffer(1)]],
+                              device float *residual [[buffer(2)]], constant P &p [[buffer(8)]],
+                              uint row [[thread_position_in_grid]]) {
+    if (row >= p.dim) return;
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    float output = 0;
+#else
+    float output = residual[row];
+#endif
+    for (uint route = 0; route <= p.n; ++route)
+        output += mixture_product(temporary[route * p.dim + row], route < p.n ? weights[route] : 1.0f);
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    residual[row] = residual[row] + output;
+#else
+    residual[row] = output;
+#endif
+}

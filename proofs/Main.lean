@@ -44,8 +44,19 @@ def zigSource : String := Id.run do
     "// Dense split reduction: integer ownership/bounds only; not reduction arithmetic.",
     s!"pub const dense_simds: u32 = {denseSimds};",
     s!"pub const dense_max_cols: u32 = {denseMaxCols};",
+    "// Split attention: integer ownership/index bounds only; no floating-point or memory-model claim.",
+    s!"pub const attention_max_context: u32 = {attentionMaxContext};",
+    s!"pub const attention_max_heads: u32 = {attentionMaxHeads};",
+    s!"pub const attention_max_dim: u32 = {attentionMaxDim};",
+    s!"pub const attention_simds: u32 = {attentionSimds};",
+    s!"pub const attention_lanes: u32 = {attentionLanes};",
+    "pub const attention_chunks = [_]u32{" ++ joined (attentionChunks.map toString) ++ "};",
+    "pub fn validAttentionChunk(chunk: u32) bool {", "    return switch (chunk) {",
+    "        " ++ joined (attentionChunks.map toString) ++ " => true,",
+    "        else => false,", "    };", "}",
     "comptime {",
     "    if (dense_simds * router_lanes != threadgroup_size) @compileError(\"dense geometry mismatch\");",
+    "    if (attention_simds * attention_lanes != threadgroup_size) @compileError(\"attention geometry mismatch\");",
     "}",
     s!"pub const router_slots: u32 = {routerSlots};",
     s!"pub const cached_router_experts: u32 = {cachedRouterExperts};",
@@ -56,7 +67,20 @@ def zigSource : String := Id.run do
     "// Requires tile < qtiles + ktiles + vtiles < 2^32 (sum in natural numbers).",
     qkvHelperSource false "stagedQkvProjection" qkvProjectionExpr,
     qkvHelperSource false "stagedQkvLocalTile" qkvLocalTileExpr, "",
-    "pub const Op = enum(u32) {"]
+    ""]
+  let geometryLines := ["// MLX candidate/aligned norm: integer ownership only; no FP, Metal-model or liveness claim."] ++
+    mlxGeometryConstants.map (fun (name, value) => s!"pub const {name}: u32 = {value};") ++
+    ["pub const mlx_attention_blocks = [_]u32{" ++ joined (mlxAttentionBlocks.map toString) ++ "};",
+     "pub fn validMlxAttentionBlocks(blocks: u32) bool {", "    return switch (blocks) {",
+     "        " ++ joined (mlxAttentionBlocks.map toString) ++ " => true,",
+     "        else => false,", "    };", "}",
+     "// Flint GQA8 / apple_g15d host policy only; no universal MLX or performance claim.",
+     "// Caller must separately enforce supported context, device, GQA and shape.",
+     "pub fn mlxLargeDeviceBlocks(length: u32) u32 {",
+     s!"    return if (length < {mlxLargeDevice512MinLength}) {mlxLargeDeviceBlocks 0}",
+     s!"        else if (length < {mlxLargeDevice1024MinLength}) {mlxLargeDeviceBlocks mlxLargeDevice512MinLength}",
+     s!"        else {mlxLargeDeviceBlocks mlxLargeDevice1024MinLength};", "}"]
+  lines := lines ++ geometryLines ++ ["pub const Op = enum(u32) {"]
   for (name, opcode) in operations do
     lines := lines ++ [s!"    {name} = {opcode},"]
   lines := lines ++ ["};", ""]
@@ -84,11 +108,26 @@ def metalSource : String := Id.run do
     "// Dense split reduction: integer ownership/bounds only; not reduction arithmetic.",
     s!"#define STAGED_DENSE_SIMDS {denseSimds}",
     s!"#define STAGED_DENSE_MAX_COLS {denseMaxCols}",
+    "// Split attention: integer ownership/index bounds only; no floating-point or memory-model claim.",
+    s!"#define STAGED_ATTENTION_SIMDS {attentionSimds}",
+    s!"#define STAGED_ATTENTION_LANES {attentionLanes}",
+    s!"#define STAGED_ATTENTION_MAX_CONTEXT {attentionMaxContext}",
+    s!"#define STAGED_ATTENTION_MAX_HEADS {attentionMaxHeads}",
+    s!"#define STAGED_ATTENTION_MAX_DIM {attentionMaxDim}",
+    "#if STAGED_ATTENTION_SIMDS * STAGED_ATTENTION_LANES != RESIDENT_THREADGROUP_SIZE",
+    "#error attention geometry mismatch", "#endif",
     "#if STAGED_DENSE_SIMDS * STAGED_ROUTER_LANES != RESIDENT_THREADGROUP_SIZE",
     "#error dense geometry mismatch",
     "#endif",
     s!"#define STAGED_ROUTER_SLOTS {routerSlots}",
     s!"#define STAGED_CACHED_ROUTER_EXPERTS {cachedRouterExperts}"]
+  lines := lines ++ ["// MLX candidate/aligned norm: integer ownership only; no FP, Metal-model or liveness claim."]
+  for (name, value) in mlxGeometryConstants do
+    lines := lines ++ [s!"#define STAGED_{name.toUpper} {value}"]
+  for blocks in mlxAttentionBlocks do
+    lines := lines ++ [s!"#define STAGED_MLX_ATTENTION_BLOCKS_{blocks} {blocks}"]
+  for chunk in attentionChunks do
+    lines := lines ++ [s!"#define STAGED_ATTENTION_CHUNK_{chunk} {chunk}"]
   for tile in rowTiles do
     lines := lines ++ [s!"#define RESIDENT_ROW_TILE_{tile} {tile}"]
   lines := lines ++ ["",

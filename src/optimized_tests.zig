@@ -2,7 +2,15 @@ const std = @import("std");
 const metal = @import("metal.zig");
 
 test "packed INT4 group-64 vector matvec matches scalar affine reference with offsets" {
-    const ctx = try metal.Context.init();
+    try checkPacked(false);
+}
+
+test "MLX-grouped packed INT4 matvec matches scalar affine reference" {
+    try checkPacked(true);
+}
+
+fn checkPacked(matched: bool) !void {
+    const ctx = try metal.Context.initMatched(matched);
     defer ctx.deinit();
     const storage = try ctx.alloc(33); // 4-byte offset plus two 128-value INT4 rows.
     defer storage.deinit();

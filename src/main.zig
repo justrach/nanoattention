@@ -23,9 +23,16 @@ const usage =
     \\  flint generate CHECKPOINT --tokens 150000,123,456 [--max-tokens 32] [--context 2048]
     \\  flint generate CHECKPOINT --tokens-file prompt.json [--max-tokens 32] [--context 2048]
     \\  flint eval CHECKPOINT --tokens 0,2,3 [--context 2048]
+    \\  flint session CHECKPOINT --context 32768 --mlx-attention 1 --staged-row-tile 2
+    \\session accepts JSONL on stdin with new tokens/max_tokens and retains KV until EOF.
+    \\Every generated token, including EOS, is committed to KV before its response.
     \\
     \\generate emits a JSON object with greedy-generated token IDs, including EOS.
     \\eval emits one JSON logits array per input token, for numerical verification.
+    \\Optional eval --logits-from N emits only positions >= N; all inputs still execute.
+    \\Staged attention: --attention-chunk 0|128|256|512|1024 (default 0; split attention is experimental).
+    \\Experimental: --mlx-attention 1 uses MLX-layout attention and matched FP32 reductions.
+    \\It requires staged D128 attention and conflicts with --attention-chunk.
     \\Optional: --resident-workers N (1..32) selects the Lean-plan single-kernel path.
     \\Tuning: --resident-row-tile 1|2|4|8 (requires resident mode).
     \\Tuning: --staged-row-tile 1|2|4|8 (default 1; nondefault requires staged mode).
@@ -47,7 +54,8 @@ pub fn main(init: std.process.Init) !void {
     }
     const inspect = std.mem.eql(u8, command, "inspect");
     const evaluate = std.mem.eql(u8, command, "eval");
-    if (!inspect and !evaluate and !std.mem.eql(u8, command, "generate")) return error.UnknownCommand;
+    const session_mode = std.mem.eql(u8, command, "session");
+    if (!inspect and !evaluate and !session_mode and !std.mem.eql(u8, command, "generate")) return error.UnknownCommand;
     const directory = args.next() orelse return error.MissingCheckpoint;
     if (inspect) {
         if (args.next() != null) return error.UnexpectedArgument;
@@ -73,6 +81,10 @@ pub fn main(init: std.process.Init) !void {
     var resident_workers: u32 = 0;
     var resident_row_tile: u32 = 1;
     var staged_row_tile: u32 = 1;
+    var logits_from: ?u32 = null;
+    var attention_chunk: ?u32 = null;
+    var mlx_attention = false;
+    var trace_position: ?u32 = null;
     var tokens: std.ArrayList(u32) = .empty;
     var has_tokens = false;
     while (args.next()) |flag| {
@@ -88,6 +100,16 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, flag, "--staged-row-tile")) {
             staged_row_tile = try std.fmt.parseInt(u32, value, 10);
             if (staged_row_tile != 1 and staged_row_tile != 2 and staged_row_tile != 4 and staged_row_tile != 8) return error.InvalidStagedRowTile;
+        } else if (std.mem.eql(u8, flag, "--attention-chunk")) {
+            attention_chunk = try std.fmt.parseInt(u32, value, 10);
+            if (attention_chunk.? != 0 and !@import("resident.zig").certified.validAttentionChunk(attention_chunk.?)) return error.InvalidAttentionChunk;
+        } else if (std.mem.eql(u8, flag, "--mlx-attention")) {
+            const enabled = try std.fmt.parseInt(u1, value, 10);
+            mlx_attention = enabled != 0;
+        } else if (std.mem.eql(u8, flag, "--trace-position")) {
+            trace_position = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--logits-from")) {
+            logits_from = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--max-tokens")) {
             max_tokens = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--tokens")) {
@@ -105,12 +127,18 @@ pub fn main(init: std.process.Init) !void {
             try tokens.appendSlice(a, parsed.value);
         } else return error.UnknownFlag;
     }
-    if (resident_workers != 0 and staged_row_tile != 1) return error.StagedTuningRequiresStaged;
+    if (resident_workers != 0 and (staged_row_tile != 1 or attention_chunk != null)) return error.StagedTuningRequiresStaged;
     if (resident_workers == 0 and resident_row_tile != 1) return error.ResidentTuningRequiresResident;
-    if (tokens.items.len == 0) return error.EmptyPrompt;
-    const required: u64 = @as(u64, tokens.items.len) + if (evaluate or max_tokens == 0) @as(u64, 0) else max_tokens - 1;
+    if (session_mode and (has_tokens or logits_from != null or trace_position != null)) return error.SessionRequiresJsonlInput;
+    if (!session_mode and tokens.items.len == 0) return error.EmptyPrompt;
+    if (mlx_attention and (resident_workers != 0 or attention_chunk != null)) return error.ConflictingAttentionMode;
+    if (trace_position != null and (!evaluate or resident_workers != 0)) return error.TraceRequiresStagedEval;
+    if (trace_position != null and trace_position.? >= tokens.items.len) return error.InvalidTracePosition;
+    if (logits_from != null and !evaluate) return error.LogitsFromRequiresEval;
+    if (evaluate and (logits_from orelse 0) >= tokens.items.len) return error.InvalidLogitRange;
+    const required: u64 = if (session_mode) 0 else @as(u64, tokens.items.len) + if (evaluate or max_tokens == 0) @as(u64, 0) else max_tokens - 1;
     if (required > context) return error.ContextExhausted;
-    const ctx = try metal.Context.init();
+    const ctx = try metal.Context.initMatched(mlx_attention);
     defer ctx.deinit();
     var model = try Model.init(init.gpa, ctx, directory, context);
     defer model.deinit();
@@ -119,14 +147,19 @@ pub fn main(init: std.process.Init) !void {
         try model.setResidentRowTile(resident_row_tile);
     } else {
         try model.setStagedRowTile(staged_row_tile);
+        if (attention_chunk) |chunk| try model.setAttentionChunk(chunk);
     }
+    if (mlx_attention) try model.enableMlxAttention();
+    model.trace_position = trace_position;
     // Validate the complete prompt before mutating the KV cache.
     for (tokens.items) |token| if (token >= model.cfg.vocab_size) return error.InvalidToken;
     std.debug.print("Mapped {d} checkpoint bytes in {d} shard(s); context={d}.\n", .{ model.store.bytes, model.store.shards.items.len, context });
+    if (session_mode) return @import("session.zig").run(&model, init.gpa);
     var logits: []const f32 = &.{};
-    for (tokens.items) |token| {
+    if (!evaluate) logits = try model.prefill(tokens.items);
+    if (evaluate) for (tokens.items, 0..) |token, position| {
         logits = try model.forward(token);
-        if (evaluate) {
+        if (evaluate and position >= (logits_from orelse 0)) {
             try output("[");
             for (logits, 0..) |v, i| {
                 if (!std.math.isFinite(v)) return error.NonFiniteLogits;
@@ -135,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
             }
             try output("]\n");
         }
-    }
+    };
     if (evaluate) return;
     try output("{\"tokens\":[");
     for (0..max_tokens) |i| {
@@ -157,8 +190,13 @@ test {
     _ = @import("resident.zig");
     _ = @import("tiling_tests.zig");
     _ = @import("model.zig");
+    _ = @import("session.zig");
     _ = @import("attention_parallel_tests.zig");
+    _ = @import("attention_split_tests.zig");
+    _ = @import("attention_mlx_tests.zig");
     _ = @import("normalization_tests.zig");
+    _ = @import("normalization_aligned_tests.zig");
     _ = @import("routing_tests.zig");
     _ = @import("dense_matvec_tests.zig");
+    _ = @import("down_parallel_tests.zig");
 }

@@ -25,7 +25,7 @@ kernel void route_topk_cached(device const float *logits [[buffer(0)]],
             if (!isfinite(logit) || !isfinite(adjustment)) {
                 atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
             } else {
-                float score = 1.0f / (1.0f + exp(-logit));
+                float score = router_sigmoid(logit);
                 probabilities[slot] = score;
                 choices[slot] = score + adjustment;
             }

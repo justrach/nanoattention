@@ -3,7 +3,15 @@ const metal = @import("metal.zig");
 const plan = @import("resident_plan.zig");
 
 test "certified row tiles preserve quantized and floating outputs including partial tails" {
-    const ctx = try metal.Context.init();
+    try checkRowTiles(false);
+}
+
+test "MLX-grouped row tiles preserve outputs including partial tails" {
+    try checkRowTiles(true);
+}
+
+fn checkRowTiles(matched: bool) !void {
+    const ctx = try metal.Context.initMatched(matched);
     defer ctx.deinit();
     const storage = try ctx.alloc(81); // 4-byte offset + 5 * 128 / 2 packed bytes.
     defer storage.deinit();

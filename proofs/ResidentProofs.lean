@@ -314,6 +314,214 @@ theorem dense_column_advance (simd lane iteration : Nat) :
       denseColumn simd lane iteration + threadgroupSize := by
   simp [denseColumn, Nat.add_mul, Nat.add_assoc]
 
+/-! Split attention integer contracts. Coordinates are relative to the sliding
+window start, not the absolute cache position. These statements do not certify
+online-softmax arithmetic, memory ordering, device execution, or barriers. -/
+def attentionChunks : List Nat := [128, 256, 512, 1024]
+def validAttentionChunk (c : Nat) : Bool := attentionChunks.contains c
+def attentionMaxContext : Nat := 262144
+def attentionMaxHeads : Nat := 64
+def attentionMaxDim : Nat := 256
+def attentionSimds : Nat := 8
+def attentionLanes : Nat := 32
+def attentionChunkCount (n c : Nat) : Nat := (n + c - 1) / c
+def attentionToken (c chunk simd iteration : Nat) : Nat :=
+  c * chunk + simd + attentionSimds * iteration
+
+theorem attention_chunk_admissible (c : Nat) :
+    validAttentionChunk c = true ↔ c = 128 ∨ c = 256 ∨ c = 512 ∨ c = 1024 := by
+  simp [validAttentionChunk, attentionChunks]
+
+theorem attention_geometry :
+    attentionSimds = 8 ∧ attentionLanes = 32 ∧
+    attentionSimds * attentionLanes = threadgroupSize ∧
+    attentionMaxContext = 262144 ∧ attentionMaxHeads = 64 ∧ attentionMaxDim = 256 := by decide
+
+theorem attention_chunk_bounds (c : Nat) (hc : validAttentionChunk c = true) :
+    128 ≤ c ∧ c ≤ 1024 ∧ c % attentionSimds = 0 := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;> decide
+
+/-- Canonical decomposition of every actual token, including a partial final
+chunk. The lane coordinate is deliberately absent: a SIMD cooperates on a token. -/
+theorem attention_token_coverage (r n c : Nat)
+    (hc : validAttentionChunk c = true) (hr : r < n) :
+    r / c < attentionChunkCount n c ∧ (r % c) % attentionSimds < attentionSimds ∧
+    (r % c) / attentionSimds < c / attentionSimds ∧
+    attentionToken c (r / c) ((r % c) % attentionSimds)
+      ((r % c) / attentionSimds) = r := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionChunkCount, attentionToken, attentionSimds] <;> omega
+
+/-- Uniqueness requires a coordinate inside its chunk; a loop guard alone
+would not prevent an iteration spilling into the next chunk. -/
+theorem attention_token_unique (c a s i b t j : Nat)
+    (hc : validAttentionChunk c = true)
+    (hs : s < attentionSimds) (ht : t < attentionSimds)
+    (hi : i < c / attentionSimds) (hj : j < c / attentionSimds)
+    (he : attentionToken c a s i = attentionToken c b t j) :
+    a = b ∧ s = t ∧ i = j := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionToken, attentionSimds] at * <;> omega
+
+theorem attention_chunk_count_bounds (n c : Nat)
+    (hn : n ≤ attentionMaxContext) (hc : validAttentionChunk c = true) :
+    attentionChunkCount n c ≤ 2048 ∧
+    (attentionChunkCount n c = 0 ↔ n = 0) ∧ n + c - 1 < 2^32 := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionChunkCount, attentionMaxContext] at * <;> omega
+
+/-- Exactly the nonempty chunks are launched; n=0 launches none. -/
+theorem attention_active_chunk (n c chunk : Nat)
+    (hc : validAttentionChunk c = true) :
+    chunk < attentionChunkCount n c ↔ c * chunk < n := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionChunkCount] <;> omega
+
+/-- The natural-number loop recurrence matches a nonwrapping += 8. -/
+theorem attention_token_advance (c chunk simd iteration : Nat) :
+    attentionToken c chunk simd (iteration + 1) =
+      attentionToken c chunk simd iteration + attentionSimds := by
+  simp [attentionToken, Nat.mul_add, Nat.add_assoc]
+
+/-- Both guards are required: the per-chunk end and the overall active
+window. With start+n bounded, their absolute cache read is below max_context. -/
+theorem attention_guarded_read_bounds (start n c chunk simd iteration : Nat)
+    (hc : validAttentionChunk c = true) (hn : start + n ≤ attentionMaxContext)
+    (hs : simd < attentionSimds)
+    (localGuard : simd + attentionSimds * iteration < c)
+    (readGuard : attentionToken c chunk simd iteration < n) :
+    chunk < attentionChunkCount n c ∧ iteration < c / attentionSimds ∧
+    start + attentionToken c chunk simd iteration < attentionMaxContext ∧
+    start + attentionToken c chunk simd iteration < 2^32 := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionToken, attentionChunkCount, attentionSimds, attentionMaxContext] at * <;> omega
+
+/-- The partial-chunk mask is exactly the remaining relative token count. -/
+theorem attention_partial_chunk_guard (n c chunk offset : Nat)
+    (hb : c * chunk < n) :
+    c * chunk + offset < n ↔ offset < n - c * chunk := by omega
+
+/-- Includes begin+width and the final SIMD loop increment, even if they
+are outside the active token window. Neither operation wraps a UInt32. -/
+theorem attention_loop_u32_bounds (start n c chunk simd iteration : Nat)
+    (hc : validAttentionChunk c = true) (hn : start + n ≤ attentionMaxContext)
+    (hchunk : chunk < attentionChunkCount n c)
+    (hs : simd < attentionSimds) (hi : iteration < c / attentionSimds) :
+    start + c * chunk + c ≤ attentionMaxContext + 1024 ∧
+    start + attentionToken c chunk simd iteration < attentionMaxContext + 1024 ∧
+    start + attentionToken c chunk simd iteration + attentionSimds < 2^32 := by
+  rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+    simp only [attentionChunkCount, attentionToken, attentionSimds, attentionMaxContext] at * <;> omega
+
+/-- One distinguished producer pair includes the sink exactly once. It
+exists only for a nonempty window (there is no producer when n=0). -/
+def attentionSinkOwner (chunk simd : Nat) : Prop := chunk = 0 ∧ simd = 0
+
+theorem attention_unique_sink (n c : Nat) (hn : 0 < n)
+    (hc : validAttentionChunk c = true) :
+    0 < attentionChunkCount n c ∧ 0 < attentionSimds ∧
+    ∀ chunk simd, attentionSinkOwner chunk simd ↔ chunk = 0 ∧ simd = 0 := by
+  have hp : 0 < attentionChunkCount n c := by
+    rcases (attention_chunk_admissible c).mp hc with rfl | rfl | rfl | rfl <;>
+      simp only [attentionChunkCount] <;> omega
+  exact ⟨hp, by decide, fun _ _ => Iff.rfl⟩
+
+/-- Head-major flattened state index. Storage is one (dim+2)-float state
+per head/chunk pair, including the two scalar softmax statistics. -/
+def attentionStateSlot (chunks head chunk : Nat) : Nat := head * chunks + chunk
+
+theorem attention_state_flatten (heads chunks head chunk : Nat)
+    (hh : head < heads) (hc : chunk < chunks) :
+    attentionStateSlot chunks head chunk < heads * chunks ∧
+    attentionStateSlot chunks head chunk / chunks = head ∧
+    attentionStateSlot chunks head chunk % chunks = chunk := by
+  have hp : 0 < chunks := by omega
+  have hm := Nat.mul_le_mul_right chunks (show head + 1 ≤ heads by omega)
+  have hd : (head * chunks + chunk) / chunks = head := by
+    rw [Nat.add_comm]
+    simp [Nat.add_mul_div_right _ _ hp, Nat.div_eq_of_lt hc]
+  have hr : (head * chunks + chunk) % chunks = chunk := by
+    simp [Nat.add_mod, Nat.mod_eq_of_lt hc]
+  simp only [attentionStateSlot]
+  constructor
+  · simp only [Nat.add_mul, Nat.one_mul] at hm
+    omega
+  · exact ⟨hd, hr⟩
+
+theorem attention_state_unique (chunks h₁ c₁ h₂ c₂ : Nat)
+    (hc₁ : c₁ < chunks) (hc₂ : c₂ < chunks)
+    (he : attentionStateSlot chunks h₁ c₁ = attentionStateSlot chunks h₂ c₂) :
+    h₁ = h₂ ∧ c₁ = c₂ := by
+  have ha := attention_state_flatten (h₁ + 1) chunks h₁ c₁ (by omega) hc₁
+  have hb := attention_state_flatten (h₂ + 1) chunks h₂ c₂ (by omega) hc₂
+  rw [he] at ha
+  omega
+
+theorem attention_state_u32_bounds (heads chunks dim head chunk field : Nat)
+    (hh : heads ≤ attentionMaxHeads) (hc : chunks ≤ 2048) (hd : dim ≤ attentionMaxDim)
+    (hhead : head < heads) (hchunk : chunk < chunks) (hf : field < dim + 2) :
+    heads * chunks * (dim + 2) ≤ 33816576 ∧
+    attentionStateSlot chunks head chunk * (dim + 2) + field <
+      heads * chunks * (dim + 2) ∧
+    attentionStateSlot chunks head chunk * (dim + 2) + field < 2^32 := by
+  have hb := (attention_state_flatten heads chunks head chunk hhead hchunk).1
+  have hm := Nat.mul_le_mul (show heads ≤ 64 from hh) hc
+  have ht := Nat.mul_le_mul hm (show dim + 2 ≤ 258 by simpa [attentionMaxDim] using Nat.add_le_add_right hd 2)
+  have hi := Nat.mul_le_mul_right (dim + 2) (show attentionStateSlot chunks head chunk + 1 ≤ heads * chunks by omega)
+  simp only [Nat.add_mul, Nat.one_mul] at hi
+  constructor
+  · exact ht
+  · constructor <;> omega
+
+/-- A dim+2 stride keeps fields of distinct states disjoint. -/
+theorem attention_state_field_unique (dim slot₁ field₁ slot₂ field₂ : Nat)
+    (hf₁ : field₁ < dim + 2) (hf₂ : field₂ < dim + 2)
+    (he : slot₁ * (dim + 2) + field₁ = slot₂ * (dim + 2) + field₂) :
+    slot₁ = slot₂ ∧ field₁ = field₂ := by
+  have hp : 0 < dim + 2 := by omega
+  have hd₁ : (slot₁ * (dim + 2) + field₁) / (dim + 2) = slot₁ := by
+    rw [Nat.add_comm]
+    simp [Nat.add_mul_div_right _ _ hp, Nat.div_eq_of_lt hf₁]
+  have hd₂ : (slot₂ * (dim + 2) + field₂) / (dim + 2) = slot₂ := by
+    rw [Nat.add_comm]
+    simp [Nat.add_mul_div_right _ _ hp, Nat.div_eq_of_lt hf₂]
+  rw [he] at hd₁
+  have hs : slot₁ = slot₂ := by omega
+  subst slot₂
+  exact ⟨rfl, by omega⟩
+
+/-- Parallel QK scores use one head-major float per actual relative token.
+This is an index/ownership bound, not an assertion about FP32 dot products. -/
+theorem attention_score_u32_bounds (heads length head relative : Nat)
+    (hh : heads ≤ attentionMaxHeads) (hl : length ≤ attentionMaxContext)
+    (hhead : head < heads) (hr : relative < length) :
+    heads * length ≤ 16777216 ∧ head * length + relative < heads * length ∧
+    head * length + relative < 2^32 := by
+  have hb := (attention_state_flatten heads length head relative hhead hr).1
+  have hm := Nat.mul_le_mul (show heads ≤ 64 from hh) (show length ≤ 262144 from hl)
+  simp only [attentionStateSlot] at hb
+  constructor
+  · exact hm
+  · exact ⟨hb, by omega⟩
+
+/-- Row-major cache element offset, not bytes or allocation size. With
+pos<262144, heads<=64, dim<=256 the maximum allocation has exactly 2^32
+float elements; every guarded element index is strictly below 2^32.
+A byte offset or a combined K+V allocation requires wider arithmetic. -/
+theorem attention_cache_u32_index (pos kvheads dim head lane : Nat)
+    (hp : pos < attentionMaxContext) (hk : kvheads ≤ attentionMaxHeads)
+    (hd : dim ≤ attentionMaxDim) (hh : head < kvheads) (hl : lane < dim) :
+    (pos * kvheads + head) * dim + lane < 2^32 := by
+  have hrow : pos * kvheads + head < attentionMaxContext * kvheads := by
+    have hm := Nat.mul_le_mul_right kvheads (show pos + 1 ≤ attentionMaxContext by omega)
+    simp only [Nat.add_mul, Nat.one_mul] at hm
+    omega
+  have hm := Nat.mul_le_mul_right dim (show pos * kvheads + head + 1 ≤ attentionMaxContext * kvheads by omega)
+  have hcap := Nat.mul_le_mul (Nat.mul_le_mul_left attentionMaxContext hk) hd
+  simp only [Nat.add_mul, Nat.one_mul] at hm
+  simp only [Nat.add_mul, attentionMaxContext, attentionMaxHeads, attentionMaxDim] at *
+  omega
+
 /-! Tiled row ownership. A SIMD owns R adjacent rows per iteration. -/
 def rowTiles : List Nat := [1, 2, 4, 8]
 
@@ -633,5 +841,281 @@ theorem int4_affine_sum (scale bias : Int) (xs : List (Int × Int)) :
   | cons p xs ih =>
     simp only [List.map_cons, List.sum_cons, ih]
     simp [Int.add_mul, Int.mul_add, Int.mul_assoc, Int.add_assoc, Int.add_comm, Int.add_left_comm]
+
+/-! MLX-style attention candidate: integer geometry only. No floating-point,
+Metal memory-model, compiler, scheduling, or liveness claim is made here. -/
+def mlxAttentionDim : Nat := 128
+def mlxAttentionLanes : Nat := 32
+def mlxAttentionElementsPerLane : Nat := 4
+def mlxAttentionSingleSimds : Nat := 32
+def mlxAttentionMergeSimds : Nat := 32
+def mlxAttentionMaxGqa : Nat := 32
+def mlxAttentionMaxHeads : Nat := 64
+def mlxAttentionMaxContext : Nat := 262144
+def mlxAttentionStateStride : Nat := 130
+def mlxAttentionMaxField : Nat := 128
+def mlxAttentionSumField : Nat := 129
+def mlxAttentionMaxBlocks : Nat := 1024
+def mlxAttentionMaxStateElements : Nat :=
+  mlxAttentionMaxHeads * mlxAttentionMaxBlocks * mlxAttentionStateStride
+def mlxAttentionBlocks : List Nat := [64, 128, 512, 1024]
+def validMlxAttentionBlocks (blocks : Nat) : Bool := mlxAttentionBlocks.contains blocks
+
+/-- Host policy for Flint GQA8 on apple_g15d only, not a universal MLX schedule.
+This definition certifies integer eligibility, not measured performance. -/
+def mlxLargeDevice512MinLength : Nat := 16384
+def mlxLargeDevice1024MinLength : Nat := 65536
+def mlxLargeDeviceBlocks (length : Nat) : Nat :=
+  if length < mlxLargeDevice512MinLength then 128
+  else if length < mlxLargeDevice1024MinLength then 512 else 1024
+def alignedNormDim : Nat := 2048
+def alignedNormThreads : Nat := 512
+def alignedNormElementsPerThread : Nat := 4
+def alignedHeadDim : Nat := 128
+def alignedHeadThreads : Nat := 32
+def alignedHeadElementsPerThread : Nat := 4
+
+/-- Exported by the emitter in both languages from these checked definitions. -/
+def mlxGeometryConstants : List (String × Nat) :=
+  [("mlx_attention_dim", mlxAttentionDim),
+   ("mlx_attention_lanes", mlxAttentionLanes),
+   ("mlx_attention_elements_per_lane", mlxAttentionElementsPerLane),
+   ("mlx_attention_single_simds", mlxAttentionSingleSimds),
+   ("mlx_attention_merge_simds", mlxAttentionMergeSimds),
+   ("mlx_attention_max_gqa", mlxAttentionMaxGqa),
+   ("mlx_attention_max_heads", mlxAttentionMaxHeads),
+   ("mlx_attention_max_context", mlxAttentionMaxContext),
+   ("mlx_attention_max_blocks", mlxAttentionMaxBlocks),
+   ("mlx_attention_max_state_elements", mlxAttentionMaxStateElements),
+   ("mlx_attention_state_stride", mlxAttentionStateStride),
+   ("mlx_attention_max_field", mlxAttentionMaxField),
+   ("mlx_attention_sum_field", mlxAttentionSumField),
+   ("aligned_norm_dim", alignedNormDim),
+   ("aligned_norm_threads", alignedNormThreads),
+   ("aligned_norm_elements_per_thread", alignedNormElementsPerThread),
+   ("aligned_head_dim", alignedHeadDim),
+   ("aligned_head_threads", alignedHeadThreads),
+   ("aligned_head_elements_per_thread", alignedHeadElementsPerThread)]
+
+def mlxAttentionComponent (lane j : Nat) : Nat :=
+  lane * mlxAttentionElementsPerLane + j
+
+theorem mlx_attention_geometry :
+    mlxAttentionDim = mlxAttentionLanes * mlxAttentionElementsPerLane ∧
+    mlxAttentionSingleSimds * mlxAttentionLanes = 1024 ∧
+    mlxAttentionMergeSimds * mlxAttentionLanes = 1024 ∧
+    mlxAttentionMaxGqa * mlxAttentionLanes = 1024 ∧
+    mlxAttentionStateStride = mlxAttentionDim + 2 ∧
+    mlxAttentionMaxField = mlxAttentionDim ∧
+    mlxAttentionSumField = mlxAttentionDim + 1 := by decide
+
+theorem mlx_attention_blocks_admissible (blocks : Nat) :
+    validMlxAttentionBlocks blocks = true ↔
+      blocks = 64 ∨ blocks = 128 ∨ blocks = 512 ∨ blocks = 1024 := by
+  simp [validMlxAttentionBlocks, mlxAttentionBlocks]
+
+theorem mlx_attention_blocks_bounds (blocks : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) :
+    0 < blocks ∧ blocks ≤ mlxAttentionMaxBlocks := by
+  have := (mlx_attention_blocks_admissible blocks).mp hb
+  simp only [mlxAttentionMaxBlocks]
+  omega
+
+theorem mlx_attention_max_state_elements : mlxAttentionMaxStateElements = 8519680 := by decide
+
+/-- All policy results are admissible, including lengths outside the supported
+context range. Actual launches must separately enforce the context limit. -/
+theorem mlx_large_device_blocks_valid (length : Nat) :
+    validMlxAttentionBlocks (mlxLargeDeviceBlocks length) = true := by
+  unfold mlxLargeDeviceBlocks
+  split
+  · decide
+  · split <;> decide
+
+theorem mlx_large_device_blocks_policy (length : Nat) :
+    (length < 16384 → mlxLargeDeviceBlocks length = 128) ∧
+    (16384 ≤ length → length < 65536 → mlxLargeDeviceBlocks length = 512) ∧
+    (65536 ≤ length → mlxLargeDeviceBlocks length = 1024) := by
+  simp only [mlxLargeDeviceBlocks, mlxLargeDevice512MinLength, mlxLargeDevice1024MinLength]
+  by_cases h : length < 16384 <;> by_cases h' : length < 65536 <;>
+    simp [h, h'] <;> omega
+
+theorem mlx_large_device_blocks_boundaries :
+    mlxLargeDeviceBlocks 0 = 128 ∧
+    mlxLargeDeviceBlocks 16383 = 128 ∧ mlxLargeDeviceBlocks 16384 = 512 ∧
+    mlxLargeDeviceBlocks 65535 = 512 ∧ mlxLargeDeviceBlocks 65536 = 1024 ∧
+    mlxLargeDeviceBlocks mlxAttentionMaxContext = 1024 ∧
+    mlxLargeDeviceBlocks (2^32 - 1) = 1024 := by decide
+
+/-- Four adjacent components per lane, including the inverse coordinates. -/
+theorem mlx_attention_component_coverage (d : Nat) (hd : d < mlxAttentionDim) :
+    d / mlxAttentionElementsPerLane < mlxAttentionLanes ∧
+    d % mlxAttentionElementsPerLane < mlxAttentionElementsPerLane ∧
+    mlxAttentionComponent (d / mlxAttentionElementsPerLane)
+      (d % mlxAttentionElementsPerLane) = d := by
+  simp only [mlxAttentionDim, mlxAttentionLanes, mlxAttentionElementsPerLane,
+    mlxAttentionComponent] at *
+  omega
+
+theorem mlx_attention_component_unique (l₁ j₁ l₂ j₂ : Nat)
+    (hj₁ : j₁ < mlxAttentionElementsPerLane) (hj₂ : j₂ < mlxAttentionElementsPerLane)
+    (he : mlxAttentionComponent l₁ j₁ = mlxAttentionComponent l₂ j₂) :
+    l₁ = l₂ ∧ j₁ = j₂ := by
+  simp only [mlxAttentionComponent, mlxAttentionElementsPerLane] at *
+  omega
+
+theorem mlx_attention_component_bounds (lane j : Nat)
+    (hl : lane < mlxAttentionLanes) (hj : j < mlxAttentionElementsPerLane) :
+    mlxAttentionComponent lane j < mlxAttentionDim ∧
+    mlxAttentionComponent lane j ≠ mlxAttentionMaxField ∧
+    mlxAttentionComponent lane j ≠ mlxAttentionSumField := by
+  simp only [mlxAttentionComponent, mlxAttentionElementsPerLane, mlxAttentionLanes,
+    mlxAttentionDim, mlxAttentionMaxField, mlxAttentionSumField] at *
+  omega
+
+/-- B is a stripe count, not a contiguous-token chunk width. -/
+def mlxAttentionToken (blocks block iteration : Nat) : Nat := block + iteration * blocks
+
+theorem mlx_attention_token_coverage (t n blocks : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) (ht : t < n)
+    (hn : n ≤ mlxAttentionMaxContext) :
+    t % blocks < blocks ∧ t / blocks < mlxAttentionMaxContext / blocks ∧
+    mlxAttentionToken blocks (t % blocks) (t / blocks) = t := by
+  rcases (mlx_attention_blocks_admissible blocks).mp hb with rfl | rfl | rfl | rfl <;>
+    simp only [mlxAttentionToken, mlxAttentionMaxContext] at * <;> omega
+
+theorem mlx_attention_token_unique (blocks b₁ i₁ b₂ i₂ : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) (h₁ : b₁ < blocks) (h₂ : b₂ < blocks)
+    (he : mlxAttentionToken blocks b₁ i₁ = mlxAttentionToken blocks b₂ i₂) :
+    b₁ = b₂ ∧ i₁ = i₂ := by
+  exact row_worker_unique blocks b₁ b₂ i₁ i₂
+    (by have := (mlx_attention_blocks_admissible blocks).mp hb; omega) h₁ h₂ he
+
+/-- Both scalar +=B and four-token prefetch +=4B, including the loop test's
+lookahead, fit UInt32. Only guarded relative indices are read; absolute ring
+addressing and resident-token validity remain caller obligations. -/
+theorem mlx_attention_token_u32_bounds (blocks block iteration n : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) (hn : n ≤ mlxAttentionMaxContext)
+    (guard : mlxAttentionToken blocks block iteration < n) :
+    mlxAttentionToken blocks block iteration < mlxAttentionMaxContext ∧
+    mlxAttentionToken blocks block iteration + 3 * blocks < 2^32 ∧
+    mlxAttentionToken blocks block iteration + 4 * blocks < 2^32 := by
+  rcases (mlx_attention_blocks_admissible blocks).mp hb with rfl | rfl | rfl | rfl <;>
+    simp only [mlxAttentionMaxContext] at * <;> omega
+
+/-- Initial loop-test lookahead is safe even for empty stripes (n=0 or n<B). -/
+theorem mlx_attention_token_init_u32_bounds (blocks block : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) (hblock : block < blocks) :
+    block < 2^32 ∧ block + 3 * blocks < 2^32 ∧ block + 4 * blocks < 2^32 := by
+  have := mlx_attention_blocks_bounds blocks hb
+  simp only [mlxAttentionMaxBlocks] at *
+  omega
+
+/-- Single-pass token ownership uses the same division/remainder construction. -/
+theorem mlx_attention_single_token_coverage (t : Nat) :
+    t % mlxAttentionSingleSimds < mlxAttentionSingleSimds ∧
+    t % mlxAttentionSingleSimds + (t / mlxAttentionSingleSimds) *
+      mlxAttentionSingleSimds = t := by
+  exact row_worker_coverage t mlxAttentionSingleSimds (by decide)
+
+/-- In the merge, each SIMD/lane owns blocks s, s+32, ... . -/
+theorem mlx_attention_merge_block_coverage (block blocks : Nat)
+    (hb : validMlxAttentionBlocks blocks = true) (h : block < blocks) :
+    block % mlxAttentionMergeSimds < mlxAttentionMergeSimds ∧
+    block / mlxAttentionMergeSimds < blocks / mlxAttentionMergeSimds ∧
+    block % mlxAttentionMergeSimds + (block / mlxAttentionMergeSimds) *
+      mlxAttentionMergeSimds = block := by
+  rcases (mlx_attention_blocks_admissible blocks).mp hb with rfl | rfl | rfl | rfl <;>
+    simp only [mlxAttentionMergeSimds] at * <;> omega
+
+/-- GQA producer SIMD s owns head kv_head*GQA+s, exactly once. -/
+theorem mlx_attention_gqa_ownership (heads kvheads gqa kvhead simd : Nat)
+    (hg : 0 < gqa) (hmax : gqa ≤ mlxAttentionMaxGqa)
+    (hheads : heads = kvheads * gqa) (hk : kvhead < kvheads) (hs : simd < gqa) :
+    kvhead * gqa + simd < heads ∧
+    (kvhead * gqa + simd) / gqa = kvhead ∧
+    (kvhead * gqa + simd) % gqa = simd ∧
+    gqa * mlxAttentionLanes ≤ 1024 := by
+  have hf := attention_state_flatten kvheads gqa kvhead simd hk hs
+  simp only [attentionStateSlot] at hf
+  refine ⟨by omega, hf.2.1, hf.2.2, ?_⟩
+  simp only [mlxAttentionMaxGqa, mlxAttentionLanes] at *
+  omega
+
+def mlxAttentionStateIndex (blocks head block field : Nat) : Nat :=
+  (head * blocks + block) * mlxAttentionStateStride + field
+
+/-- State allocation is at most 8,519,680 float elements, not bytes. -/
+theorem mlx_attention_state_u32_bounds (heads blocks head block field : Nat)
+    (hh : heads ≤ mlxAttentionMaxHeads) (hb : validMlxAttentionBlocks blocks = true)
+    (hhead : head < heads) (hblock : block < blocks) (hf : field < mlxAttentionStateStride) :
+    heads * blocks * mlxAttentionStateStride ≤ mlxAttentionMaxStateElements ∧
+    mlxAttentionStateIndex blocks head block field < heads * blocks * mlxAttentionStateStride ∧
+    mlxAttentionStateIndex blocks head block field < 2^32 := by
+  have flat := (attention_state_flatten heads blocks head block hhead hblock).1
+  have bmax : blocks ≤ mlxAttentionMaxBlocks := (mlx_attention_blocks_bounds blocks hb).2
+  have allocation := Nat.mul_le_mul_right mlxAttentionStateStride
+    (Nat.mul_le_mul (show heads ≤ 64 from hh) bmax)
+  have index := Nat.mul_le_mul_right mlxAttentionStateStride
+    (show attentionStateSlot blocks head block + 1 ≤ heads * blocks by omega)
+  simp only [attentionStateSlot, mlxAttentionStateStride, mlxAttentionMaxBlocks,
+    mlxAttentionMaxStateElements, mlxAttentionMaxHeads, Nat.add_mul, Nat.one_mul,
+    mlxAttentionStateIndex] at *
+  exact ⟨allocation, by omega, by omega⟩
+
+theorem mlx_attention_state_unique (blocks h₁ b₁ f₁ h₂ b₂ f₂ : Nat)
+    (hb₁ : b₁ < blocks) (hb₂ : b₂ < blocks)
+    (hf₁ : f₁ < mlxAttentionStateStride) (hf₂ : f₂ < mlxAttentionStateStride)
+    (he : mlxAttentionStateIndex blocks h₁ b₁ f₁ = mlxAttentionStateIndex blocks h₂ b₂ f₂) :
+    h₁ = h₂ ∧ b₁ = b₂ ∧ f₁ = f₂ := by
+  have slots := attention_state_field_unique mlxAttentionDim
+    (attentionStateSlot blocks h₁ b₁) f₁ (attentionStateSlot blocks h₂ b₂) f₂ hf₁ hf₂ he
+  have owners := attention_state_unique blocks h₁ b₁ h₂ b₂ hb₁ hb₂ slots.1
+  exact ⟨owners.1, owners.2, slots.2⟩
+
+/-- Every head has B allocated records, even for n<B or n=0. Only block zero
+owns its sink. This is ownership, not a softmax or sink-value theorem. -/
+def mlxAttentionSinkOwner (block : Nat) : Prop := block = 0
+
+theorem mlx_attention_unique_sink (blocks : Nat) (hb : validMlxAttentionBlocks blocks = true) :
+    ∃ block, block < blocks ∧ mlxAttentionSinkOwner block ∧
+      ∀ other, other < blocks → mlxAttentionSinkOwner other → other = block := by
+  have hp : 0 < blocks := by
+    have := (mlx_attention_blocks_admissible blocks).mp hb
+    omega
+  exact ⟨0, hp, rfl, fun _ _ h => h⟩
+
+/-! Aligned normalization: contiguous four-component integer ownership only. -/
+theorem aligned_norm_geometry :
+    alignedNormDim = alignedNormThreads * alignedNormElementsPerThread ∧
+    alignedHeadDim = alignedHeadThreads * alignedHeadElementsPerThread := by decide
+
+theorem aligned_norm_ownership (d : Nat) (hd : d < alignedNormDim) :
+    d / alignedNormElementsPerThread < alignedNormThreads ∧
+    d % alignedNormElementsPerThread < alignedNormElementsPerThread ∧
+    (d / alignedNormElementsPerThread) * alignedNormElementsPerThread +
+      d % alignedNormElementsPerThread = d := by
+  simp only [alignedNormDim, alignedNormThreads, alignedNormElementsPerThread] at *
+  omega
+
+theorem aligned_norm_unique (t₁ j₁ t₂ j₂ : Nat)
+    (hj₁ : j₁ < alignedNormElementsPerThread) (hj₂ : j₂ < alignedNormElementsPerThread)
+    (he : t₁ * alignedNormElementsPerThread + j₁ = t₂ * alignedNormElementsPerThread + j₂) :
+    t₁ = t₂ ∧ j₁ = j₂ := by
+  simp only [alignedNormElementsPerThread] at *
+  omega
+
+theorem aligned_norm_bounds (t j : Nat) (ht : t < alignedNormThreads)
+    (hj : j < alignedNormElementsPerThread) :
+    t * alignedNormElementsPerThread + j < alignedNormDim := by
+  simp only [alignedNormThreads, alignedNormElementsPerThread, alignedNormDim] at *
+  omega
+
+theorem aligned_head_ownership (d : Nat) (hd : d < alignedHeadDim) :
+    d / alignedHeadElementsPerThread < alignedHeadThreads ∧
+    d % alignedHeadElementsPerThread < alignedHeadElementsPerThread ∧
+    (d / alignedHeadElementsPerThread) * alignedHeadElementsPerThread +
+      d % alignedHeadElementsPerThread = d := by
+  exact mlx_attention_component_coverage d hd
 
 end Resident

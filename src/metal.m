@@ -222,6 +222,11 @@ static void profile_report(FMContext *c) {
     else fprintf(stderr, "FLINT_PROFILE: could not serialize timestamp report\n");
 }
 
+int fm_is_m3_ultra(void *context) {
+    FMContext *c = context;
+    return [c->device.name isEqualToString:@"Apple M3 Ultra"];
+}
+
 void *fm_open(const char *source) {
     FMContext *c = calloc(1, sizeof(*c));
     if (!c) return NULL;

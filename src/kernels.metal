@@ -52,6 +52,24 @@ inline float dot4_g64(device const uchar *w, device const uchar *scales, device 
         uint group = row * (cols / 64) + segment / 4;
         float scale = weight(scales, 0, scale_dtype, group), bias = weight(biases, 0, bias_dtype, group);
         float dot = 0, input_sum = 0;
+#if FLINT_MLX_MATH
+        #pragma unroll
+        for (uint j = 0; j < 16; j += 4) {
+            float value0 = x[segment * 16 + j], value1 = x[segment * 16 + j + 1];
+            float value2 = x[segment * 16 + j + 2], value3 = x[segment * 16 + j + 3];
+            input_sum += value0 + value1 + value2 + value3;
+            value1 = value1 / 16.0f;
+            value2 = value2 / 256.0f;
+            value3 = value3 / 4096.0f;
+            uint codes = j < 8 ? codes0 : codes1;
+            uint half_word = (j & 7u) < 4 ? codes : codes >> 16;
+            dot += (value0 * float(half_word & 0x000fu) +
+                    value1 * float(half_word & 0x00f0u) +
+                    value2 * float(half_word & 0x0f00u) +
+                    value3 * float(half_word & 0xf000u));
+        }
+        sum += scale * dot + input_sum * bias;
+#else
         #pragma unroll
         for (uint j = 0; j < 16; ++j) {
             float value = x[segment * 16 + j];
@@ -63,6 +81,7 @@ inline float dot4_g64(device const uchar *w, device const uchar *scales, device 
             input_sum += value;
         }
         sum += scale * dot + bias * input_sum;
+#endif
     }
     return sum;
 }
@@ -141,9 +160,28 @@ kernel void attention(device const float *q [[buffer(0)]], device const float *k
     }
     for (uint d = lane, j = 0; d < p.dim; d += 32, ++j) out[head * p.dim + d] = acc[j] / denom;
 }
+inline float mixture_product(float value, float scale) {
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    // MLX materializes expert*weight before reducing experts. Preserve that
+    // FP32 rounding boundary instead of contracting it into the next addition.
+    volatile float product = value * scale;
+    return product;
+#else
+    return value * scale;
+#endif
+}
+inline float swiglu_product(float gate, float up) {
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    float y = 1.0f / (1.0f + metal::precise::exp(abs(gate)));
+    float sigmoid = gate < 0 ? y : 1.0f - y;
+    return (gate * sigmoid) * up;
+#else
+    return (gate / (1.0f + exp(-gate))) * up;
+#endif
+}
 kernel void swiglu(device const float *gate [[buffer(0)]], device const float *up [[buffer(1)]],
                    device float *out [[buffer(2)]], constant P &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
-    if (i < p.n) { float g = gate[i]; out[i] = (g / (1.0f + exp(-g))) * up[i]; }
+    if (i < p.n) { float g = gate[i]; out[i] = swiglu_product(g, up[i]); }
 }
 kernel void add_scaled(device float *x [[buffer(0)]], device const float *y [[buffer(1)]],
                        constant P &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
@@ -174,6 +212,15 @@ inline float matrix_dot(Matrix m, device const float *x, uint row, uint lane) {
     return sum;
 }
 
+inline float router_sigmoid(float x) {
+#if FLINT_MLX_MATH
+    float y = 1.0f / (1.0f + metal::precise::exp(abs(x)));
+    return x < 0 ? y : 1.0f - y;
+#else
+    return 1.0f / (1.0f + exp(-x));
+#endif
+}
+
 // One SIMD group selects all routes, with deterministic low-index tie breaks.
 // p.m = experts, p.n = top-k. Invalid logits are flagged for the single final CPU fence.
 kernel void route_topk(device const float *logits [[buffer(0)]], device const float *bias [[buffer(1)]],
@@ -188,7 +235,7 @@ kernel void route_topk(device const float *logits [[buffer(0)]], device const fl
             bool used = false;
             for (uint j = 0; j < k; ++j) used |= ids[j] == e;
             if (used) continue;
-            float score = 1.0f / (1.0f + exp(-logits[e]));
+            float score = router_sigmoid(logits[e]);
             if (!isfinite(logits[e]) || !isfinite(bias[e])) {
                 atomic_fetch_or_explicit(error, 1u, memory_order_relaxed);
                 continue;
@@ -199,7 +246,7 @@ kernel void route_topk(device const float *logits [[buffer(0)]], device const fl
         float top = simd_max(best);
         uint winner = simd_min(best == top ? best_id : p.m);
         if (winner >= p.m) winner = 0; // Keep invalid-input execution in bounds until the final error check.
-        float w = 1.0f / (1.0f + exp(-logits[winner]));
+        float w = router_sigmoid(logits[winner]);
         if (!isfinite(w)) w = 0;
         if (lane == 0) { ids[k] = winner; weights[k] = w; }
         total += w;
@@ -223,7 +270,7 @@ kernel void fused_gate_up(device const MLP *experts [[buffer(0)]], device const 
     float gate = matrix_dot(mlp.gate, x, row, lane);
     float up = matrix_dot(mlp.up, x, row, lane);
     gate = simd_sum(gate); up = simd_sum(up);
-    if (lane == 0) activation[route * p.k + row] = (gate / (1.0f + exp(-gate))) * up;
+    if (lane == 0) activation[route * p.k + row] = swiglu_product(gate, up);
 }
 
 // Fuses every selected down projection, mixture weighting, shared expert, and
@@ -234,13 +281,21 @@ kernel void fused_down_reduce(device const MLP *experts [[buffer(0)]], device co
                               uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     uint row = i / 32;
     if (row >= p.dim) return;
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    float output = 0;
+#else
     float output = lane == 0 ? residual[row] : 0;
+#endif
     for (uint route = 0; route <= p.n; ++route) {
         uint expert = route < p.n ? ids[route] : p.m;
         device const Matrix &down = experts[expert].down;
         float sum = matrix_dot(down, activation + route * p.k, row, lane);
         sum = simd_sum(sum);
-        if (lane == 0) output += sum * (route < p.n ? weights[route] : 1.0f);
+        if (lane == 0) output += mixture_product(sum, route < p.n ? weights[route] : 1.0f);
     }
+#if defined(FLINT_MLX_MATH) && FLINT_MLX_MATH
+    if (lane == 0) residual[row] = residual[row] + output;
+#else
     if (lane == 0) residual[row] = output;
+#endif
 }

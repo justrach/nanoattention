@@ -1,0 +1,287 @@
+{
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "gpu_cores": 60,
+    "unified_memory_gib": 256,
+    "architecture": "applegpu_g15d"
+  },
+  "model": "RecursiveSI/flint, existing affine INT4/group64 export; native FP32 activations, accumulation and KV",
+  "reference_mlx": "0.32.4",
+  "protocol": {
+    "prompt": "Actual exact-length raw repeated-code token IDs; performance fixture, not the separate coding conversation.",
+    "decode": "256 teacher-forced tokens, 8 warmup tokens, three synchronous repeats.",
+    "prefill": "Native evaluates every prefix token once sequentially and restores real KV snapshots outside decode timing; native prefill has one sample. Stock MLX uses batched prefill on fresh caches.",
+    "scope": "Decode timings only. No full-model all-logit numerical parity claim at these benchmark lengths; the separate coding-session reference covers its own recorded token stream."
+  },
+  "attention_schedule": {
+    "profile": "M3 Ultra GQA8 only for allocated contexts >=16384",
+    "stripes_below_16384": 128,
+    "stripes_16384_to_65535": 512,
+    "stripes_from_65536": 1024,
+    "tested_kernel_contexts": [
+      16384,
+      32768
+    ],
+    "above_32768_full_model": "unverified"
+  },
+  "checks": {
+    "zig_unit_and_headless_metal_tests": 60,
+    "lean_binding_tests": 15,
+    "proof_verifier_tests": 6,
+    "tiny_persistent_session_cases": [
+      "F32",
+      "BF16 affine INT4/INT8 embeddings"
+    ],
+    "proof_scope": "Integer indexing, geometry and ownership only; not floating-point or performance proofs."
+  },
+  "contexts": [
+    {
+      "prompt_tokens": 16384,
+      "decode_tokens": 256,
+      "repeats": 3,
+      "input_sha256": "771a281c04cdf579c1bfe8f4a40dca99f013c8b5e72fe33907a5769e0a50d0ea",
+      "native_execution": {
+        "mode": "staged",
+        "resident_workers": 0,
+        "resident_row_tile": 1,
+        "staged_row_tile": 2,
+        "attention_implementation": "mlx_layout_128_stripes",
+        "reuse_prefill": true,
+        "prefill_samples": 1,
+        "attention_chunk": 0
+      },
+      "engines": {
+        "zig_fp32": {
+          "median_prefill_seconds": 161.430805,
+          "median_decode_seconds": 2.692235,
+          "prefill_tokens_per_second": 101.49240103213263,
+          "decode_tokens_per_second": 95.08828166931936,
+          "prefill_run_seconds": [
+            161.430805
+          ],
+          "decode_run_seconds": [
+            2.700108,
+            2.692235,
+            2.691985
+          ],
+          "checksums": [
+            696337,
+            696337,
+            696337
+          ],
+          "attention_implementation": "mlx_layout_128_stripes",
+          "attention_chunk": [
+            0,
+            0,
+            0
+          ],
+          "prefill_samples": 1,
+          "prefill_reused": true,
+          "submissions_per_token": [
+            1,
+            1,
+            1
+          ],
+          "dispatches_per_token": [
+            503,
+            503,
+            503
+          ],
+          "prefill_gpu_seconds": [
+            135.194243868,
+            135.194243868,
+            135.194243868
+          ],
+          "decode_gpu_seconds": [
+            2.465201376,
+            2.462809208,
+            2.463925667
+          ]
+        },
+        "mlx_fp32": {
+          "median_prefill_seconds": 12.23296766600106,
+          "median_decode_seconds": 3.7371164170326665,
+          "prefill_tokens_per_second": 1339.3315871778077,
+          "decode_tokens_per_second": 68.50201370051734,
+          "prefill_run_seconds": [
+            12.032581500010565,
+            12.23296766600106,
+            12.47821724996902
+          ],
+          "decode_run_seconds": [
+            3.706735499901697,
+            4.34900420892518,
+            3.7371164170326665
+          ],
+          "checksums": [
+            696337,
+            696337,
+            696337
+          ]
+        },
+        "mlx_bf16": {
+          "median_prefill_seconds": 10.108923041960225,
+          "median_decode_seconds": 3.2139552499866113,
+          "prefill_tokens_per_second": 1620.7463378634025,
+          "decode_tokens_per_second": 79.65263362054168,
+          "prefill_run_seconds": [
+            10.108923041960225,
+            10.417452667024918,
+            10.062728667049669
+          ],
+          "decode_run_seconds": [
+            3.1876655420055613,
+            3.2139552499866113,
+            3.2474623329471797
+          ],
+          "checksums": [
+            696337,
+            696337,
+            696337
+          ]
+        }
+      },
+      "ratios": {
+        "zig_fp32_prefill_speedup_over_mlx_fp32": 0.07577839722722723,
+        "mlx_fp32_prefill_speedup_over_zig_fp32": 13.196373063967355,
+        "zig_fp32_decode_speedup_over_mlx_fp32": 1.3881092909915616,
+        "mlx_fp32_decode_speedup_over_zig_fp32": 0.7204043705273918,
+        "zig_fp32_prefill_speedup_over_mlx_bf16": 0.06262078072373006,
+        "mlx_bf16_prefill_speedup_over_zig_fp32": 15.96913977185614,
+        "zig_fp32_decode_speedup_over_mlx_bf16": 1.1937870393879477,
+        "mlx_bf16_decode_speedup_over_zig_fp32": 0.8376703440445274
+      }
+    },
+    {
+      "prompt_tokens": 32768,
+      "decode_tokens": 256,
+      "repeats": 3,
+      "input_sha256": "b4642a4d81491f31c19662deeca7b04c5eb1550d328e827a619ef3b7c70f4476",
+      "native_execution": {
+        "mode": "staged",
+        "resident_workers": 0,
+        "resident_row_tile": 1,
+        "staged_row_tile": 2,
+        "attention_implementation": "mlx_layout_128_stripes",
+        "reuse_prefill": true,
+        "prefill_samples": 1,
+        "attention_chunk": 0
+      },
+      "engines": {
+        "zig_fp32": {
+          "median_prefill_seconds": 358.474421,
+          "median_decode_seconds": 3.221365,
+          "prefill_tokens_per_second": 91.40959042095781,
+          "decode_tokens_per_second": 79.46941746744004,
+          "prefill_run_seconds": [
+            358.474421
+          ],
+          "decode_run_seconds": [
+            3.223352,
+            3.221365,
+            3.218838
+          ],
+          "checksums": [
+            707387,
+            707387,
+            707387
+          ],
+          "attention_implementation": "mlx_layout_128_stripes",
+          "attention_chunk": [
+            0,
+            0,
+            0
+          ],
+          "prefill_samples": 1,
+          "prefill_reused": true,
+          "submissions_per_token": [
+            1,
+            1,
+            1
+          ],
+          "dispatches_per_token": [
+            503,
+            503,
+            503
+          ],
+          "prefill_gpu_seconds": [
+            310.92971759,
+            310.92971759,
+            310.92971759
+          ],
+          "decode_gpu_seconds": [
+            3.001081751,
+            2.999161125,
+            2.998223583
+          ]
+        },
+        "mlx_fp32": {
+          "median_prefill_seconds": 30.3072242080234,
+          "median_decode_seconds": 4.32120574999135,
+          "prefill_tokens_per_second": 1081.1943639274343,
+          "decode_tokens_per_second": 59.2427240939667,
+          "prefill_run_seconds": [
+            31.73436062503606,
+            30.188478874973953,
+            30.3072242080234
+          ],
+          "decode_run_seconds": [
+            4.349686375004239,
+            4.32120574999135,
+            4.309419041965157
+          ],
+          "checksums": [
+            707387,
+            707387,
+            707387
+          ]
+        },
+        "mlx_bf16": {
+          "median_prefill_seconds": 24.761827040929347,
+          "median_decode_seconds": 3.4189713340019807,
+          "prefill_tokens_per_second": 1323.327230492204,
+          "decode_tokens_per_second": 74.87632243477935,
+          "prefill_run_seconds": [
+            24.685257457895204,
+            24.761827040929347,
+            24.78452808293514
+          ],
+          "decode_run_seconds": [
+            3.4189713340019807,
+            3.4136615419993177,
+            3.608195999986492
+          ],
+          "checksums": [
+            707387,
+            707387,
+            707387
+          ]
+        }
+      },
+      "ratios": {
+        "zig_fp32_prefill_speedup_over_mlx_fp32": 0.08454501195225697,
+        "mlx_fp32_prefill_speedup_over_zig_fp32": 11.828018908610545,
+        "zig_fp32_decode_speedup_over_mlx_fp32": 1.341420717612363,
+        "mlx_fp32_decode_speedup_over_zig_fp32": 0.7454782730506291,
+        "zig_fp32_prefill_speedup_over_mlx_bf16": 0.06907557580218351,
+        "mlx_bf16_prefill_speedup_over_zig_fp32": 14.476897056403395,
+        "zig_fp32_decode_speedup_over_mlx_bf16": 1.0613424228555226,
+        "mlx_bf16_decode_speedup_over_zig_fp32": 0.9422029860160664
+      }
+    }
+  ],
+  "source_sha256": {
+    "src/main.zig": "0d8115cb9cc282a8576536491b677464fdb164278fc7302d7f3275f87ba422e3",
+    "src/session.zig": "7890f4fb9d75004893d9caf305142f38f2c0d083f563477a4b9d514508cd4c78",
+    "src/model.zig": "f119811977c33991088cb3490cda1d4c65d19323ef53676385b13e696c58a69c",
+    "src/metal.zig": "60dbf65b39596b4c6117d4472661437669e4338b683cedef387b275a609f23fb",
+    "src/metal.m": "b82caf765735cfd9fd5a35c7a7d3eadd68aa756e25d955e4bab2794fda95a0cb",
+    "src/attention_mlx.metal": "c92b60bd60d55c109919c48290c3770aefbbbba619335398c8364b1218a8c082",
+    "src/resident_plan.zig": "affebe5f142c05a1073ee66c1486c6e8e9e47aef0b4c88118757d3fe864972c0",
+    "src/resident_plan.metal": "8f8a95962af3ed420fecc6c7f3335c7b0b64b1816bf22b49215a6668a9202c2b",
+    "src/benchmark.zig": "5d2b6825bb578b4b6804282bb9810936f7a5777b3aa20f939c38d82d25a7184d",
+    "tools/benchmark.py": "95f97b02fb4ee181229f6217a15890c1d7d841e25f1cecb58bd54ff8d031ed2d",
+    "proofs/ResidentProofs.lean": "8a33a11afc62566fad057a5d639e5ef84f76469d86f1bb37708d874053b6fd26"
+  },
+  "publication": "Measurements captured before publication; source fingerprints identify the tested working tree."
+}

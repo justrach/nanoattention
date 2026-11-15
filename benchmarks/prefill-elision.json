@@ -1,0 +1,238 @@
+{
+  "change": "Elide terminal normalization and vocabulary projection on non-final staged prefill tokens only; no decode-kernel or resident-plan change.",
+  "environment": {
+    "device": "Apple M3 Ultra",
+    "gpu_cores": 60,
+    "unified_memory_gib": 256,
+    "zig": "0.17.0",
+    "optimize": "ReleaseSafe",
+    "mlx": "0.32.4"
+  },
+  "workload": {
+    "prompt_tokens": 16384,
+    "decode_tokens": 256,
+    "context": 16640,
+    "repeats": 3,
+    "staged_row_tile": 2,
+    "mlx_attention": true,
+    "reuse_prefill": true,
+    "token_arrays_sha256": "53d5d006012e8a38ae394038aff147e11f9b89cbe3701f44a64172031cde80e1"
+  },
+  "before": {
+    "prefill_seconds": 158.132777,
+    "prefill_gpu_seconds": 133.578847985,
+    "prefill_samples": 1,
+    "decode_seconds": [
+      2.978961,
+      2.812283,
+      2.850233
+    ],
+    "median_decode_seconds": 2.850233,
+    "decode_tokens_per_second": 89.81721845196516,
+    "decode_gpu_seconds": [
+      2.457310291,
+      2.458802874,
+      2.456841749
+    ],
+    "checksums": [
+      696337,
+      696337,
+      696337
+    ],
+    "submissions_per_token": [
+      1,
+      1,
+      1
+    ],
+    "dispatches_per_token": [
+      503,
+      503,
+      503
+    ]
+  },
+  "retained": {
+    "prefill_seconds": 152.407385,
+    "prefill_gpu_seconds": 128.402725386,
+    "prefill_samples": 1,
+    "decode_seconds": [
+      3.055359,
+      2.96269,
+      2.79063
+    ],
+    "median_decode_seconds": 2.96269,
+    "decode_tokens_per_second": 86.40796033334571,
+    "decode_gpu_seconds": [
+      2.438760291,
+      2.439179918,
+      2.439911167
+    ],
+    "checksums": [
+      696337,
+      696337,
+      696337
+    ],
+    "submissions_per_token": [
+      1,
+      1,
+      1
+    ],
+    "dispatches_per_token": [
+      503,
+      503,
+      503
+    ]
+  },
+  "initial_head_only_run": {
+    "prefill_seconds": 145.461716,
+    "prefill_gpu_seconds": 129.121840325,
+    "prefill_samples": 1,
+    "decode_seconds": [
+      2.798367,
+      2.856532,
+      2.669051
+    ],
+    "median_decode_seconds": 2.798367,
+    "decode_tokens_per_second": 91.48192499411265,
+    "decode_gpu_seconds": [
+      2.439579416,
+      2.442718125,
+      2.435743709
+    ],
+    "checksums": [
+      696337,
+      696337,
+      696337
+    ],
+    "submissions_per_token": [
+      1,
+      1,
+      1
+    ],
+    "dispatches_per_token": [
+      503,
+      503,
+      503
+    ]
+  },
+  "rejected_single_simd_router": {
+    "reason": "No end-to-end GPU decode benefit; removed rather than attributing wall-clock noise to a kernel win.",
+    "timings": {
+      "prefill_seconds": 145.929939,
+      "prefill_gpu_seconds": 128.968269749,
+      "prefill_samples": 1,
+      "decode_seconds": [
+        2.682679,
+        2.68006,
+        2.679726
+      ],
+      "median_decode_seconds": 2.68006,
+      "decode_tokens_per_second": 95.52024954665194,
+      "decode_gpu_seconds": [
+        2.454502625,
+        2.454317041,
+        2.453385166
+      ],
+      "checksums": [
+        696337,
+        696337,
+        696337
+      ],
+      "submissions_per_token": [
+        1,
+        1,
+        1
+      ],
+      "dispatches_per_token": [
+        503,
+        503,
+        503
+      ]
+    }
+  },
+  "prefill_wall_latency_reduction_percent": 3.6206231931283916,
+  "prefill_gpu_latency_reduction_percent": 3.874956759307635,
+  "accuracy": {
+    "teacher_forced_prediction_agreement_per_repeat": 256,
+    "session_comparison": {
+      "status": "pass",
+      "initial_prompt_tokens": 16384,
+      "scope": "retained head-only optimization vs original full-head prefill; two persistent turns, four boundary vocabulary rows, 32 generated tokens; not every logit or KV element",
+      "turns": [
+        {
+          "id": 1,
+          "cache_before": 0,
+          "cache_after": 16400,
+          "generated_tokens": 16,
+          "all_vocabulary_rows_bit_exact": 2,
+          "before_prefill_seconds": 151.3445589999901,
+          "after_prefill_seconds": 145.45767000003252
+        },
+        {
+          "id": 2,
+          "cache_before": 16400,
+          "cache_after": 16473,
+          "generated_tokens": 16,
+          "all_vocabulary_rows_bit_exact": 2,
+          "before_prefill_seconds": 0.5951829999685287,
+          "after_prefill_seconds": 0.5766960000619292
+        }
+      ]
+    },
+    "stock_sequential_fp32_mlx": {
+      "native_execution": {
+        "mode": "staged",
+        "resident_workers": 0,
+        "resident_row_tile": 1,
+        "staged_row_tile": 2,
+        "attention_implementation": "mlx_layout_128_stripes"
+      },
+      "precision_note": "FP32 activations, accumulation, and checkpoint weights are unchanged; MLX-layout mode changes floating-point reduction association.",
+      "prompt_tokens": 4096,
+      "generated_tokens": 16,
+      "evaluated_positions": 16,
+      "greedy_decode_agreement": 16,
+      "max_absolute_logit_error": 0.0,
+      "rms_logit_error": 0.0,
+      "top1_agreement": 16,
+      "last_native_top1": 1026,
+      "last_mlx_top1": 1026,
+      "prompt_protocol": "Exact-length raw code prefix: repeat tokenizer.encode(CONTINUATION, add_special_tokens=False) token IDs and truncate to the requested length; no chat template, padding, or synthetic cache positions. Context-length performance workload, not quality evaluation or the original short chat prompt.",
+      "context_length": 4112,
+      "validated_position_range": {
+        "start": 4095,
+        "end_inclusive": 4110,
+        "indexing": "zero-based absolute input token position"
+      },
+      "mlx_prefill_chunk_size": 1,
+      "native_timeout_seconds": 316,
+      "reference_prefill_mode": "sequential",
+      "prefill_note": "Native and MLX actually prefill every prefix token; native eval emits only --logits-from onward, and MLX retains only the final prefill row plus cached decode rows. Earlier prefill logits are not validated."
+    }
+  },
+  "checks": {
+    "native_tests": 60,
+    "python_tests": 52,
+    "lean_proofs_and_exact_bindings": "pass during final build",
+    "tiny_checkpoint_sessions": "F32 and quantized BF16 NumPy/fresh-native parity, reset, final-token commitment, sliding wrap, byte accounting and overflow"
+  },
+  "fingerprints": {
+    "before_benchmark_sha256": "c16b5f34edaad593dc6f3dde2be3823340223282318dc1fb21348b04b64d2cbe",
+    "retained_benchmark_sha256": "f6aac9f50b2217e1684d5ecba79aa569e74bb3dacf2251bfcee281d186261293",
+    "before_session_sha256": "f2be8ee140f5f1fd4bd368ebf204d9d242476ac0bffb17fed6f5f78f7fe32938",
+    "retained_session_sha256": "59e04e23e66bf1c44950d676ef0c9bd0a0e725d56e614b38fc01e320e62d0bee",
+    "retained_sources": {
+      "src/model.zig": "1a9c9c498fd3e1ec14b1e58f21ffb62f23ec4523f5f89300e2a50a5a00608174",
+      "src/main.zig": "b9f0de1a28a82c3091675d8e6cedbf9da16af46758fa65bc17e907fc7ac6c695",
+      "src/session.zig": "8e1bf319814e0f103e2d31e2168bfc459d7dab61badc463321b38d98c056b290",
+      "src/benchmark.zig": "3ae4e2eee6608db7f1bbc5f7d69bc4f68c772a7e93fb3fd7315cd0d448125019"
+    }
+  },
+  "limitations": [
+    "Single timed prefill sample per benchmark executable; not a broad latency distribution.",
+    "Decode math is unchanged; observed wall-time variation is not a demonstrated decode speedup.",
+    "The 16K persistent check compares four boundary vocabulary rows and 32 generated tokens, not every logit or KV element.",
+    "MLX check covers the last 4K-prefill row and 15 cached-decode rows, not all prefix logits.",
+    "Still sequential prefill; no claim to match MLX batched-prefill latency.",
+    "Lean contracts remain integer scheduling/index contracts, not a proof of IEEE754 or end-to-end model equivalence."
+  ]
+}

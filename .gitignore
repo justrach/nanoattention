@@ -1,5 +1,6 @@
 .zig-cache/
 zig-out/
+target/
 .lake/
 .venv/
 __pycache__/

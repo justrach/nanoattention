@@ -1,6 +1,7 @@
 const std = @import("std");
 extern fn fm_open([*:0]const u8) ?*anyopaque;
 extern fn fm_close(*anyopaque) void;
+extern fn fm_is_m3_ultra(*anyopaque) c_int;
 extern fn fm_error() [*:0]const u8;
 extern fn fm_finish(*anyopaque) c_int;
 extern fn fm_alloc(*anyopaque, usize) ?*anyopaque;
@@ -102,7 +103,14 @@ pub const Context = struct {
     handle: *anyopaque,
 
     pub fn init() !Context {
-        return .{ .handle = fm_open(@embedFile("kernels.metal") ++ "\n" ++ @embedFile("resident_plan.metal") ++ "\n" ++ @embedFile("row_tiling.metal") ++ "\n" ++ @embedFile("routing.metal") ++ "\n" ++ @embedFile("dense_matvec.metal") ++ "\n" ++ @embedFile("attention_parallel.metal") ++ "\n" ++ @embedFile("normalization.metal") ++ "\n" ++ @embedFile("resident.metal")) orelse return failure() };
+        return initMatched(false);
+    }
+    pub fn initMatched(matched: bool) !Context {
+        const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("resident_plan.metal") ++ "\n" ++ @embedFile("row_tiling.metal") ++ "\n" ++ @embedFile("routing.metal") ++ "\n" ++ @embedFile("dense_matvec.metal") ++ "\n" ++ @embedFile("attention_parallel.metal") ++ "\n" ++ @embedFile("attention_split.metal") ++ "\n" ++ @embedFile("attention_ordered.metal") ++ "\n" ++ @embedFile("attention_mlx.metal") ++ "\n" ++ @embedFile("normalization.metal") ++ "\n" ++ @embedFile("normalization_aligned.metal") ++ "\n" ++ @embedFile("resident.metal");
+        return .{ .handle = fm_open(if (matched) "#define FLINT_MLX_MATH 1\n" ++ source else source) orelse return failure() };
+    }
+    pub fn isM3Ultra(self: Context) bool {
+        return fm_is_m3_ultra(self.handle) != 0;
     }
     pub fn deinit(self: Context) void {
         fm_close(self.handle);

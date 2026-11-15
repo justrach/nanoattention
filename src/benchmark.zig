@@ -7,7 +7,15 @@ const sampling = @import("sampling.zig");
 
 const Timespec = extern struct { sec: i64, nsec: i64 };
 extern "c" fn clock_gettime(c_int, *Timespec) c_int;
+extern "c" fn clock() c_ulong;
 extern "c" fn write(c_int, [*]const u8, usize) isize;
+
+const DecodeCandidate = struct {
+    head_row_tile: u32 = 2,
+    packed_router: bool = false,
+    parallel_down: bool = false,
+    down_row_tile: u32 = 0,
+};
 
 const Input = struct {
     checkpoint: []const u8,
@@ -18,6 +26,39 @@ const Input = struct {
     resident_row_tile: u32 = 1,
     staged_row_tile: u32 = 1,
     emit_predictions: bool = false,
+    reuse_prefill: bool = false,
+    mlx_attention: bool = false,
+    attention_chunk: ?u32 = null,
+    attention_candidates: ?[]const u32 = null,
+    decode_candidates: ?[]const DecodeCandidate = null,
+};
+
+// Decode-only trials may restore a prefix computed by real model inference.
+// Snapshot/restore is outside decode timing; no cache values or positions are
+// fabricated. The single prefill sample is labeled explicitly in every row.
+const Prefix = struct {
+    position: u32,
+    caches: []const struct { keys: []u8, values: []u8 },
+
+    fn save(a: std.mem.Allocator, model: *Model) !Prefix {
+        const caches = try a.alloc(@typeInfo(@FieldType(Prefix, "caches")).pointer.child, model.layers.len);
+        for (model.layers, caches) |layer, *cache| {
+            const bytes = try std.math.mul(usize, @min(model.position, layer.capacity), layer.keys.len / layer.capacity);
+            cache.* = .{
+                .keys = try a.dupe(u8, layer.keys.structs(u8)[0..bytes]),
+                .values = try a.dupe(u8, layer.values.structs(u8)[0..bytes]),
+            };
+        }
+        return .{ .position = model.position, .caches = caches };
+    }
+    fn restore(self: Prefix, model: *Model) void {
+        for (model.layers, self.caches) |layer, cache| {
+            @memcpy(layer.keys.structs(u8)[0..cache.keys.len], cache.keys);
+            @memcpy(layer.values.structs(u8)[0..cache.values.len], cache.values);
+        }
+        model.position = self.position;
+        model.failed = false;
+    }
 };
 
 fn now() !f64 {
@@ -56,10 +97,25 @@ pub fn main(init: std.process.Init) !void {
     if (input.staged_row_tile != 1 and input.staged_row_tile != 2 and input.staged_row_tile != 4 and input.staged_row_tile != 8) return error.InvalidStagedRowTile;
     if (input.resident_workers != 0 and input.staged_row_tile != 1) return error.StagedTuningRequiresStaged;
     if (input.resident_workers == 0 and input.resident_row_tile != 1) return error.ResidentTuningRequiresResident;
+    if (input.mlx_attention and (input.resident_workers != 0 or input.attention_chunk != null or input.attention_candidates != null)) return error.ConflictingAttentionMode;
+    const single = [_]u32{input.attention_chunk orelse 0};
+    const candidates = input.attention_candidates orelse &single;
+    if (candidates.len == 0) return error.EmptyAttentionCandidates;
+    if (candidates.len > 1 and !input.reuse_prefill) return error.AttentionCandidatesRequirePrefixRestore;
+    if (input.resident_workers != 0 and (input.attention_chunk != null or input.attention_candidates != null)) return error.AttentionTuningRequiresStaged;
+    for (candidates) |chunk| if (chunk != 0 and !@import("resident.zig").certified.validAttentionChunk(chunk)) return error.InvalidAttentionChunk;
+    if (input.decode_candidates) |configs| {
+        if (!input.reuse_prefill or !input.mlx_attention or input.resident_workers != 0 or configs.len == 0 or configs.len > 16 or input.decode.len == 0) return error.InvalidDecodeSweep;
+        if (configs[0].head_row_tile != input.staged_row_tile or configs[0].packed_router or configs[0].parallel_down or (configs[0].down_row_tile != 0 and configs[0].down_row_tile != input.staged_row_tile)) return error.DecodeSweepRequiresBaselineFirst;
+        for (configs) |config| {
+            if (!@import("resident.zig").certified.validRowTile(config.head_row_tile) or
+                (config.down_row_tile != 0 and !@import("resident.zig").certified.validRowTile(config.down_row_tile))) return error.InvalidStagedRowTile;
+        }
+    }
     const required = try std.math.add(usize, input.prompt.len, input.decode.len);
     const context = std.math.cast(u32, @max(1, required)) orelse return error.ContextExhausted;
 
-    const ctx = try metal.Context.init();
+    const ctx = try metal.Context.initMatched(input.mlx_attention);
     defer ctx.deinit();
     var model = try Model.init(init.gpa, ctx, input.checkpoint, context);
     defer model.deinit();
@@ -68,46 +124,151 @@ pub fn main(init: std.process.Init) !void {
         try model.setResidentRowTile(input.resident_row_tile);
     } else {
         try model.setStagedRowTile(input.staged_row_tile);
+        try model.setAttentionChunk(candidates[0]);
     }
+    if (input.mlx_attention) try model.enableMlxAttention();
     // Validate all inputs before mutating the cache; repetitions never deduplicate
     // input tokens, stop at EOS, or feed the predicted tokens back into the model.
     for (input.prompt) |token| if (token >= model.cfg.vocab_size) return error.InvalidToken;
     for (input.decode) |token| if (token >= model.cfg.vocab_size) return error.InvalidToken;
 
-    for (input.prompt) |token| _ = try model.forward(token);
-    for (input.decode[0..@min(8, input.decode.len)]) |token|
-        _ = try sampling.greedy(try model.forward(token));
-
+    const seed_gpu_start = ctx.stats().gpu_seconds;
+    const seed_start = try now();
+    _ = try model.prefill(input.prompt);
+    const seed_prefill_seconds = (try now()) - seed_start;
+    const seed_prefill_gpu_seconds = ctx.stats().gpu_seconds - seed_gpu_start;
+    const prefix: ?Prefix = if (input.reuse_prefill) try Prefix.save(init.arena.allocator(), &model) else null;
+    if (input.decode_candidates != null) return decodeSweep(&model, input, prefix.?, seed_prefill_seconds, seed_prefill_gpu_seconds, init.arena.allocator());
     const predictions: []u32 = if (input.emit_predictions) try init.arena.allocator().alloc(u32, input.decode.len) else &.{};
-    for (0..input.repeats) |repeat| {
-        try model.reset();
-        const gpu_start = ctx.stats().gpu_seconds;
-        const start = try now();
-        for (input.prompt) |token| _ = try model.forward(token);
-        const prefilled = try now();
-        const gpu_prefilled = ctx.stats().gpu_seconds;
-        var checksum: u64 = 0;
-        for (input.decode, 0..) |token, i| {
-            const prediction = try sampling.greedy(try model.forward(token));
-            checksum += prediction;
-            if (input.emit_predictions) predictions[i] = prediction;
-        }
-        const finished = try now();
-        const gpu_finished = ctx.stats().gpu_seconds;
-        var buffer: [512]u8 = undefined;
-        try output(try std.fmt.bufPrint(
-            &buffer,
-            "{{\"engine\":\"zig_fp32\",\"repeat\":{d},\"prefill_seconds\":{d:.9},\"decode_seconds\":{d:.9},\"checksum\":{d},\"submissions_per_token\":{d},\"dispatches_per_token\":{d},\"prefill_gpu_seconds\":{d:.9},\"decode_gpu_seconds\":{d:.9},\"resident_row_tile\":{d},\"staged_row_tile\":{d}",
-            .{ repeat, prefilled - start, finished - prefilled, checksum, model.last_execution.submissions, model.last_execution.dispatches, gpu_prefilled - gpu_start, gpu_finished - gpu_prefilled, input.resident_row_tile, model.staged_row_tile },
-        ));
-        if (input.emit_predictions) {
-            try output(",\"predictions\":[");
-            for (predictions, 0..) |prediction, i| {
-                if (i > 0) try output(",");
-                try output(try std.fmt.bufPrint(&buffer, "{d}", .{prediction}));
+    for (candidates) |chunk| {
+        // Tuning changes only scheduling; every candidate receives the same
+        // genuinely computed prefix, never synthetic KV values or positions.
+        model.attention_chunk = chunk;
+        if (prefix) |snapshot| snapshot.restore(&model);
+        for (input.decode[0..@min(8, input.decode.len)]) |token|
+            _ = try sampling.greedy(try model.forward(token));
+        for (0..input.repeats) |repeat| {
+            if (prefix) |snapshot| snapshot.restore(&model) else try model.reset();
+            const gpu_start = ctx.stats().gpu_seconds;
+            const start = try now();
+            if (!input.reuse_prefill) _ = try model.prefill(input.prompt);
+            const prefilled = try now();
+            const gpu_prefilled = ctx.stats().gpu_seconds;
+            var checksum: u64 = 0;
+            for (input.decode, 0..) |token, i| {
+                const prediction = try sampling.greedy(try model.forward(token));
+                checksum += prediction;
+                if (input.emit_predictions) predictions[i] = prediction;
             }
-            try output("]");
+            const finished = try now();
+            const gpu_finished = ctx.stats().gpu_seconds;
+            var buffer: [768]u8 = undefined;
+            try output(try std.fmt.bufPrint(
+                &buffer,
+                "{{\"engine\":\"zig_fp32\",\"repeat\":{d},\"prefill_seconds\":{d:.9},\"decode_seconds\":{d:.9},\"checksum\":{d},\"submissions_per_token\":{d},\"dispatches_per_token\":{d},\"prefill_gpu_seconds\":{d:.9},\"decode_gpu_seconds\":{d:.9},\"resident_row_tile\":{d},\"staged_row_tile\":{d},\"prefill_reused\":{},\"prefill_samples\":{d},\"attention_chunk\":{d}",
+                .{ repeat, if (input.reuse_prefill) seed_prefill_seconds else prefilled - start, finished - prefilled, checksum, model.last_execution.submissions, model.last_execution.dispatches, if (input.reuse_prefill) seed_prefill_gpu_seconds else gpu_prefilled - gpu_start, gpu_finished - gpu_prefilled, input.resident_row_tile, model.staged_row_tile, input.reuse_prefill, if (input.reuse_prefill) @as(u32, 1) else input.repeats, chunk },
+            ));
+            if (model.mlx_attention) try output(",\"attention_implementation\":\"mlx_layout_128_stripes\"");
+            if (input.emit_predictions) {
+                try output(",\"predictions\":[");
+                for (predictions, 0..) |prediction, i| {
+                    if (i > 0) try output(",");
+                    try output(try std.fmt.bufPrint(&buffer, "{d}", .{prediction}));
+                }
+                try output("]");
+            }
+            try output("}\n");
         }
-        try output("}\n");
+    }
+}
+
+// Candidate admission compares every vocabulary bit at every decode position,
+// outside timing. Timing alternates candidates against one real prefix snapshot.
+fn decodeSweep(model: *Model, input: Input, prefix: Prefix, prefill_seconds: f64, prefill_gpu_seconds: f64, a: std.mem.Allocator) !void {
+    const configs = input.decode_candidates.?;
+    for (configs) |config| if (config.parallel_down) {
+        try model.prepareParallelDown();
+        break;
+    };
+    const vocab: usize = model.cfg.vocab_size;
+    const reference = try a.alloc(u32, try std.math.mul(usize, input.decode.len, vocab));
+    const admitted = try a.alloc(bool, configs.len);
+    @memset(admitted, true);
+    for (configs, 0..) |config, index| {
+        model.head_row_tile = config.head_row_tile;
+        model.packed_router = config.packed_router;
+        model.parallel_down = config.parallel_down;
+        model.down_row_tile = config.down_row_tile;
+        prefix.restore(model);
+        for (input.decode, 0..) |token, position| {
+            const logits = try model.forward(token);
+            _ = try sampling.greedy(logits);
+            const bits = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(logits));
+            const expected = reference[position * vocab ..][0..vocab];
+            if (index == 0) @memcpy(expected, bits) else if (!std.mem.eql(u32, expected, bits)) {
+                std.debug.print("Decode candidate {d} changes vocabulary bits at position {d}\n", .{ index, position });
+                admitted[index] = false;
+                break;
+            }
+        }
+        try output(try std.json.Stringify.valueAlloc(a, .{ .phase = "validation", .candidate = index, .config = config, .positions = input.decode.len, .vocabulary = vocab, .logits_bit_exact = admitted[index] }, .{}));
+        try output("\n");
+    }
+    var model_buffer_bytes: u64 = 0;
+    var kv_allocated_bytes: u64 = 0;
+    for (model.buffers.items) |buffer| model_buffer_bytes += buffer.len;
+    for (model.layers) |layer| kv_allocated_bytes += layer.keys.len + layer.values.len;
+    const predictions = try a.alloc(u32, input.decode.len);
+    for (0..input.repeats) |repeat| {
+        for (0..configs.len) |offset| {
+            // Rotate order to avoid always granting one candidate the same
+            // thermal/CPU-scheduling position within a round.
+            const index = (offset + repeat) % configs.len;
+            if (!admitted[index]) continue;
+            const config = configs[index];
+            model.head_row_tile = config.head_row_tile;
+            model.packed_router = config.packed_router;
+            model.parallel_down = config.parallel_down;
+            model.down_row_tile = config.down_row_tile;
+            prefix.restore(model);
+            for (input.decode[0..@min(8, input.decode.len)]) |token| _ = try sampling.greedy(try model.forward(token));
+            prefix.restore(model);
+            const cpu_start = clock();
+            const gpu_start = model.ctx.stats().gpu_seconds;
+            const start = try now();
+            var checksum: u64 = 0;
+            for (input.decode, predictions) |token, *prediction| {
+                prediction.* = try sampling.greedy(try model.forward(token));
+                checksum += prediction.*;
+            }
+            const seconds = (try now()) - start;
+            const gpu_seconds = model.ctx.stats().gpu_seconds - gpu_start;
+            // Darwin CLOCKS_PER_SEC is 1,000,000; includes all process threads.
+            const cpu_seconds = @as(f64, @floatFromInt(clock() - cpu_start)) / 1000000.0;
+            const row = .{
+                .phase = "timing",
+                .engine = "zig_fp32",
+                .repeat = repeat,
+                .candidate = index,
+                .config = config,
+                .prefill_seconds = prefill_seconds,
+                .prefill_gpu_seconds = prefill_gpu_seconds,
+                .prefill_samples = @as(u32, 1),
+                .prefill_reused = true,
+                .decode_seconds = seconds,
+                .decode_gpu_seconds = gpu_seconds,
+                .decode_cpu_seconds = cpu_seconds,
+                .checksum = checksum,
+                .predictions = predictions,
+                .submissions_per_token = model.last_execution.submissions,
+                .dispatches_per_token = model.last_execution.dispatches,
+                .checkpoint_mapped_bytes = model.store.bytes,
+                .model_buffer_bytes = model_buffer_bytes,
+                .kv_allocated_bytes = kv_allocated_bytes,
+                .reference_logit_bytes = reference.len * @sizeOf(u32),
+            };
+            try output(try std.json.Stringify.valueAlloc(a, row, .{}));
+            try output("\n");
+        }
     }
 }

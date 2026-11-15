@@ -25,4 +25,22 @@ The independent Lean proof covers the abstract integer schedule/control contract
 
 The masked-nibble activation prescaling and two-word, 16-input lane layout in the INT4/group-64 portions of `src/kernels.metal` and `src/row_tiling.metal` are adapted from MLX's [`mlx/backend/metal/kernels/quantized.h`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/quantized.h), including the INT4 `qdot` / `qmv_fast` approach. Multi-row input reuse follows the same design direction; expert selection, native descriptors, model scheduling, FP32 integration, and verification are implemented here.
 
+## MLX-layout attention and numerical scheduling
+
+The optional `src/attention_mlx.metal` path adapts the float32 D128 single-pass
+and two-pass vector attention from MLX v0.32.4's
+`mlx/backend/metal/kernels/sdpa_vector.h`. It retains the source's adjacent-four
+lane layout, interleaved stripes, learned sink ownership, online recurrence and
+transpose/reduction association, while using this engine's native descriptors
+and ring-cache storage. Its Apple copyright and MIT notice are included in the
+shader.
+
+The opt-in normalization, RoPE phase, router GEMV, stable sigmoid and grouped
+quantized arithmetic follow the corresponding v0.32.4 `rms_norm.metal`,
+`rope.metal`, `gemv.h`, `unary_ops.h` and `quantized.h` implementation strategies.
+Native sliding attention also reproduces MLX-LM's full rotating-cache physical
+iteration order. Explicit expert-weight rounding preserves a materialization
+boundary from MLX's separate multiply and reduction operations; it does not
+change model weights or expert selection semantics.
+
 MLX is copyright © 2023 Apple Inc. and licensed under the MIT License; a copy is included in `licenses/mlx-MIT.txt`. This engine does not link to or execute MLX. MLX is used separately only for optional reference comparisons and benchmarks. The integer proofs do not establish IEEE754 equivalence of MLX's or this implementation's reductions; unchanged numerical checks remain required.

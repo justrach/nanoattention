@@ -1,0 +1,431 @@
+{
+  "status": "Persistent KV and numerical checks passed; coding completion/functional limits are separate.",
+  "workload": {
+    "description": "Three user turns: topological plan_order(graph), missing/cycle/duplicate handling, then nonmutation and lexicographically smallest ready-task ordering.",
+    "source": "82 uniquely structured synthetic repository/spec components; not a real-repository or broad coding-quality benchmark.",
+    "prompt_tokens_actual": 16483,
+    "template": "Checkpoint local chat template; strict full cached prefix equality in raw IDs and rendered bytes; new requests contain suffixes only.",
+    "precision": "Native FP32 activation/accumulation/KV; existing affine-INT4 checkpoint; stock MLX FP32 reference.",
+    "timing": "Engine prefill/decode phases, commit-inclusive. Excludes model loading, tokenizer/template work and JSON transfer. Responses are not streamed; suffix prefill time is not client first-byte latency."
+  },
+  "attempts": [
+    {
+      "generation_budget_per_turn": 1024,
+      "protocol_status": "complete",
+      "sizing": {
+        "target_prompt_tokens": 16384,
+        "actual_prompt_tokens": 16483,
+        "synthetic_components": 82,
+        "source_context": "synthetic",
+        "sizing": "nearest complete structured component; no raw token repetition/truncation"
+      },
+      "allocated_context_tokens": 32768,
+      "ending_cache_tokens": 19675,
+      "generated_tokens": 3072,
+      "complete_eos_turns": 0,
+      "turns": [
+        {
+          "id": 1,
+          "cache_before": 0,
+          "cache_after": 17507,
+          "prefill_tokens": 16483,
+          "decode_forward_tokens": 1024,
+          "reused_prefix_tokens": 0,
+          "prefill_seconds": 162.26941500010435,
+          "decode_seconds": 11.111076999921352,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1077465088,
+          "eos": false,
+          "decode_tokens_per_second": 92.16028293272095,
+          "completion": {
+            "turn": 1,
+            "stop_reason": "length_limit",
+            "reasoning_complete": false,
+            "has_final_answer": false
+          },
+          "static_check": {
+            "syntax": "not_checked_no_final_answer",
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 1,
+            "cache_before": 0,
+            "cache_after": 17507,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 5776,
+              "reference_top1": 5776,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 1024,
+            "generated_tokens": 1024
+          }
+        },
+        {
+          "id": 2,
+          "cache_before": 17507,
+          "cache_after": 18588,
+          "prefill_tokens": 57,
+          "decode_forward_tokens": 1024,
+          "reused_prefix_tokens": 17507,
+          "prefill_seconds": 0.6078249999554828,
+          "decode_seconds": 10.932846000068821,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1139453952,
+          "eos": false,
+          "decode_tokens_per_second": 93.66271142880399,
+          "completion": {
+            "turn": 2,
+            "stop_reason": "length_limit",
+            "reasoning_complete": false,
+            "has_final_answer": false
+          },
+          "static_check": {
+            "syntax": "not_checked_no_final_answer",
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 2,
+            "cache_before": 17507,
+            "cache_after": 18588,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 25,
+              "reference_top1": 25,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 1024,
+            "generated_tokens": 1024
+          }
+        },
+        {
+          "id": 3,
+          "cache_before": 18588,
+          "cache_after": 19675,
+          "prefill_tokens": 63,
+          "decode_forward_tokens": 1024,
+          "reused_prefix_tokens": 18588,
+          "prefill_seconds": 0.6736419999506325,
+          "decode_seconds": 11.00783500005491,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1201786880,
+          "eos": false,
+          "decode_tokens_per_second": 93.02465016916514,
+          "completion": {
+            "turn": 3,
+            "stop_reason": "length_limit",
+            "reasoning_complete": false,
+            "has_final_answer": false
+          },
+          "static_check": {
+            "syntax": "not_checked_no_final_answer",
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 3,
+            "cache_before": 18588,
+            "cache_after": 19675,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 65,
+              "reference_top1": 65,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 1024,
+            "generated_tokens": 1024
+          }
+        }
+      ],
+      "fresh_native_replay": {
+        "status": "pass",
+        "bit_exact": true,
+        "replayed_tokens": 19675,
+        "checked_position": 19674,
+        "vocabulary_size": 150144,
+        "max_absolute_error": 0.0,
+        "transcript_sha256": "fe6cd34b611a404aa0c8018431330de946c63661b5c9bf05f8416b0416196175",
+        "scope": "one final all-vocabulary row after a fresh full-history native replay; not every cached KV element"
+      }
+    },
+    {
+      "generation_budget_per_turn": 4096,
+      "protocol_status": "complete",
+      "sizing": {
+        "target_prompt_tokens": 16384,
+        "actual_prompt_tokens": 16483,
+        "synthetic_components": 82,
+        "source_context": "synthetic",
+        "sizing": "nearest complete structured component; no raw token repetition/truncation"
+      },
+      "allocated_context_tokens": 32768,
+      "ending_cache_tokens": 28623,
+      "generated_tokens": 12020,
+      "complete_eos_turns": 1,
+      "turns": [
+        {
+          "id": 1,
+          "cache_before": 0,
+          "cache_after": 20579,
+          "prefill_tokens": 16483,
+          "decode_forward_tokens": 4096,
+          "reused_prefix_tokens": 0,
+          "prefill_seconds": 160.95199299999513,
+          "decode_seconds": 44.27472599991597,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1253625856,
+          "eos": false,
+          "decode_tokens_per_second": 92.51327721390695,
+          "completion": {
+            "stop_reason": "length_limit",
+            "reasoning_complete": false,
+            "has_final_answer": false
+          },
+          "static_check": {
+            "syntax": "not_checked_no_final_answer",
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 1,
+            "cache_before": 0,
+            "cache_after": 20579,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 566,
+              "reference_top1": 566,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 4096,
+            "generated_tokens": 4096
+          }
+        },
+        {
+          "id": 2,
+          "cache_before": 20579,
+          "cache_after": 24732,
+          "prefill_tokens": 57,
+          "decode_forward_tokens": 4096,
+          "reused_prefix_tokens": 20579,
+          "prefill_seconds": 0.6302770000183955,
+          "decode_seconds": 46.4166860000696,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1491775488,
+          "eos": false,
+          "decode_tokens_per_second": 88.24412841523969,
+          "completion": {
+            "stop_reason": "length_limit",
+            "reasoning_complete": false,
+            "has_final_answer": false
+          },
+          "static_check": {
+            "syntax": "not_checked_no_final_answer",
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 2,
+            "cache_before": 20579,
+            "cache_after": 24732,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 3111,
+              "reference_top1": 3111,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 4096,
+            "generated_tokens": 4096
+          }
+        },
+        {
+          "id": 3,
+          "cache_before": 24732,
+          "cache_after": 28623,
+          "prefill_tokens": 63,
+          "decode_forward_tokens": 3828,
+          "reused_prefix_tokens": 24732,
+          "prefill_seconds": 0.739956000004895,
+          "decode_seconds": 45.80444199999329,
+          "kv_allocated_bytes": 1952591872,
+          "kv_valid_bytes": 1714900992,
+          "eos": true,
+          "decode_tokens_per_second": 83.57268057103634,
+          "completion": {
+            "stop_reason": "eos",
+            "reasoning_complete": true,
+            "has_final_answer": true
+          },
+          "static_check": {
+            "syntax": "valid",
+            "has_plan_order_definition": true,
+            "functional": "not_tested",
+            "executed": false
+          },
+          "mlx_reference": {
+            "turn": 3,
+            "cache_before": 24732,
+            "cache_after": 28623,
+            "prefill": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "final": {
+              "allclose": true,
+              "bit_exact": true,
+              "greedy_top1_agreement": true,
+              "native_top1": 150006,
+              "reference_top1": 150006,
+              "max_absolute_error": 0.0,
+              "rms_error": 0.0,
+              "vocabulary_size": 150144
+            },
+            "teacher_forced_greedy_matches": 3828,
+            "generated_tokens": 3828
+          }
+        }
+      ],
+      "fresh_native_replay": {
+        "status": "pass",
+        "bit_exact": true,
+        "replayed_tokens": 28623,
+        "checked_position": 28622,
+        "vocabulary_size": 150144,
+        "max_absolute_error": 0.0,
+        "transcript_sha256": "24c2b7b5c8c4601d0a3be2492ec027be5f080c111d921c57bfe889b9fcc0532d",
+        "scope": "one final all-vocabulary row after a fresh full-history native replay; not every cached KV element"
+      }
+    }
+  ],
+  "coding_quality": {
+    "first_attempt": "All three 1024-token responses hit length limits inside reasoning; no final answers. Earlier syntax checks on thought text were reassessed, not counted as code completion.",
+    "second_attempt": "4096-token budget: first two responses still hit limits before final answers; third emitted EOS and a syntactically valid plan_order function.",
+    "final_answer_sha256": "de45bf5a8ad8ce2c867530b54d2df6026dff44df8400667a30c6708860e24f9f",
+    "functional_check": {
+      "status": "unverified",
+      "executor": "isolated network-disabled sandbox",
+      "exit_code": 255,
+      "stdout": "",
+      "stderr": "",
+      "note": "Executor returned 255 without diagnostics. No functional pass is claimed. Code was not run through the host shell or coding driver; isolated-tool execution/completion is unknown.",
+      "direct_host_shell_execution": false
+    },
+    "claims": "One completed final function, not three successful completed coding answers. No task-quality guarantee."
+  },
+  "numerical_scope": {
+    "all_vocabulary_rows": "Prefill boundary and final committed-token boundary for each turn (six rows per attempt).",
+    "greedy": "Every generated token compared with the reference argmax while teacher-forcing identical recorded IDs.",
+    "fresh_replay": "One final all-vocabulary row after a separate full-history native run, with the same context and execution mode.",
+    "not_proved": "Not an all-element KV memory comparison or all-logit comparison at every prefix/decode position; not a universal model quality guarantee."
+  },
+  "checks": {
+    "release_safe_build": "pass",
+    "zig_unit_and_headless_metal_tests": 60,
+    "cpu_protocol_tests": 52,
+    "lean_binding_tests": 15,
+    "proof_verifier_tests": 6,
+    "tiny_persistent_kv_cases": [
+      "F32",
+      "BF16 affine INT4/INT8 embeddings"
+    ],
+    "lean_scope": "Integer schedule/indexing/ownership/bounds only; FP equivalence is empirical."
+  },
+  "source_sha256": {
+    "src/main.zig": "0d8115cb9cc282a8576536491b677464fdb164278fc7302d7f3275f87ba422e3",
+    "src/session.zig": "7890f4fb9d75004893d9caf305142f38f2c0d083f563477a4b9d514508cd4c78",
+    "src/model.zig": "f119811977c33991088cb3490cda1d4c65d19323ef53676385b13e696c58a69c",
+    "src/metal.zig": "60dbf65b39596b4c6117d4472661437669e4338b683cedef387b275a609f23fb",
+    "src/metal.m": "b82caf765735cfd9fd5a35c7a7d3eadd68aa756e25d955e4bab2794fda95a0cb",
+    "src/attention_mlx.metal": "c92b60bd60d55c109919c48290c3770aefbbbba619335398c8364b1218a8c082",
+    "src/normalization_aligned.metal": "eeeec6a80473ef470ca6166b0ce0313faefc575aa7888f20f17ded1f1f8b4641",
+    "src/kernels.metal": "1a0c9620e0f1b47930eb60d1c3a9dcac4e3ee4982d68ff94e8ab3bb6b5b41e93",
+    "src/row_tiling.metal": "dbf4069eb40fd2faf97d61d74a540489b4178b6cea6a6c154cc1db1ac20187e1",
+    "src/dense_matvec.metal": "0c8c0b32aa1580e569431a285e44dedf9d2f8f09794704062f7a39af97e57329",
+    "src/routing.metal": "072bf7c1bde06a5537b207e76abf77c99c54072f86943a2b5af675b262576747",
+    "src/resident_plan.zig": "affebe5f142c05a1073ee66c1486c6e8e9e47aef0b4c88118757d3fe864972c0",
+    "src/resident_plan.metal": "8f8a95962af3ed420fecc6c7f3335c7b0b64b1816bf22b49215a6668a9202c2b",
+    "tools/coding_multiturn.py": "b37c0031a1423aac77328e8061a76e0e05636610b3469a3e55d2a9670219c3ae",
+    "tools/check_sessions.py": "037c66826f81d7a15af1387798b83e2c532201422adbc5db1211ecb370a67417",
+    "tools/check_session_replay.py": "b239b607ba1e3b1fc7adae513cf150ae98757e6fc1617939f148c948f91abd3f",
+    "tools/test_coding_multiturn.py": "711a8202a8d8912357d9a1bb71d443cb25b51b7327a6182038c4bd8bf29562c3",
+    "proofs/ResidentProofs.lean": "8a33a11afc62566fad057a5d639e5ef84f76469d86f1bb37708d874053b6fd26"
+  },
+  "publication": "Measurements captured before publication; source fingerprints identify the tested working tree. Complete raw transcripts/logits remain ignored under target/."
+}

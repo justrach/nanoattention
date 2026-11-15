@@ -27,6 +27,9 @@ exports `threadgroup_size = 256`, `max_workers = 32`, `spin_limit = 10000000`,
 `max_layers = 49`, `row_tiles = [_]u32{1, 2, 4, 8}`,
 `router_lanes = 32`, `router_slots = 8`, `cached_router_experts = 256`,
 `dense_simds = 8`, `dense_max_cols = 8192`,
+`attention_chunks = [_]u32{128, 256, 512, 1024}`, `validAttentionChunk`,
+`attention_max_context = 262144`, `attention_max_heads = 64`,
+`attention_max_dim = 256`, `attention_simds = 8`, `attention_lanes = 32`,
 `validRowTile(tile: u32) bool`, enum `Op`, and
 `program(layers: u32) ?[]const u32`.
 `program` returns a distinct immutable static array for each count **1..49**
@@ -97,6 +100,63 @@ These facts certify the integer register layout, not top-k selection semantics,
 sigmoid arithmetic, Metal shuffles, or compiler register allocation. Those are
 checked empirically against the CPU reference and legacy GPU routing, including
 ties, partial expert counts, full-capacity selection, and nonfinite inputs.
+
+## MLX-layout and aligned-normalization certificates
+
+The opt-in MLX-layout candidate exports `mlx_attention_dim = 128`, 32 lanes,
+four adjacent elements per lane, 32 single/merge SIMDs, and admissible stripe
+counts 64/128/512/1024. Its packed state stride is 130 floats: 128 numerator elements,
+maximum at 128, denominator at 129. The shaders statically assert these
+specializations against the generated Metal binding; host allocation and launch
+sizes consume the corresponding Zig constants.
+
+Certificates establish adjacent-element coverage/uniqueness, interleaved token
+ownership `block + iteration*blocks`, guarded TK4 lookahead/advancement, GQA
+head ownership, unique sink ownership by block zero, merge coverage, and packed
+state UInt32 bounds (at most 8,519,680 float elements). Aligned normalization
+also certifies `2048 = 512*4` and `128 = 32*4` element ownership. The axiom audit
+and binding tests include these facts.
+
+The generated `mlxLargeDeviceBlocks(length)` policy selects 128 stripes below
+16,384 keys, 512 below 65,536, and 1024 thereafter. Integer certificates and CPU
+binding tests cover its threshold neighbors and validity through the context
+ceiling. This models the observed MLX `applegpu_g15d` GQA8 policy, not universal
+Apple GPU tuning. The host gates contexts of at least 16K to the validated
+M3 Ultra/GQA8 configuration and sizes scratch for the largest required stripe
+count. Changing block counts also changes FP32 association, so the policy must
+be validated independently with full-model numerical checks.
+
+These are integer-layout proofs, **not proofs of FP32 agreement with MLX**.
+Reduction association, sigmoid/exponential implementations, the Metal compiler,
+cache residency, synchronization and measured speed remain separate empirical
+acceptance requirements. Passing Lean does not turn a failed logit check into
+a pass.
+
+## Split-attention indexing certificates
+
+`attentionChunks` defines the admitted 128/256/512/1024-token chunks; the
+emitter exports the same list/predicate and matching Metal constants. The host
+checks dimensions/context against the emitted bounds, and the shaders consume
+the generated eight-SIMD, 32-lane geometry. Larger unsupported shapes retain
+the prior attention path rather than using an uncertified split launch.
+
+Relative to the effective sliding-window start, chunk `c`, SIMD `s`, iteration
+`i` owns `width*c + s + 8*i`. Certificates establish constructive coverage,
+unique ownership with within-chunk iteration bounds, nonempty chunk count,
+partial-chunk masking, guarded absolute reads, and nonwrapping initialization
+and loop advancement. Exactly chunk 0 / SIMD 0 owns the denominator-only sink.
+Head-major state indexing and its `dim+2` fields have unique ownership and
+UInt32 bounds; a separate theorem bounds row-major KV element indices under
+the stated context/head/dimension premises. Byte allocations require wider
+host arithmetic; the theorem does not claim a 16 GB float buffer is available.
+
+Each producer merges its local eight SIMD states into an **unnormalized**
+(maximum, denominator, weighted-value vector) record. A dependent merge dispatch
+combines only this token's active chunk records and normalizes once. Lean does
+not prove this floating-point algebra, implementation memory visibility, or
+performance. GPU tests separately compare against independent FP64 softmax at
+unchanged 1e-5 tolerance, including partial chunks, 1K/4K/8K, nonaligned sliding
+starts, ring wrap, GQA, partial dimensions, and sink dtype/offset cases.
 
 ## Fused QKV and split dense projection certificates
 

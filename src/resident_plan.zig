@@ -8,8 +8,22 @@ pub const router_lanes: u32 = 32;
 // Dense split reduction: integer ownership/bounds only; not reduction arithmetic.
 pub const dense_simds: u32 = 8;
 pub const dense_max_cols: u32 = 8192;
+// Split attention: integer ownership/index bounds only; no floating-point or memory-model claim.
+pub const attention_max_context: u32 = 262144;
+pub const attention_max_heads: u32 = 64;
+pub const attention_max_dim: u32 = 256;
+pub const attention_simds: u32 = 8;
+pub const attention_lanes: u32 = 32;
+pub const attention_chunks = [_]u32{128, 256, 512, 1024};
+pub fn validAttentionChunk(chunk: u32) bool {
+    return switch (chunk) {
+        128, 256, 512, 1024 => true,
+        else => false,
+    };
+}
 comptime {
     if (dense_simds * router_lanes != threadgroup_size) @compileError("dense geometry mismatch");
+    if (attention_simds * attention_lanes != threadgroup_size) @compileError("attention geometry mismatch");
 }
 pub const router_slots: u32 = 8;
 pub const cached_router_experts: u32 = 256;
@@ -30,6 +44,41 @@ pub fn stagedQkvLocalTile(tile: u32, qtiles: u32, ktiles: u32) u32 {
     return tile - (if (tile < qtiles) 0 else (if (tile < qtiles + ktiles) qtiles else qtiles + ktiles));
 }
 
+
+// MLX candidate/aligned norm: integer ownership only; no FP, Metal-model or liveness claim.
+pub const mlx_attention_dim: u32 = 128;
+pub const mlx_attention_lanes: u32 = 32;
+pub const mlx_attention_elements_per_lane: u32 = 4;
+pub const mlx_attention_single_simds: u32 = 32;
+pub const mlx_attention_merge_simds: u32 = 32;
+pub const mlx_attention_max_gqa: u32 = 32;
+pub const mlx_attention_max_heads: u32 = 64;
+pub const mlx_attention_max_context: u32 = 262144;
+pub const mlx_attention_max_blocks: u32 = 1024;
+pub const mlx_attention_max_state_elements: u32 = 8519680;
+pub const mlx_attention_state_stride: u32 = 130;
+pub const mlx_attention_max_field: u32 = 128;
+pub const mlx_attention_sum_field: u32 = 129;
+pub const aligned_norm_dim: u32 = 2048;
+pub const aligned_norm_threads: u32 = 512;
+pub const aligned_norm_elements_per_thread: u32 = 4;
+pub const aligned_head_dim: u32 = 128;
+pub const aligned_head_threads: u32 = 32;
+pub const aligned_head_elements_per_thread: u32 = 4;
+pub const mlx_attention_blocks = [_]u32{64, 128, 512, 1024};
+pub fn validMlxAttentionBlocks(blocks: u32) bool {
+    return switch (blocks) {
+        64, 128, 512, 1024 => true,
+        else => false,
+    };
+}
+// Flint GQA8 / apple_g15d host policy only; no universal MLX or performance claim.
+// Caller must separately enforce supported context, device, GQA and shape.
+pub fn mlxLargeDeviceBlocks(length: u32) u32 {
+    return if (length < 16384) 128
+        else if (length < 65536) 512
+        else 1024;
+}
 pub const Op = enum(u32) {
     embedding = 1,
     input_norm = 2,
