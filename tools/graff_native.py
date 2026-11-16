@@ -30,6 +30,31 @@ class Interrupted(Exception):
         self.signum = signum
 
 
+def supports_builtin_flint(graff):
+    """Detect the built-in provider via the public, content-free schema."""
+    probe_env = dict(os.environ)
+    probe_env.pop('NANOATTENTION_API_KEY', None)
+    probe_env.pop('GRAFF_NANOATTENTION_URL', None)
+    try:
+        result = subprocess.run([str(graff), '--schema'], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                env=probe_env, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0 or len(result.stdout) > 4 * 1024 * 1024:
+        return False
+    try:
+        schema = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return False
+    providers = schema.get('providers') if isinstance(schema, dict) else None
+    return (schema.get('harness') == 'simple-harness'
+            and isinstance(providers, list)
+            and any(isinstance(item, dict) and item.get('id') == 'nanoattention'
+                    and item.get('kind') == 'openai'
+                    and item.get('default_model') == 'flint' for item in providers))
+
+
 class RouterLease:
     """Exclusive local metadata file; never replace existing or user-edited data."""
     def __init__(self, workspace):
@@ -176,8 +201,10 @@ def parse_args(argv=None):
 
 
 def run(args):
+    built_in = supports_builtin_flint(args.graff)
     lease = RouterLease(args.workspace)
-    lease.check()
+    if not built_in:
+        lease.check()
     server = agent = None
     # Preserve the user's normal interactive auth environment. Only this child
     # tree receives the ephemeral adapter credential; it is never serialized.
@@ -202,7 +229,10 @@ def run(args):
                 (['--speculative-weight-reuse'] if getattr(args, 'speculative_weight_reuse', False) else []), env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=False)
         port = receive_ready(server, min(90, args.timeout), args.context)
-        lease.acquire(port)
+        if built_in:
+            env['GRAFF_NANOATTENTION_URL'] = 'http://127.0.0.1:{}/v1/chat/completions'.format(port)
+        else:
+            lease.acquire(port)
         agent = subprocess.Popen([str(args.graff), '--model', 'nanoattention/flint',
                                   '--no-subagent-tier', '--subagent-provider', 'nanoattention',
                                   '--subagent-model', 'flint'] + args.graff_args, cwd=args.workspace, env=env,

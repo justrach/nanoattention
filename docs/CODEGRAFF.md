@@ -5,10 +5,12 @@ one persistent `flint session` subprocess. **All model inference remains Zig +
 Metal.** Python provides HTTP, the checkpoint's local tokenizer/chat template,
 and Flint-tool-call/OpenAI-tool-call translation; no MLX/PyTorch model is loaded.
 
-The integration uses Codegraff's existing project-local router contract, inspected
-at `v0.302.74.68:src/router_config.zig`. No Codegraff source changes or global
-provider/key settings are required. Model ID is `flint`, provider ID
-`nanoattention`. The example contains endpoint metadata, not a credential.
+The adapter uses Codegraff's OpenAI-compatible chat contract. Current Codegraff
+builds expose `nanoattention` as a built-in local provider; older installed
+binaries are detected from their bounded, content-free `--schema` output and
+receive a temporary project-local router instead. Neither path changes global
+provider/key settings. Model ID is `flint`, provider ID `nanoattention`. The
+example contains endpoint metadata, not a credential.
 
 ## Owned terminal launcher
 
@@ -26,10 +28,12 @@ python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 140
 ```
 
 Omit the arguments after `--` for an interactive terminal session. The launcher
-pins the model route, refuses an existing `.graff/.config.router`, and passes an
-ephemeral API key only in the owned child environment. On exit, failure, timeout
-or interruption it stops its owned children and removes only its unchanged
-router file; user edits or replacements are preserved. No additional inference
+pins the model route and passes an ephemeral API key only in the owned child
+environment. Built-in-aware binaries receive the ephemeral loopback URL through
+the child environment and do not write router configuration. Older binaries
+refuse an existing `.graff/.config.router` and lease a temporary router file.
+On exit, failure, timeout or interruption it stops its owned children and removes
+only its unchanged router file; user edits or replacements are preserved. No additional inference
 lock or process group is created. A configured 32K capacity is not a filled-32K
 speed measurement. Normal Graff tool permissions still apply; this launcher is
 not itself an OS sandbox. Subagents default to the same local provider/model
@@ -41,7 +45,7 @@ synthetic coding workspace: **five requests, one native worker, four KV-hit
 follow-ups, zero failures**, and **all six unchanged fixture tests passed**. The
 configured capacity was 32,768; only 3,369 tokens were cached. The temporary router
 was removed and an OS process check found no launcher adapter/native children
-remaining. Its 11 CPU-only cleanup/configuration tests pass. This verifies the
+remaining. Its 16 CPU-only cleanup/configuration tests pass. This verifies the
 launcher lifecycle and coding integration, not 32K-filled throughput.
 
 ### Optional BF16 global KV

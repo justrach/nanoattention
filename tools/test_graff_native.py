@@ -69,6 +69,30 @@ class LauncherTests(unittest.TestCase):
             context=32768, max_tokens=4096, timeout=20, kv_bf16=False,
             graff_args=['-p', 'synthetic task'])
         self.router = self.workspace / '.graff/.config.router'
+        self.capability = patch.object(launcher, 'supports_builtin_flint', return_value=False)
+        self.capability.start()
+        self.addCleanup(self.capability.stop)
+
+    def test_schema_probe_detects_builtin_provider_without_forwarding_credentials(self):
+        self.capability.stop()
+        schema = json.dumps(dict(harness='simple-harness', providers=[dict(
+            id='nanoattention', kind='openai', default_model='flint')])).encode()
+        completed = subprocess.CompletedProcess(['fake', '--schema'], 0, stdout=schema)
+        with patch.dict(os.environ, {'NANOATTENTION_API_KEY': 'probe-secret'}), \
+                patch.object(launcher.subprocess, 'run', return_value=completed) as probe:
+            self.assertTrue(launcher.supports_builtin_flint('/fake/graff'))
+        self.assertEqual(probe.call_args.args[0], ['/fake/graff', '--schema'])
+        self.assertEqual(probe.call_args.kwargs['timeout'], 5)
+        self.assertNotIn('NANOATTENTION_API_KEY', probe.call_args.kwargs['env'])
+
+    def test_schema_probe_fails_closed_on_old_or_unbounded_metadata(self):
+        self.capability.stop()
+        old = subprocess.CompletedProcess(['fake'], 0, stdout=b'{"providers":[]}')
+        large = subprocess.CompletedProcess(['fake'], 0, stdout=b' ' * (4 * 1024 * 1024 + 1))
+        with patch.object(launcher.subprocess, 'run', side_effect=[old, large, subprocess.TimeoutExpired('fake', 5)]):
+            self.assertFalse(launcher.supports_builtin_flint('/fake/graff'))
+            self.assertFalse(launcher.supports_builtin_flint('/fake/graff'))
+            self.assertFalse(launcher.supports_builtin_flint('/fake/graff'))
 
     def test_ready_runs_pinned_child_and_never_persists_secret(self):
         server, agent = FakeProcess(ready()), FakeProcess(code=7)
@@ -113,6 +137,23 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(agent.terminated)
         self.assertFalse(self.router.exists())
         self.assertNotIn('NANOATTENTION_API_KEY', os.environ)
+
+    def test_builtin_provider_uses_ephemeral_url_without_touching_user_router(self):
+        self.capability.stop()
+        self.capability = patch.object(launcher, 'supports_builtin_flint', return_value=True)
+        self.capability.start()
+        self.addCleanup(self.capability.stop)
+        self.router.parent.mkdir()
+        self.router.write_text('user router configuration')
+        before = self.router.read_bytes()
+        server, agent = FakeProcess(ready()), FakeProcess(code=3)
+        with patch.object(launcher.subprocess, 'Popen', side_effect=[server, agent]) as spawn:
+            self.assertEqual(launcher.run(self.args), 3)
+        self.assertEqual(spawn.call_count, 2)
+        self.assertEqual(spawn.call_args_list[1].kwargs['env']['GRAFF_NANOATTENTION_URL'],
+                         'http://127.0.0.1:19234/v1/chat/completions')
+        self.assertEqual(self.router.read_bytes(), before)
+        self.assertTrue(server.terminated)
 
     def test_opt_in_bf16_is_forwarded_only_to_owned_adapter(self):
         self.args.kv_bf16 = True
