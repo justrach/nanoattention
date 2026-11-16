@@ -12,7 +12,23 @@ extern "c" fn write(c_int, [*]const u8, usize) isize;
 
 const DecodeCandidate = struct {
     head_row_tile: u32 = 2,
+    qkv_row_tile: u32 = 0,
+    gate_row_tile: u32 = 0,
+    projection_row_tile: u32 = 0,
     packed_router: bool = false,
+    replay: bool = false,
+    bf16_vector_loads: bool = false,
+    fixed_loops: bool = false,
+    affine_loads: bool = false,
+    fixed_attention: bool = false,
+    gqa_reuse: u32 = 1,
+    gqa_blocks: u32 = 1,
+    gqa_prefetch: u32 = 4,
+    wide_attention: bool = false,
+    ring_attention: bool = false,
+    prepared_inputs: bool = false,
+    prepared_fused_norm: bool = false,
+    prepared_fused_gate: bool = false,
     parallel_down: bool = false,
     down_row_tile: u32 = 0,
 };
@@ -28,9 +44,15 @@ const Input = struct {
     emit_predictions: bool = false,
     reuse_prefill: bool = false,
     mlx_attention: bool = false,
+    kv_bf16: bool = false,
+    bf16_blocks: u32 = 0,
     attention_chunk: ?u32 = null,
     attention_candidates: ?[]const u32 = null,
     decode_candidates: ?[]const DecodeCandidate = null,
+    profile_decode: bool = false,
+    profile_after_sweep: bool = false,
+    profile_candidate: u32 = 1,
+    prepare_replay: bool = false,
 };
 
 // Decode-only trials may restore a prefix computed by real model inference.
@@ -98,6 +120,8 @@ pub fn main(init: std.process.Init) !void {
     if (input.resident_workers != 0 and input.staged_row_tile != 1) return error.StagedTuningRequiresStaged;
     if (input.resident_workers == 0 and input.resident_row_tile != 1) return error.ResidentTuningRequiresResident;
     if (input.mlx_attention and (input.resident_workers != 0 or input.attention_chunk != null or input.attention_candidates != null)) return error.ConflictingAttentionMode;
+    if (input.kv_bf16 and !input.mlx_attention) return error.InvalidBf16KvBenchmark;
+    if (input.bf16_blocks != 0 and (!input.kv_bf16 or (input.bf16_blocks != 128 and input.bf16_blocks != 512 and input.bf16_blocks != 1024))) return error.InvalidBf16Blocks;
     const single = [_]u32{input.attention_chunk orelse 0};
     const candidates = input.attention_candidates orelse &single;
     if (candidates.len == 0) return error.EmptyAttentionCandidates;
@@ -106,19 +130,35 @@ pub fn main(init: std.process.Init) !void {
     for (candidates) |chunk| if (chunk != 0 and !@import("resident.zig").certified.validAttentionChunk(chunk)) return error.InvalidAttentionChunk;
     if (input.decode_candidates) |configs| {
         if (!input.reuse_prefill or !input.mlx_attention or input.resident_workers != 0 or configs.len == 0 or configs.len > 16 or input.decode.len == 0) return error.InvalidDecodeSweep;
-        if (configs[0].head_row_tile != input.staged_row_tile or configs[0].packed_router or configs[0].parallel_down or (configs[0].down_row_tile != 0 and configs[0].down_row_tile != input.staged_row_tile)) return error.DecodeSweepRequiresBaselineFirst;
+        if (configs[0].head_row_tile != input.staged_row_tile or configs[0].qkv_row_tile != 0 or configs[0].gate_row_tile != 0 or configs[0].projection_row_tile != 0 or configs[0].packed_router or configs[0].replay or configs[0].bf16_vector_loads or configs[0].fixed_loops or configs[0].affine_loads or configs[0].fixed_attention or configs[0].gqa_reuse != 1 or configs[0].gqa_blocks != 1 or configs[0].gqa_prefetch != 4 or configs[0].wide_attention or configs[0].ring_attention or configs[0].prepared_inputs or configs[0].prepared_fused_norm or configs[0].prepared_fused_gate or configs[0].parallel_down or (configs[0].down_row_tile != 0 and configs[0].down_row_tile != input.staged_row_tile)) return error.DecodeSweepRequiresBaselineFirst;
         for (configs) |config| {
+            if ((config.prepared_fused_norm or config.prepared_fused_gate) and !config.prepared_inputs) return error.PreparedFusionRequiresPreparedInputs;
+            if (config.prepared_inputs and (input.prepare_replay or config.parallel_down)) return error.PreparedInputsRequireOrdinaryDecode;
+            if (config.replay and !input.prepare_replay) return error.ReplayNotPrepared;
+            for ([_]u32{ config.qkv_row_tile, config.gate_row_tile, config.projection_row_tile }) |tile|
+                if (tile != 0 and !@import("resident.zig").certified.validRowTile(tile)) return error.InvalidStagedRowTile;
+            if ((config.wide_attention or config.ring_attention) and input.kv_bf16) return error.WideAttentionRequiresFp32Kv;
+            if (config.bf16_vector_loads and !input.kv_bf16) return error.InvalidBf16VectorLoads;
+            if (config.gqa_reuse != 1 and config.gqa_reuse != 2 and config.gqa_reuse != 4) return error.InvalidGqaReuse;
+            if (config.gqa_prefetch != 4 and !((config.gqa_reuse == 2 or config.gqa_reuse == 4) and config.gqa_blocks == 1 and !input.kv_bf16 and (config.gqa_prefetch == 1 or config.gqa_prefetch == 2))) return error.InvalidGqaPrefetch;
+            if (config.gqa_blocks != 1 and !(config.gqa_reuse == 2 and (config.gqa_blocks == 2 or config.gqa_blocks == 4)) and !(config.gqa_reuse == 4 and config.gqa_blocks == 4)) return error.InvalidGqaBlocks;
             if (!@import("resident.zig").certified.validRowTile(config.head_row_tile) or
                 (config.down_row_tile != 0 and !@import("resident.zig").certified.validRowTile(config.down_row_tile))) return error.InvalidStagedRowTile;
         }
     }
+    if (input.profile_after_sweep and (input.decode_candidates == null or input.resident_workers != 0 or input.decode.len == 0 or input.profile_decode or input.prepare_replay)) return error.InvalidSweepProfile;
+    if (input.profile_after_sweep and input.profile_candidate >= input.decode_candidates.?.len) return error.InvalidProfileCandidate;
+    if (input.profile_decode and (input.decode_candidates != null or input.decode.len == 0 or input.decode.len > 8 or input.repeats != 1)) return error.InvalidProfileRequest;
+    if (input.prepare_replay and (input.resident_workers != 0 or input.profile_decode)) return error.InvalidReplayBenchmark;
     const required = try std.math.add(usize, input.prompt.len, input.decode.len);
     const context = std.math.cast(u32, @max(1, required)) orelse return error.ContextExhausted;
 
     const ctx = try metal.Context.initMatched(input.mlx_attention);
     defer ctx.deinit();
-    var model = try Model.init(init.gpa, ctx, input.checkpoint, context);
+    if (input.prepare_replay) try ctx.prepareReplay();
+    var model = try Model.initWithKv(init.gpa, ctx, input.checkpoint, context, input.kv_bf16);
     defer model.deinit();
+    try model.setBf16Blocks(input.bf16_blocks);
     if (input.resident_workers != 0) {
         try model.enableResident(input.resident_workers);
         try model.setResidentRowTile(input.resident_row_tile);
@@ -127,6 +167,9 @@ pub fn main(init: std.process.Init) !void {
         try model.setAttentionChunk(candidates[0]);
     }
     if (input.mlx_attention) try model.enableMlxAttention();
+    // Sweeps keep the seed prefix on the reference policy; candidates change
+    // decode only, and every candidate sees the identical genuine KV snapshot.
+    if (input.decode_candidates != null) model.gqa_reuse = 1;
     // Validate all inputs before mutating the cache; repetitions never deduplicate
     // input tokens, stop at EOS, or feed the predicted tokens back into the model.
     for (input.prompt) |token| if (token >= model.cfg.vocab_size) return error.InvalidToken;
@@ -137,8 +180,17 @@ pub fn main(init: std.process.Init) !void {
     _ = try model.prefill(input.prompt);
     const seed_prefill_seconds = (try now()) - seed_start;
     const seed_prefill_gpu_seconds = ctx.stats().gpu_seconds - seed_gpu_start;
+    if (input.profile_decode) {
+        try ctx.beginProfile();
+        for (input.decode) |token| _ = try sampling.greedy(try model.forward(token));
+        try output("{\"phase\":\"profile\",\"benchmark\":false}\n");
+        return;
+    }
     const prefix: ?Prefix = if (input.reuse_prefill) try Prefix.save(init.arena.allocator(), &model) else null;
     if (input.decode_candidates != null) return decodeSweep(&model, input, prefix.?, seed_prefill_seconds, seed_prefill_gpu_seconds, init.arena.allocator());
+    if (input.prepare_replay) try ctx.setReplay(true);
+    var kv_allocated_bytes: u64 = 0;
+    for (model.layers) |layer| kv_allocated_bytes += layer.keys.len + layer.values.len;
     const predictions: []u32 = if (input.emit_predictions) try init.arena.allocator().alloc(u32, input.decode.len) else &.{};
     for (candidates) |chunk| {
         // Tuning changes only scheduling; every candidate receives the same
@@ -168,7 +220,9 @@ pub fn main(init: std.process.Init) !void {
                 "{{\"engine\":\"zig_fp32\",\"repeat\":{d},\"prefill_seconds\":{d:.9},\"decode_seconds\":{d:.9},\"checksum\":{d},\"submissions_per_token\":{d},\"dispatches_per_token\":{d},\"prefill_gpu_seconds\":{d:.9},\"decode_gpu_seconds\":{d:.9},\"resident_row_tile\":{d},\"staged_row_tile\":{d},\"prefill_reused\":{},\"prefill_samples\":{d},\"attention_chunk\":{d}",
                 .{ repeat, if (input.reuse_prefill) seed_prefill_seconds else prefilled - start, finished - prefilled, checksum, model.last_execution.submissions, model.last_execution.dispatches, if (input.reuse_prefill) seed_prefill_gpu_seconds else gpu_prefilled - gpu_start, gpu_finished - gpu_prefilled, input.resident_row_tile, model.staged_row_tile, input.reuse_prefill, if (input.reuse_prefill) @as(u32, 1) else input.repeats, chunk },
             ));
-            if (model.mlx_attention) try output(",\"attention_implementation\":\"mlx_layout_128_stripes\"");
+            if (model.mlx_attention) try output(",\"attention_implementation\":\"mlx_layout_adaptive_stripes\"");
+            try output(if (model.kv_bf16) ",\"kv_storage\":\"bf16_global_fp32_sliding\"" else ",\"kv_storage\":\"fp32\"");
+            try output(try std.fmt.bufPrint(&buffer, ",\"kv_allocated_bytes\":{d},\"bf16_blocks\":{d}", .{ kv_allocated_bytes, input.bf16_blocks }));
             if (input.emit_predictions) {
                 try output(",\"predictions\":[");
                 for (predictions, 0..) |prediction, i| {
@@ -186,6 +240,10 @@ pub fn main(init: std.process.Init) !void {
 // outside timing. Timing alternates candidates against one real prefix snapshot.
 fn decodeSweep(model: *Model, input: Input, prefix: Prefix, prefill_seconds: f64, prefill_gpu_seconds: f64, a: std.mem.Allocator) !void {
     const configs = input.decode_candidates.?;
+    for (configs) |config| if (config.prepared_inputs) {
+        try model.prepareQuantInputs();
+        break;
+    };
     for (configs) |config| if (config.parallel_down) {
         try model.prepareParallelDown();
         break;
@@ -195,10 +253,26 @@ fn decodeSweep(model: *Model, input: Input, prefix: Prefix, prefill_seconds: f64
     const admitted = try a.alloc(bool, configs.len);
     @memset(admitted, true);
     for (configs, 0..) |config, index| {
+        if (input.prepare_replay) try model.ctx.setReplay(config.replay);
         model.head_row_tile = config.head_row_tile;
         model.packed_router = config.packed_router;
+        model.bf16_vector_loads = config.bf16_vector_loads;
+        model.fixed_loops = config.fixed_loops;
+        model.affine_loads = config.affine_loads;
+        model.fixed_attention = config.fixed_attention;
+        model.gqa_reuse = config.gqa_reuse;
+        model.gqa_blocks = config.gqa_blocks;
+        model.gqa_prefetch = config.gqa_prefetch;
+        model.wide_attention = config.wide_attention;
+        model.ring_attention = config.ring_attention;
+        model.prepared_inputs = config.prepared_inputs;
+        model.prepared_fused_norm = config.prepared_fused_norm;
+        model.prepared_fused_gate = config.prepared_fused_gate;
         model.parallel_down = config.parallel_down;
         model.down_row_tile = config.down_row_tile;
+        model.qkv_row_tile = config.qkv_row_tile;
+        model.gate_row_tile = config.gate_row_tile;
+        model.projection_row_tile = config.projection_row_tile;
         prefix.restore(model);
         for (input.decode, 0..) |token, position| {
             const logits = try model.forward(token);
@@ -226,10 +300,26 @@ fn decodeSweep(model: *Model, input: Input, prefix: Prefix, prefill_seconds: f64
             const index = (offset + repeat) % configs.len;
             if (!admitted[index]) continue;
             const config = configs[index];
+            if (input.prepare_replay) try model.ctx.setReplay(config.replay);
             model.head_row_tile = config.head_row_tile;
             model.packed_router = config.packed_router;
+            model.bf16_vector_loads = config.bf16_vector_loads;
+            model.fixed_loops = config.fixed_loops;
+            model.affine_loads = config.affine_loads;
+            model.fixed_attention = config.fixed_attention;
+            model.gqa_reuse = config.gqa_reuse;
+            model.gqa_blocks = config.gqa_blocks;
+            model.gqa_prefetch = config.gqa_prefetch;
+            model.wide_attention = config.wide_attention;
+            model.ring_attention = config.ring_attention;
+            model.prepared_inputs = config.prepared_inputs;
+            model.prepared_fused_norm = config.prepared_fused_norm;
+            model.prepared_fused_gate = config.prepared_fused_gate;
             model.parallel_down = config.parallel_down;
             model.down_row_tile = config.down_row_tile;
+            model.qkv_row_tile = config.qkv_row_tile;
+            model.gate_row_tile = config.gate_row_tile;
+            model.projection_row_tile = config.projection_row_tile;
             prefix.restore(model);
             for (input.decode[0..@min(8, input.decode.len)]) |token| _ = try sampling.greedy(try model.forward(token));
             prefix.restore(model);
@@ -266,9 +356,41 @@ fn decodeSweep(model: *Model, input: Input, prefix: Prefix, prefill_seconds: f64
                 .model_buffer_bytes = model_buffer_bytes,
                 .kv_allocated_bytes = kv_allocated_bytes,
                 .reference_logit_bytes = reference.len * @sizeOf(u32),
+                .kv_storage = if (model.kv_bf16) "bf16_global_fp32_sliding" else "fp32",
+                .bf16_blocks = input.bf16_blocks,
             };
             try output(try std.json.Stringify.valueAlloc(a, row, .{}));
             try output("\n");
         }
+    }
+    if (input.profile_after_sweep) {
+        const index = input.profile_candidate;
+        if (!admitted[index]) return error.ProfileCandidateRejected;
+        const config = configs[index];
+        model.head_row_tile = config.head_row_tile;
+        model.packed_router = config.packed_router;
+        model.bf16_vector_loads = config.bf16_vector_loads;
+        model.fixed_loops = config.fixed_loops;
+        model.affine_loads = config.affine_loads;
+        model.fixed_attention = config.fixed_attention;
+        model.gqa_reuse = config.gqa_reuse;
+        model.gqa_blocks = config.gqa_blocks;
+        model.gqa_prefetch = config.gqa_prefetch;
+        model.wide_attention = config.wide_attention;
+        model.ring_attention = config.ring_attention;
+        model.prepared_inputs = config.prepared_inputs;
+        model.prepared_fused_norm = config.prepared_fused_norm;
+        model.prepared_fused_gate = config.prepared_fused_gate;
+        model.parallel_down = config.parallel_down;
+        model.down_row_tile = config.down_row_tile;
+        model.qkv_row_tile = config.qkv_row_tile;
+        model.gate_row_tile = config.gate_row_tile;
+        model.projection_row_tile = config.projection_row_tile;
+        prefix.restore(model);
+        try model.ctx.beginProfile();
+        const tokens = @min(8, input.decode.len);
+        for (input.decode[0..tokens]) |token| _ = try sampling.greedy(try model.forward(token));
+        try output(try std.json.Stringify.valueAlloc(a, .{ .phase = "profile", .benchmark = false, .candidate = index, .tokens = tokens }, .{}));
+        try output("\n");
     }
 }

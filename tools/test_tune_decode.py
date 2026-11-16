@@ -1,6 +1,33 @@
 import unittest
 
-from tune_decode import summarize
+from tune_decode import profile_metrics, raw_workload, summarize
+
+
+class RawWorkload(unittest.TestCase):
+    def test_deterministic_valid_ids_and_changed_seed(self):
+        first = raw_workload(150144, 512, 256, 42)
+        self.assertEqual(first, raw_workload(150144, 512, 256, 42))
+        self.assertNotEqual(first, raw_workload(150144, 512, 256, 43))
+        self.assertEqual(tuple(map(len, first)), (512, 256))
+        self.assertTrue(all(0 <= token < 150144 for seq in first for token in seq))
+        self.assertGreater(len(set(first[0])), 500)
+
+    def test_decode_stream_independent_of_prefix_length(self):
+        short = raw_workload(150144, 512, 256, 42)
+        long = raw_workload(150144, 1024, 256, 42)
+        self.assertEqual(short[0], long[0][:512])
+        self.assertEqual(short[1], long[1])
+        self.assertNotEqual(short[0][:256], short[1])
+
+    def test_profiler_excludes_arbitrary_stderr(self):
+        self.assertIsNone(profile_metrics('private diagnostic\n{"kernels": []}\n'))
+        report = '{"type":"flint_kernel_profile","benchmark":false,"kernels":[]}'
+        self.assertEqual(profile_metrics('not json\n' + report)['kernels'], [])
+
+    def test_invalid_sizes(self):
+        for values in ((0, 1, 1), (2**32, 1, 1), (4, 0, 1), (4, 1, 0)):
+            with self.assertRaises(ValueError):
+                raw_workload(*values, seed=42)
 
 
 class DecodeSweepReports(unittest.TestCase):

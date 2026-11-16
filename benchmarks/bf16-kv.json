@@ -1,0 +1,498 @@
+{
+  "status": "measured_not_target_met",
+  "target": 130,
+  "default_kv": "fp32",
+  "precision": "opt-in BF16 global KV; FP32 sliding KV and all arithmetic; not stock MLX BF16",
+  "prompt_tokens": 16384,
+  "protocol": "independent actual prefixes per storage/stripe mode; five warm 256-step teacher-forced repeats; not rotated across precision modes",
+  "trials": [
+    {
+      "mode": "fp32",
+      "repeats": 5,
+      "decode_tokens": 256,
+      "decode_seconds": [
+        2.448063,
+        2.46429,
+        2.449355,
+        2.456302,
+        2.451672
+      ],
+      "decode_gpu_seconds": [
+        2.240548375,
+        2.246923958,
+        2.248438583,
+        2.245528749,
+        2.243461293
+      ],
+      "decode_tokens_per_second": 104.41853559529987,
+      "kv_storage": "fp32",
+      "kv_allocated_bytes": null
+    },
+    {
+      "mode": "bf16_default",
+      "repeats": 5,
+      "decode_tokens": 256,
+      "decode_seconds": [
+        2.445299,
+        2.420777,
+        2.437983,
+        2.435046,
+        2.430185
+      ],
+      "decode_gpu_seconds": [
+        2.222667082,
+        2.219189,
+        2.219731,
+        2.223594457,
+        2.217065541
+      ],
+      "decode_tokens_per_second": 105.13148416908757,
+      "kv_storage": "bf16_global_fp32_sliding",
+      "kv_allocated_bytes": null
+    },
+    {
+      "mode": "bf16_b128",
+      "repeats": 5,
+      "decode_tokens": 256,
+      "decode_seconds": [
+        2.403125,
+        2.402518,
+        2.406073,
+        2.40476,
+        2.400152
+      ],
+      "decode_gpu_seconds": [
+        2.176338833,
+        2.174486042,
+        2.175854168,
+        2.175613666,
+        2.174558792
+      ],
+      "decode_tokens_per_second": 106.52795838751625,
+      "kv_storage": "bf16_global_fp32_sliding",
+      "kv_allocated_bytes": 550645760
+    },
+    {
+      "mode": "bf16_b1024_fixed",
+      "repeats": 5,
+      "decode_tokens": 256,
+      "decode_seconds": [
+        2.589435,
+        2.587054,
+        2.577574,
+        2.567422,
+        2.581247
+      ],
+      "decode_gpu_seconds": [
+        2.358740374,
+        2.354681084,
+        2.353480624,
+        2.355960041,
+        2.358153749
+      ],
+      "decode_tokens_per_second": 99.17687071403861,
+      "kv_storage": "bf16_global_fp32_sliding",
+      "kv_allocated_bytes": 550645760
+    }
+  ],
+  "numerical_comparison": {
+    "status": "measured",
+    "protocol": "native FP32 KV versus hybrid global BF16 KV",
+    "scope": "numerical comparison only; no quality, free-run, or accuracy-pass claim",
+    "precision": "global KV BF16 round-to-nearest; sliding KV FP32; same FP32 math and checkpoint weights",
+    "binary": {
+      "name": "flint",
+      "sha256": "03affb677e14e05e6a658796d3f5304c65ef9c97f01337bb5f2f0b1be3e77348"
+    },
+    "prompt_tokens": 16384,
+    "teacher_forced_decode_tokens": 16,
+    "evaluated_input_tokens": 16400,
+    "native_timeout_seconds": 1085,
+    "execution": {
+      "order": [
+        "fp32",
+        "bf16"
+      ],
+      "mlx_attention": true,
+      "staged_row_tile": 2
+    },
+    "positions": {
+      "start": 16383,
+      "end_inclusive": 16399,
+      "count": 17,
+      "note": "zero-based input positions; final prefill plus every forced decode input, including the final next-token prediction"
+    },
+    "prompt_protocol": "benchmark.workload exact repeated code-token prefix; all prefix tokens really evaluated; no fabricated cache",
+    "kv_allocation": {
+      "scope": "analytic allocation of K+V buffers only; not RSS, measured memory, or total engine memory",
+      "dimensions": {
+        "num_hidden_layers": 49,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "sliding_window": 513,
+        "max_position_embeddings": 262144,
+        "vocab_size": 150144
+      },
+      "global_layers": 14,
+      "sliding_layers": 35,
+      "global_capacity_per_layer": 16400,
+      "sliding_capacity_per_layer": 513,
+      "fp32": {
+        "global_bytes": 940441600,
+        "sliding_bytes": 73543680,
+        "total_bytes": 1013985280
+      },
+      "hybrid_bf16": {
+        "global_bytes": 470220800,
+        "sliding_bytes": 73543680,
+        "total_bytes": 543764480
+      },
+      "saved_bytes": 470220800
+    },
+    "input_sha256": "a78d885429842869789818a7b95eb0e5c5b714aed9952e457634975552972277",
+    "logits": {
+      "status": "measured",
+      "issues": [],
+      "fp32": {
+        "shape": [
+          17,
+          150144
+        ],
+        "count": 2552448,
+        "finite_count": 2552448,
+        "nonfinite_count": 0
+      },
+      "bf16": {
+        "shape": [
+          17,
+          150144
+        ],
+        "count": 2552448,
+        "finite_count": 2552448,
+        "nonfinite_count": 0
+      },
+      "max_absolute_logit_error": 2.8662339999999986,
+      "rms_logit_error": 0.5177564394600639,
+      "relative_l2_logit_error": 0.017352868283988025,
+      "relative_l2_note": "null means nonzero error with zero FP32 reference norm",
+      "top1_agreement_count": 17,
+      "top1_agreement_fraction": 1.0,
+      "mean_softmax_kl_nats": 0.00033635032595928486,
+      "kl_direction": "FP32 KV || hybrid BF16 KV; float64 log-softmax; negative roundoff clamped to zero",
+      "rows": [
+        {
+          "row": 0,
+          "fp32_top1": 790,
+          "bf16_top1": 790,
+          "top1_agrees": true,
+          "fp32_top1_margin": 14.238074699999999,
+          "bf16_top1_margin": 13.9761247,
+          "softmax_kl_nats": 7.833005099552252e-08
+        },
+        {
+          "row": 1,
+          "fp32_top1": 6534,
+          "bf16_top1": 6534,
+          "top1_agrees": true,
+          "fp32_top1_margin": 1.7317395599999998,
+          "bf16_top1_margin": 1.9484077000000002,
+          "softmax_kl_nats": 0.004904325189430999
+        },
+        {
+          "row": 2,
+          "fp32_top1": 537,
+          "bf16_top1": 537,
+          "top1_agrees": true,
+          "fp32_top1_margin": 5.08432895,
+          "bf16_top1_margin": 5.19399497,
+          "softmax_kl_nats": 0.00035106538568923767
+        },
+        {
+          "row": 3,
+          "fp32_top1": 279,
+          "bf16_top1": 279,
+          "top1_agrees": true,
+          "fp32_top1_margin": 5.590534440000001,
+          "bf16_top1_margin": 6.041917799999999,
+          "softmax_kl_nats": 0.00039163879183287876
+        },
+        {
+          "row": 4,
+          "fp32_top1": 790,
+          "bf16_top1": 790,
+          "top1_agrees": true,
+          "fp32_top1_margin": 8.798219549999999,
+          "bf16_top1_margin": 9.111132959999999,
+          "softmax_kl_nats": 2.4294757857774727e-05
+        },
+        {
+          "row": 5,
+          "fp32_top1": 2409,
+          "bf16_top1": 2409,
+          "top1_agrees": true,
+          "fp32_top1_margin": 10.362332199999999,
+          "bf16_top1_margin": 10.2997976,
+          "softmax_kl_nats": 1.0838705065400458e-05
+        },
+        {
+          "row": 6,
+          "fp32_top1": 2180,
+          "bf16_top1": 2180,
+          "top1_agrees": true,
+          "fp32_top1_margin": 11.932412776,
+          "bf16_top1_margin": 11.923515309999999,
+          "softmax_kl_nats": 3.768216227371754e-07
+        },
+        {
+          "row": 7,
+          "fp32_top1": 5082,
+          "bf16_top1": 5082,
+          "top1_agrees": true,
+          "fp32_top1_margin": 10.4192717,
+          "bf16_top1_margin": 10.663630900000001,
+          "softmax_kl_nats": 5.9719307383417505e-06
+        },
+        {
+          "row": 8,
+          "fp32_top1": 1473,
+          "bf16_top1": 1473,
+          "top1_agrees": true,
+          "fp32_top1_margin": 12.58752963,
+          "bf16_top1_margin": 12.800724950000001,
+          "softmax_kl_nats": 1.3986083503261122e-06
+        },
+        {
+          "row": 9,
+          "fp32_top1": 11,
+          "bf16_top1": 11,
+          "top1_agrees": true,
+          "fp32_top1_margin": 8.601289529999999,
+          "bf16_top1_margin": 8.7760777,
+          "softmax_kl_nats": 3.250057795503172e-06
+        },
+        {
+          "row": 10,
+          "fp32_top1": 1026,
+          "bf16_top1": 1026,
+          "top1_agrees": true,
+          "fp32_top1_margin": 10.04868017,
+          "bf16_top1_margin": 10.625148300000001,
+          "softmax_kl_nats": 1.2638695364717343e-05
+        },
+        {
+          "row": 11,
+          "fp32_top1": 1080,
+          "bf16_top1": 1080,
+          "top1_agrees": true,
+          "fp32_top1_margin": 8.14457528,
+          "bf16_top1_margin": 8.191942555,
+          "softmax_kl_nats": 4.0169365953730396e-06
+        },
+        {
+          "row": 12,
+          "fp32_top1": 319,
+          "bf16_top1": 319,
+          "top1_agrees": true,
+          "fp32_top1_margin": 11.052558150000001,
+          "bf16_top1_margin": 11.09325683,
+          "softmax_kl_nats": 3.540704280757384e-07
+        },
+        {
+          "row": 13,
+          "fp32_top1": 791,
+          "bf16_top1": 791,
+          "top1_agrees": true,
+          "fp32_top1_margin": 10.46053963,
+          "bf16_top1_margin": 10.534269940000001,
+          "softmax_kl_nats": 1.4382724050538766e-06
+        },
+        {
+          "row": 14,
+          "fp32_top1": 5085,
+          "bf16_top1": 5085,
+          "top1_agrees": true,
+          "fp32_top1_margin": 10.769389,
+          "bf16_top1_margin": 10.92240283,
+          "softmax_kl_nats": 5.061116554599039e-07
+        },
+        {
+          "row": 15,
+          "fp32_top1": 311,
+          "bf16_top1": 311,
+          "top1_agrees": true,
+          "fp32_top1_margin": 12.769416354,
+          "bf16_top1_margin": 12.67552449,
+          "softmax_kl_nats": 2.6222349407309252e-06
+        },
+        {
+          "row": 16,
+          "fp32_top1": 1026,
+          "bf16_top1": 1026,
+          "top1_agrees": true,
+          "fp32_top1_margin": 11.7166291,
+          "bf16_top1_margin": 11.77823057,
+          "softmax_kl_nats": 3.1406414842365663e-06
+        }
+      ]
+    }
+  },
+  "teacher_forced_256_top1": {
+    "positions": 256,
+    "agreement": 256,
+    "free_running": false
+  },
+  "vector_trial": {
+    "protocol": "real prefix; all-logit bitwise admission within the selected KV storage mode; rotated candidates; warm decode only",
+    "prompt_tokens": 16384,
+    "decode_tokens": 256,
+    "repeats": 5,
+    "kv_storage": "bf16_global_fp32_sliding",
+    "bf16_blocks": 128,
+    "input_sha256": "53d5d006012e8a38ae394038aff147e11f9b89cbe3701f44a64172031cde80e1",
+    "benchmark_sha256": "798a3cea4637fcc20ae3966fcf09c51276880a59decadb1dac8bf1f88f38c781",
+    "candidates": [
+      {
+        "candidate": 0,
+        "config": {
+          "head_row_tile": 2
+        },
+        "admitted": true,
+        "bit_exact_positions": 256,
+        "vocabulary": 150144,
+        "decode_seconds": [
+          2.406089000054635,
+          2.419359000050463,
+          2.514398999977857,
+          2.4075680000241846,
+          2.411772000021301
+        ],
+        "decode_gpu_seconds": [
+          2.1750969174318016,
+          2.1819737498881295,
+          2.194240418029949,
+          2.179330833023414,
+          2.1788747500395402
+        ],
+        "median_decode_seconds": 2.411772000021301,
+        "median_gpu_seconds": 2.179330833023414,
+        "decode_tokens_per_second": 106.1460204354885,
+        "decode_cpu_seconds": [
+          0.097632,
+          0.096398,
+          0.129803,
+          0.101994,
+          0.106546
+        ],
+        "median_cpu_seconds": 0.101994,
+        "wall_speedup_over_baseline": 1.0,
+        "gpu_speedup_over_baseline": 1.0
+      },
+      {
+        "candidate": 1,
+        "config": {
+          "head_row_tile": 2,
+          "bf16_vector_loads": true
+        },
+        "admitted": true,
+        "bit_exact_positions": 256,
+        "vocabulary": 150144,
+        "decode_seconds": [
+          2.4099559999303892,
+          2.413330000010319,
+          2.452019000076689,
+          2.480663999915123,
+          2.4067400000058115
+        ],
+        "decode_gpu_seconds": [
+          2.175923999864608,
+          2.181847666739486,
+          2.190332833910361,
+          2.1811535001033917,
+          2.184488249826245
+        ],
+        "median_decode_seconds": 2.413330000010319,
+        "median_gpu_seconds": 2.181847666739486,
+        "decode_tokens_per_second": 106.07749458172127,
+        "decode_cpu_seconds": [
+          0.094364,
+          0.096356,
+          0.121005,
+          0.110746,
+          0.104278
+        ],
+        "median_cpu_seconds": 0.104278,
+        "wall_speedup_over_baseline": 0.9993544190023697,
+        "gpu_speedup_over_baseline": 0.9988464668022249
+      },
+      {
+        "candidate": 2,
+        "config": {
+          "head_row_tile": 2,
+          "bf16_vector_loads": true,
+          "parallel_down": true
+        },
+        "admitted": true,
+        "bit_exact_positions": 256,
+        "vocabulary": 150144,
+        "decode_seconds": [
+          2.396743999910541,
+          2.407154000014998,
+          2.40329400007613,
+          2.4099539999151602,
+          2.4000099999830127
+        ],
+        "decode_gpu_seconds": [
+          2.1553522918839008,
+          2.163220458664,
+          2.1604912508046255,
+          2.1634167914744467,
+          2.160054624429904
+        ],
+        "median_decode_seconds": 2.40329400007613,
+        "median_gpu_seconds": 2.1604912508046255,
+        "decode_tokens_per_second": 106.52046732188846,
+        "decode_cpu_seconds": [
+          0.09879,
+          0.101537,
+          0.097326,
+          0.109001,
+          0.108682
+        ],
+        "median_cpu_seconds": 0.101537,
+        "wall_speedup_over_baseline": 1.0035276582660726,
+        "gpu_speedup_over_baseline": 1.0087200455969318
+      }
+    ]
+  },
+  "fault": {
+    "initial_b1024_trial": "GPU address fault from an undersized scratch override",
+    "root_fix": "grow before prefix; reject unsafe direct override before encoding",
+    "real_rerun": "five complete 16K-prefix timing repeats passed",
+    "failure_not_erased": true
+  },
+  "graff_launcher": {
+    "status": "pass",
+    "kv_storage": "bf16_global_fp32_sliding",
+    "configured_context": 32768,
+    "requests": 5,
+    "worker_starts": 1,
+    "failures": 0,
+    "fixture_tests": 6,
+    "router_removed": true,
+    "launcher_exit": 0,
+    "cached_tokens": 3392,
+    "scope": "actual installed Graff; OS sandboxed synthetic coding task; not filled 32K speed"
+  },
+  "checks": {
+    "native_tests": 81,
+    "python_tests": 110,
+    "lean_build": true,
+    "lean_axiom_audit": true
+  },
+  "limitations": [
+    "130 tok/s not reached.",
+    "No full-window 262K speed/quality claim.",
+    "BF16 numerical drift is not zero.",
+    "Coding fixture actual cache3392, not32K full."
+  ]
+}

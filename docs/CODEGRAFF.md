@@ -10,7 +10,71 @@ at `v0.302.74.68:src/router_config.zig`. No Codegraff source changes or global
 provider/key settings are required. Model ID is `flint`, provider ID
 `nanoattention`. The example contains endpoint metadata, not a credential.
 
-## Run
+## Owned terminal launcher
+
+`tools/graff_native.py` starts an ephemeral-port loopback adapter, selects
+`nanoattention/flint` in the chosen workspace, then runs the installed terminal
+Graff. It makes no global provider changes. Run it with the tokenizer Python
+environment under the same inference guard:
+
+```sh
+python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 1400 -- \
+  /path/to/tokenizer-python -B tools/graff_native.py /path/to/flint-int4 \
+  --graff /path/to/installed/graff --workspace /path/to/coding-workspace \
+  --context 32768 --max-tokens 4096 --timeout 1200 -- \
+  -p 'Your coding task'
+```
+
+Omit the arguments after `--` for an interactive terminal session. The launcher
+pins the model route, refuses an existing `.graff/.config.router`, and passes an
+ephemeral API key only in the owned child environment. On exit, failure, timeout
+or interruption it stops its owned children and removes only its unchanged
+router file; user edits or replacements are preserved. No additional inference
+lock or process group is created. A configured 32K capacity is not a filled-32K
+speed measurement. Normal Graff tool permissions still apply; this launcher is
+not itself an OS sandbox. Subagents default to the same local provider/model
+with tier selection disabled; explicit additional Graff arguments remain the
+user's choice. The adapter still admits only one active model request at a time.
+
+The owned launcher was also exercised with the installed Graff in an OS-sandboxed
+synthetic coding workspace: **five requests, one native worker, four KV-hit
+follow-ups, zero failures**, and **all six unchanged fixture tests passed**. The
+configured capacity was 32,768; only 3,369 tokens were cached. The temporary router
+was removed and an OS process check found no launcher adapter/native children
+remaining. Its 11 CPU-only cleanup/configuration tests pass. This verifies the
+launcher lifecycle and coding integration, not 32K-filled throughput.
+
+### Optional BF16 global KV
+
+Add `--kv-bf16` to the launcher arguments **before** `--` to request the
+experimental storage-only mode. The manual adapter accepts the same flag. This
+halves global-layer KV storage; sliding KV and activation/attention math remain
+FP32. Default behavior is unchanged. It can change logits and generated tokens,
+and is not stock MLX BF16 inference. Request metrics expose `kv_storage`.
+
+The BF16 launcher completed the same real sandboxed coding fixture: five
+requests, one native worker, four KV-hit follow-ups, zero failures, and all six
+unchanged tests passed. It cached 3,392 actual tokens with a 32K allocation and
+removed its temporary router. This does not establish filled-32K speed or
+unchanged generations. See [numerical and performance measurements](../benchmarks/bf16-kv.md).
+
+### Experimental greedy speculation
+
+The launcher/manual adapter accept `--speculative-tokens N` (range 0–32; zero
+keeps ordinary decoding). It uses committed-history drafts and native batched
+target verification, with explicit sliding-KV rejection rollback. Every returned
+token still comes from exact target greedy acceptance; no draft is exposed
+unverified. See [implementation and verification boundaries](SPECULATIVE.md).
+
+For copy-heavy continuations, the measured profile is `--speculative-tokens 32
+--speculative-weight-reuse`, before the launcher's `--`. It reached 167/139 tok/s
+on filled 16K/32K repeated-code completion. **It is not a general coding speedup:**
+the real five-turn Graff fixture had poor draft acceptance and only 22.83 native
+decode tok/s with that profile, although all six fixture tests passed and KV
+reuse/cleanup worked. Keep the default ordinary mode for general coding unless
+measuring your workload shows a benefit.
+
+## Manual adapter setup
 
 From nanoattention, build the native executable, then run the adapter under the
 same exclusive inference lock/resource guard used by other local Flint jobs:

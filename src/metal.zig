@@ -4,6 +4,7 @@ extern fn fm_close(*anyopaque) void;
 extern fn fm_is_m3_ultra(*anyopaque) c_int;
 extern fn fm_error() [*:0]const u8;
 extern fn fm_finish(*anyopaque) c_int;
+extern fn fm_profile_begin(*anyopaque) c_int;
 extern fn fm_alloc(*anyopaque, usize) ?*anyopaque;
 extern fn fm_wrap(*anyopaque, *anyopaque, usize) ?*anyopaque;
 extern fn fm_contents(*anyopaque) *anyopaque;
@@ -30,6 +31,9 @@ pub const Matrix = extern struct {
     reserved: u32 = 0,
 };
 pub const MLP = extern struct { gate: Matrix, up: Matrix, down: Matrix };
+extern fn fm_replay_prepare(*anyopaque) c_int;
+extern fn fm_replay_enable(*anyopaque, c_int) c_int;
+extern fn fm_replay_clear(*anyopaque) c_int;
 extern fn fm_dispatch(*anyopaque, [*:0]const u8, [*]const *anyopaque, usize, *const anyopaque, usize, usize, usize) c_int;
 extern fn fm_map([*:0]const u8, *usize, *usize) ?[*]u8;
 extern fn fm_unmap(*anyopaque, usize) void;
@@ -106,7 +110,7 @@ pub const Context = struct {
         return initMatched(false);
     }
     pub fn initMatched(matched: bool) !Context {
-        const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("resident_plan.metal") ++ "\n" ++ @embedFile("row_tiling.metal") ++ "\n" ++ @embedFile("routing.metal") ++ "\n" ++ @embedFile("dense_matvec.metal") ++ "\n" ++ @embedFile("attention_parallel.metal") ++ "\n" ++ @embedFile("attention_split.metal") ++ "\n" ++ @embedFile("attention_ordered.metal") ++ "\n" ++ @embedFile("attention_mlx.metal") ++ "\n" ++ @embedFile("normalization.metal") ++ "\n" ++ @embedFile("normalization_aligned.metal") ++ "\n" ++ @embedFile("resident.metal");
+        const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("resident_plan.metal") ++ "\n" ++ @embedFile("row_tiling.metal") ++ "\n" ++ @embedFile("row_tiling_affine.metal") ++ "\n" ++ @embedFile("row_tiling_prepared.metal") ++ "\n" ++ @embedFile("row_tiling_prepared_fused.metal") ++ "\n" ++ @embedFile("row_tiling_fixed.metal") ++ "\n" ++ @embedFile("routing.metal") ++ "\n" ++ @embedFile("dense_matvec.metal") ++ "\n" ++ @embedFile("attention_parallel.metal") ++ "\n" ++ @embedFile("attention_split.metal") ++ "\n" ++ @embedFile("attention_ordered.metal") ++ "\n" ++ @embedFile("attention_mlx.metal") ++ "\n" ++ @embedFile("attention_mlx_wide.metal") ++ "\n" ++ @embedFile("attention_mlx_ring.metal") ++ "\n" ++ @embedFile("attention_mlx_fixed.metal") ++ "\n" ++ @embedFile("attention_gqa_reuse.metal") ++ "\n" ++ @embedFile("attention_gqa_stream.metal") ++ "\n" ++ @embedFile("attention_gqa_grouped.metal") ++ "\n" ++ @embedFile("normalization.metal") ++ "\n" ++ @embedFile("normalization_aligned.metal") ++ "\n" ++ @embedFile("normalization_prepared.metal") ++ "\n" ++ @embedFile("kv_bf16.metal") ++ "\n" ++ @embedFile("resident.metal") ++ "\n" ++ @embedFile("token_batch.metal") ++ "\n" ++ @embedFile("token_batch_attention.metal") ++ "\n" ++ @embedFile("token_batch_weight_reuse.metal") ++ "\n" ++ @embedFile("token_batch_greedy.metal") ++ "\n" ++ @embedFile("token_batch_mlp_weight_reuse.metal");
         return .{ .handle = fm_open(if (matched) "#define FLINT_MLX_MATH 1\n" ++ source else source) orelse return failure() };
     }
     pub fn isM3Ultra(self: Context) bool {
@@ -114,6 +118,22 @@ pub const Context = struct {
     }
     pub fn deinit(self: Context) void {
         fm_close(self.handle);
+    }
+    pub fn prepareReplay(self: Context) !void {
+        comptime {
+            if (@sizeOf(Params) > @import("resident_plan.zig").replay_param_stride)
+                @compileError("Metal Params exceed the Lean-certified replay slot");
+        }
+        if (fm_replay_prepare(self.handle) == 0) return failure();
+    }
+    pub fn setReplay(self: Context, enabled: bool) !void {
+        if (fm_replay_enable(self.handle, @intFromBool(enabled)) == 0) return failure();
+    }
+    pub fn clearReplay(self: Context) !void {
+        if (fm_replay_clear(self.handle) == 0) return failure();
+    }
+    pub fn beginProfile(self: Context) !void {
+        if (fm_profile_begin(self.handle) == 0) return failure();
     }
     pub fn finish(self: Context) !void {
         if (fm_finish(self.handle) == 0) return failure();

@@ -4,6 +4,8 @@ pub const threadgroup_size: u32 = 256;
 pub const max_workers: u32 = 32;
 pub const spin_limit: u32 = 10000000;
 pub const max_layers: u32 = 49;
+pub const replay_commands: u32 = 1024;
+pub const replay_param_stride: u32 = 256;
 pub const router_lanes: u32 = 32;
 // Dense split reduction: integer ownership/bounds only; not reduction arithmetic.
 pub const dense_simds: u32 = 8;

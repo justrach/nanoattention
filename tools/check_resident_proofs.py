@@ -22,14 +22,19 @@ def main() -> int:
     proofs = zig / "proofs"
     try:
         subprocess.run(["lake", "build"], cwd=proofs, check=True)
+        subprocess.run(["lake", "env", "lean", "Speculative.lean"], cwd=proofs, check=True)
+        subprocess.run(["lake", "env", "lean", "Prefetch.lean"], cwd=proofs, check=True)
+        subprocess.run(["lake", "env", "lean", "Transpose.lean"], cwd=proofs, check=True)
+        subprocess.run(["lake", "env", "lean", "Prepared.lean"], cwd=proofs, check=True)
         emitter = proofs / ".lake" / "build" / "bin" / "resident_emit"
-        # Obtain both results before touching any destination.
+        # Obtain all results before touching any destination.
         generated = [
             (zig / "src" / filename, subprocess.run(
                 [str(emitter), mode], cwd=proofs, check=True,
                 stdout=subprocess.PIPE).stdout)
             for filename, mode in (("resident_plan.zig", "--zig"),
-                                   ("resident_plan.metal", "--metal"))
+                                   ("resident_plan.metal", "--metal"),
+                                   ("replay_limits.h", "--replay-c"))
         ]
         failed = False
         for path, expected in generated:

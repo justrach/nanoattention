@@ -16,7 +16,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from benchmark import ATTENTION_CHUNKS, LONG_PROMPT_NOTE, code_prompt, mlx_prefill, positive_u32
+from benchmark import ATTENTION_CHUNKS, LONG_PROMPT_NOTE, MLX_ATTENTION_IMPLEMENTATION, code_prompt, mlx_prefill, positive_u32
 
 LONG_PREFILL_CHUNK_SIZE = 256
 
@@ -149,7 +149,7 @@ def main():
         "last_mlx_top1": int(reference[-1].argmax()),
     }
     if args.mlx_attention:
-        report["native_execution"]["attention_implementation"] = "mlx_layout_128_stripes"
+        report["native_execution"]["attention_implementation"] = MLX_ATTENTION_IMPLEMENTATION
     if args.attention_chunk is not None:
         report["native_execution"]["attention_chunk"] = args.attention_chunk
     if args.prompt_tokens is not None:

@@ -59,7 +59,7 @@ class BinarySearchTree:
 ENGINES = ("zig_fp32", "mlx_fp32", "mlx_bf16")
 LONG_PREFILL_CHUNK_SIZE = 512
 ATTENTION_CHUNKS = (0, 128, 256, 512, 1024)
-MLX_ATTENTION_IMPLEMENTATION = "mlx_layout_128_stripes"
+MLX_ATTENTION_IMPLEMENTATION = "mlx_layout_adaptive_stripes"
 LONG_PROMPT_NOTE = (
     "Exact-length raw code prefix: repeat tokenizer.encode(CONTINUATION, "
     "add_special_tokens=False) token IDs and truncate to the requested length; "

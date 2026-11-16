@@ -76,6 +76,30 @@ kernel void dense_matvec_router_f32(device const uchar *w [[buffer(0)]],
     if (lane == 0) out[row] = sum;
 }
 
+// Matched BF16 router: same per-row FP32 arithmetic and reduction as the
+// split reference, but no seven idle SIMDs per 256-thread output-row group.
+// Host selects only m=256,n=2048 with BF16 weights; offsets are bytes.
+kernel void dense_matvec_router_bf16(device const uchar *w [[buffer(0)]],
+                                     device const float *x [[buffer(1)]], device float *out [[buffer(2)]],
+                                     constant P &p [[buffer(8)]], uint i [[thread_position_in_grid]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    uint row = i / 32;
+    if (p.m != 256 || p.n != 2048 || row >= p.m) return;
+    device const ushort *weights = (device const ushort *)(w + p.offset) + ulong(row) * p.n;
+    float sum = 0;
+    for (uint block = 0; block < 16; ++block) {
+        uint col = block * 128 + lane * 4;
+        for (uint j = 0; j < 4; ++j)
+            sum += dense_matvec_value(weights[col + j]) * x[col + j];
+    }
+    sum += simd_shuffle_down(sum, 16);
+    sum += simd_shuffle_down(sum, 8);
+    sum += simd_shuffle_down(sum, 4);
+    sum += simd_shuffle_down(sum, 2);
+    sum += simd_shuffle_down(sum, 1);
+    if (lane == 0) out[row] = sum;
+}
+
 // One-row-per-threadgroup path. Dispatch exactly 256 threads
 // (eight 32-lane SIMD groups) per threadgroup, with one group per output row.
 // Every thread in an excess group returns together, before the barrier.

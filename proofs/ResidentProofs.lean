@@ -1118,4 +1118,105 @@ theorem aligned_head_ownership (d : Nat) (hd : d < alignedHeadDim) :
       d % alignedHeadElementsPerThread = d := by
   exact mlx_attention_component_coverage d hd
 
+/-- Fixed-width unrolling visits exactly the original lane-strided segment.
+This is integer-only: neither compiler FP reassociation nor device parity is proved. -/
+def fixedSegment (lane step : Nat) : Nat := lane + step * 32
+
+theorem fixed_segment_order (lane a b : Nat) (h : a < b) :
+    fixedSegment lane a < fixedSegment lane b := by
+  unfold fixedSegment
+  omega
+
+theorem fixed_segment_coverage (width lane segment : Nat)
+    (aligned : width % 512 = 0) (hlane : lane < 32)
+    (hsegment : segment < width / 16) (owner : segment % 32 = lane) :
+    ∃ step, step < width / 512 ∧ fixedSegment lane step = segment := by
+  refine ⟨segment / 32, ?_, ?_⟩
+  · omega
+  · unfold fixedSegment
+    omega
+
+theorem fixed_segment_unique (lane a b : Nat)
+    (h : fixedSegment lane a = fixedSegment lane b) : a = b := by
+  unfold fixedSegment at h
+  omega
+
+theorem fixed_segment_bounds (width lane step : Nat)
+    (hlane : lane < 32) (hstep : step < width / 512) :
+    fixedSegment lane step < width / 16 := by
+  unfold fixedSegment
+  omega
+
+/-- Global cache specialization may remove modulo only for a resident linear
+prefix. Windowed/ring attention is deliberately excluded by the host guard. -/
+theorem linear_cache_index (token capacity : Nat) (resident : token < capacity) :
+    token % capacity = token := Nat.mod_eq_of_lt resident
+
+/-- Sharing K/V registers does not share or split a query's SIMD lanes:
+each GQA8 local head has one (SIMD, register-head) owner. -/
+theorem gqa_reuse_coverage (head h : Nat) (admissible : h = 2 ∨ h = 4)
+    (bound : head < 8) :
+    ∃ sg slot, sg < 8 / h ∧ slot < h ∧ sg * h + slot = head := by
+  rcases admissible with rfl | rfl
+  · exact ⟨head / 2, head % 2, by omega⟩
+  · exact ⟨head / 4, head % 4, by omega⟩
+
+theorem gqa_reuse_unique (h a x b y : Nat) (admissible : h = 2 ∨ h = 4)
+    (hx : x < h) (hy : y < h) (same : a * h + x = b * h + y) :
+    a = b ∧ x = y := by
+  rcases admissible with rfl | rfl <;> omega
+
+/-- Packing independent stripes into a physical group never crosses a KV
+head, since the certified stripe counts are divisible by the packing factor. -/
+theorem gqa_grouped_kv_owner (group slot stripes blocks : Nat)
+    (hb : stripes = 128 ∨ stripes = 512 ∨ stripes = 1024)
+    (hc : blocks = 2 ∨ blocks = 4) (hs : slot < blocks) :
+    (group * blocks + slot) / stripes = group / (stripes / blocks) := by
+  rcases hb with rfl | rfl | rfl <;> rcases hc with rfl | rfl <;> omega
+
+theorem gqa_grouped_inverse (stripe blocks : Nat) (hc : blocks = 2 ∨ blocks = 4) :
+    stripe / blocks * blocks + stripe % blocks = stripe := by
+  rcases hc with rfl | rfl <;> omega
+
+/-- Integer specification of discarding 16 low mantissa bits with ties to even.
+NaN handling, float interpretation and device code are separate runtime checks. -/
+def bf16RoundedHigh (high low : Nat) : Nat :=
+  high + if low > 32768 ∨ (low = 32768 ∧ high % 2 = 1) then 1 else 0
+
+theorem bf16_rounding_bias (high low : Nat) (bound : low < 65536) :
+    (high * 65536 + low + 32767 + high % 2) / 65536 =
+      bf16RoundedHigh high low := by
+  unfold bf16RoundedHigh
+  split <;> omega
+
+theorem bf16_tie_even (high : Nat) :
+    bf16RoundedHigh high 32768 % 2 = 0 := by
+  unfold bf16RoundedHigh
+  split <;> omega
+
+theorem bf16_finite_round_no_u32_wrap (bits : Nat) (finite_bound : bits ≤ 4286578687) :
+    bits + 32767 + (bits / 65536) % 2 < 4294967296 := by omega
+
+/-- Replay parameter-table geometry, emitted to the C bridge and Zig. These
+certify indices only, not the semantics of Metal indirect-command barriers. -/
+def replayCommands : Nat := 1024
+def replayParamStride : Nat := 256
+
+theorem replay_param_alignment (command : Nat) :
+    command * replayParamStride % 256 = 0 := by
+  unfold replayParamStride
+  omega
+
+theorem replay_param_bounds (command bytes : Nat)
+    (hc : command < replayCommands) (hb : bytes ≤ replayParamStride) :
+    command * replayParamStride + bytes ≤ replayCommands * replayParamStride := by
+  unfold replayParamStride replayCommands at *
+  omega
+
+theorem replay_param_disjoint (a b bytes : Nat)
+    (order : a < b) (bound : bytes ≤ replayParamStride) :
+    a * replayParamStride + bytes ≤ b * replayParamStride := by
+  unfold replayParamStride at *
+  omega
+
 end Resident

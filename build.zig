@@ -32,6 +32,18 @@ pub fn build(b: *std.Build) void {
     const bench = b.addExecutable(.{ .name = "flint-bench", .root_module = bench_module });
     bench.step.dependOn(&proofs.step);
     b.installArtifact(bench);
+    const speculative_module = b.createModule(.{
+        .root_source_file = b.path("src/speculative_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    speculative_module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
+    speculative_module.linkFramework("Foundation", .{});
+    speculative_module.linkFramework("Metal", .{});
+    const speculative_bench = b.addExecutable(.{ .name = "flint-speculative-bench", .root_module = speculative_module });
+    speculative_bench.step.dependOn(&proofs.step);
+    b.installArtifact(speculative_bench);
     const tests = b.addTest(.{ .root_module = module });
     tests.step.dependOn(&proofs.step);
     const run_tests = b.addRunArtifact(tests);

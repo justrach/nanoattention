@@ -1,0 +1,182 @@
+{
+  "protocol": "real prefix; all-logit bitwise admission within the selected KV storage mode; rotated candidates; warm decode only",
+  "prompt_tokens": 16384,
+  "decode_tokens": 256,
+  "repeats": 5,
+  "input_sha256": "53d5d006012e8a38ae394038aff147e11f9b89cbe3701f44a64172031cde80e1",
+  "benchmark_sha256": "1f8cbe1267dcf4f7eecabac5cceeb4772fb23a5f9ebe3395681bf3f21b07087f",
+  "candidates": [
+    {
+      "candidate": 0,
+      "config": {
+        "head_row_tile": 2
+      },
+      "admitted": true,
+      "bit_exact_positions": 256,
+      "vocabulary": 150144,
+      "decode_seconds": [
+        2.6697820000117645,
+        2.6715989999938756,
+        2.665796000044793,
+        2.6593870000215247,
+        2.6610290000680834
+      ],
+      "decode_gpu_seconds": [
+        2.439435333828442,
+        2.4344108756631613,
+        2.4314362491713837,
+        2.4267775827320293,
+        2.4263789576943964
+      ],
+      "median_decode_seconds": 2.665796000044793,
+      "median_gpu_seconds": 2.4314362491713837,
+      "decode_tokens_per_second": 96.03135423554484,
+      "decode_cpu_seconds": [
+        0.092068,
+        0.095755,
+        0.09328,
+        0.090115,
+        0.092145
+      ],
+      "median_cpu_seconds": 0.092145,
+      "wall_speedup_over_baseline": 1.0,
+      "gpu_speedup_over_baseline": 1.0
+    },
+    {
+      "candidate": 1,
+      "config": {
+        "head_row_tile": 2,
+        "gqa_reuse": 2,
+        "affine_loads": true,
+        "gate_row_tile": 1,
+        "down_row_tile": 1
+      },
+      "admitted": true,
+      "bit_exact_positions": 256,
+      "vocabulary": 150144,
+      "decode_seconds": [
+        2.4119799999753013,
+        2.412657000008039,
+        2.4184909999603406,
+        2.4001429999480024,
+        2.3974050000542775
+      ],
+      "decode_gpu_seconds": [
+        2.1862124170875177,
+        2.1848185824928805,
+        2.1895566259045154,
+        2.1791113342624158,
+        2.168840917875059
+      ],
+      "median_decode_seconds": 2.4119799999753013,
+      "median_gpu_seconds": 2.1848185824928805,
+      "decode_tokens_per_second": 106.13686680761094,
+      "decode_cpu_seconds": [
+        0.093451,
+        0.094648,
+        0.090247,
+        0.092879,
+        0.090789
+      ],
+      "median_cpu_seconds": 0.092879,
+      "wall_speedup_over_baseline": 1.1052313866914696,
+      "gpu_speedup_over_baseline": 1.1128778694280017
+    },
+    {
+      "candidate": 2,
+      "config": {
+        "head_row_tile": 2,
+        "gqa_reuse": 2,
+        "affine_loads": true,
+        "gate_row_tile": 1,
+        "down_row_tile": 1,
+        "replay": true
+      },
+      "admitted": true,
+      "bit_exact_positions": 256,
+      "vocabulary": 150144,
+      "decode_seconds": [
+        2.467464999994263,
+        2.4781499999808148,
+        2.4682320000138134,
+        2.484180000028573,
+        2.473340000025928
+      ],
+      "decode_gpu_seconds": [
+        2.271863208618015,
+        2.274097375688143,
+        2.2675189587753266,
+        2.278648167150095,
+        2.2688870838610455
+      ],
+      "median_decode_seconds": 2.473340000025928,
+      "median_gpu_seconds": 2.271863208618015,
+      "decode_tokens_per_second": 103.50376413971243,
+      "decode_cpu_seconds": [
+        0.081554,
+        0.083395,
+        0.082866,
+        0.083372,
+        0.082681
+      ],
+      "median_cpu_seconds": 0.082866,
+      "wall_speedup_over_baseline": 1.0778121891922854,
+      "gpu_speedup_over_baseline": 1.070238841822892
+    },
+    {
+      "candidate": 3,
+      "config": {
+        "head_row_tile": 2,
+        "gqa_reuse": 2,
+        "replay": true
+      },
+      "admitted": true,
+      "bit_exact_positions": 256,
+      "vocabulary": 150144,
+      "decode_seconds": [
+        2.537315999972634,
+        2.529370000003837,
+        2.5376580000156537,
+        2.5222679999424145,
+        2.5247400000225753
+      ],
+      "decode_gpu_seconds": [
+        2.342940000235103,
+        2.340741749154404,
+        2.337478041416034,
+        2.3325125412084162,
+        2.336114789824933
+      ],
+      "median_decode_seconds": 2.529370000003837,
+      "median_gpu_seconds": 2.337478041416034,
+      "decode_tokens_per_second": 101.21097348336212,
+      "decode_cpu_seconds": [
+        0.085719,
+        0.082446,
+        0.084536,
+        0.079445,
+        0.080852
+      ],
+      "median_cpu_seconds": 0.082446,
+      "wall_speedup_over_baseline": 1.0539367510647903,
+      "gpu_speedup_over_baseline": 1.040196402315048
+    }
+  ],
+  "status": "rejected_for_default_slower_gpu",
+  "pipelines_icb_capable": true,
+  "precision": "FP32; no mathematical or precision change",
+  "logical_dispatches_per_token": 503,
+  "submissions_per_token": 1,
+  "proof_scope": "Lean-generated C/Zig capacity and stride with integer bounds/alignment; GPU barrier semantics verified only empirically",
+  "checks": {
+    "native_tests": 81,
+    "python_tests": 110
+  },
+  "source_sha256": {
+    "src/metal.m": "0a209aca97e8e9b0b8b67184f3cc487e9be85b7932071b2f40ca3cbb5c9fc610",
+    "src/replay_state.h": "4dfae49cf46cce4ae3eec58032201c2fe7d7436925119cfbc76ff596b5caa076",
+    "src/replay_impl.inc": "6803c32a3a3094779896e90e745ea972611e08a5a5fc881926b2e042945fa16d",
+    "src/replay_limits.h": "c3d673aeddec5006f7b467d5d3ddc0fb6176302d4b908c543d6ffed737559a74",
+    "src/replay_tests.zig": "cd22880e99a03e41352dc57d4cb688694843cc7cbffba8966756862e89e2c7ba"
+  }
+}

@@ -2,7 +2,6 @@
 //! No sockets, prompt replay, implicit resets, or GPU work in the CPU-only tests.
 const std = @import("std");
 const Model = @import("model.zig").Model;
-const sampling = @import("sampling.zig");
 const Allocator = std.mem.Allocator;
 
 extern "c" fn read(c_int, [*]u8, usize) isize;
@@ -33,6 +32,10 @@ pub const Response = struct {
     decode_seconds: f64,
     kv_allocated_bytes: u64,
     kv_valid_bytes: u64,
+    kv_storage: []const u8 = "fp32",
+    speculative_batches: usize = 0,
+    speculative_proposed: usize = 0,
+    speculative_accepted: usize = 0,
     prefill_logits: ?[]const f32,
     final_logits: ?[]const f32,
 };
@@ -189,7 +192,7 @@ fn output(bytes: []const u8) !void {
     }
 }
 
-fn handle(model: *Model, gpa: Allocator, line: []const u8) !void {
+fn handle(model: *Model, gpa: Allocator, history: *std.ArrayList(u32), line: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -203,7 +206,12 @@ fn handle(model: *Model, gpa: Allocator, line: []const u8) !void {
     const final_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, model.cfg.vocab_size) else null;
     // Also detect a failed clock before mutating the model.
     _ = try now();
-    if (request.reset) try model.reset();
+    try history.ensureUnusedCapacity(gpa, request.tokens.len + request.max_tokens + 1);
+    if (request.reset) {
+        try model.reset();
+        history.clearRetainingCapacity();
+    }
+    history.appendSliceAssumeCapacity(request.tokens);
 
     const prefill_start = try now();
     var logits = try model.prefill(request.tokens);
@@ -211,20 +219,12 @@ fn handle(model: *Model, gpa: Allocator, line: []const u8) !void {
     const prefill_seconds = try elapsed(prefill_start, try now());
     if (prefill_copy) |copy| @memcpy(copy, logits);
 
-    var count: usize = 0;
-    var eos = false;
     const decode_start = try now();
-    while (count < request.max_tokens) {
-        const token = try sampling.greedy(logits);
-        generated[count] = token;
-        count += 1;
-        // Do not defer this forward to a later request: every returned token is
-        // already committed, even if it is EOS or exhausts max_tokens.
-        logits = try model.forward(token);
-        try finiteLogits(logits, model.cfg.vocab_size);
-        eos = std.mem.indexOfScalar(u32, model.cfg.eos_token_id, token) != null;
-        if (eos) break;
-    }
+    const result = try @import("speculative_generation.zig").generate(model, gpa, history, generated, logits);
+    const count = result.count;
+    const eos = result.eos;
+    logits = result.logits;
+    try finiteLogits(logits, model.cfg.vocab_size);
     const decode_seconds = try elapsed(decode_start, try now());
     if (final_copy) |copy| @memcpy(copy, logits);
     const expected: u64 = @as(u64, preflight.cache_before) + request.tokens.len + count;
@@ -243,6 +243,10 @@ fn handle(model: *Model, gpa: Allocator, line: []const u8) !void {
         .decode_seconds = decode_seconds,
         .kv_allocated_bytes = bytes.allocated,
         .kv_valid_bytes = bytes.valid,
+        .kv_storage = if (model.kv_bf16) "bf16_global_fp32_sliding" else "fp32",
+        .speculative_batches = result.batches,
+        .speculative_proposed = result.proposed,
+        .speculative_accepted = result.accepted,
         .prefill_logits = prefill_copy,
         .final_logits = final_copy,
     };
@@ -267,16 +271,18 @@ fn runImpl(model: *Model, gpa: Allocator) !void {
     const storage = try gpa.alloc(u8, max_line_bytes);
     defer gpa.free(storage);
     var lines: LineBuffer = .{ .storage = storage };
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(gpa);
     var chunk: [8192]u8 = undefined;
     while (true) {
         const n = read(0, &chunk, chunk.len);
         if (n < 0) return error.InputFailed;
         if (n == 0) {
-            if (lines.finish()) |line| try handle(model, gpa, line);
+            if (lines.finish()) |line| try handle(model, gpa, &history, line);
             return;
         }
         for (chunk[0..@intCast(n)]) |byte| {
-            if (try lines.push(byte)) |line| try handle(model, gpa, line);
+            if (try lines.push(byte)) |line| try handle(model, gpa, &history, line);
         }
     }
 }

@@ -29,6 +29,8 @@ typedef struct {
     NSMutableArray *resident_resources;
     NSMutableDictionary *resident_usage;
     uint64_t invalid_dispatches, failed_dispatches, profiled_submissions;
+    uint64_t initial_dispatches;
+    double initial_gpu_seconds;
 } FMProfile;
 
 enum { FM_PIPELINE_CACHE_SIZE = 128 }; // Power of two; bounded open-addressed cache.
@@ -38,6 +40,8 @@ typedef struct {
     // Borrowed from pipelines, which owns every cached pipeline until fm_close.
     id<MTLComputePipelineState> pipeline;
 } FMPipelineCacheEntry;
+
+#include "replay_state.h"
 
 typedef struct {
     id<MTLDevice> device;
@@ -53,12 +57,15 @@ typedef struct {
     NSAutoreleasePool *pool;
     NSAutoreleasePool *batch_pool;
     FMProfile *profile;
+    FMReplay *replay;
 } FMContext;
 static _Thread_local char fm_error_text[2048];
 static void fail(NSString *message) {
     snprintf(fm_error_text, sizeof(fm_error_text), "%s", message.UTF8String ?: "Metal failure");
 }
 const char *fm_error(void) { return fm_error_text; }
+static id<MTLComputeCommandEncoder> encoder_for(FMContext *, id<MTLCounterSampleBuffer>, NSUInteger);
+#include "replay_impl.inc"
 
 static void profile_destroy(FMProfile *p) {
     if (!p) return;
@@ -122,6 +129,8 @@ static int profile_open(FMContext *c) {
     if (!p) { fail(@"FLINT_PROFILE: cannot allocate profiler"); return 0; }
     c->profile = p;
     p->method = method;
+    p->initial_dispatches = c->dispatches;
+    p->initial_gpu_seconds = c->gpu_seconds;
     p->counter_set = method == FMProfileCommand ? nil : [timestamp_set retain];
     p->sample_buffers = [[NSMutableArray alloc] init];
     p->names = [[NSMutableArray alloc] init];
@@ -211,8 +220,8 @@ static void profile_report(FMContext *c) {
             @"GPU ticks calibrated against CPU nanosecond timestamps per submission",
         @"profiled_submissions": @(p->profiled_submissions),
         @"dispatches": @(count), @"total_us": @(total_us),
-        @"encoded_dispatches": @(c->dispatches),
-        @"command_gpu_us": @(c->gpu_seconds * 1000000.0),
+        @"encoded_dispatches": @(c->dispatches - p->initial_dispatches),
+        @"command_gpu_us": @((c->gpu_seconds - p->initial_gpu_seconds) * 1000000.0),
         @"invalid_dispatches": @(p->invalid_dispatches),
         @"failed_dispatches": @(p->failed_dispatches), @"kernels": rows
     };
@@ -273,7 +282,9 @@ static id<MTLComputeCommandEncoder> encoder_for(FMContext *c,
                 a.endOfEncoderSampleIndex = sample_index + 1;
                 c->encoder = [[c->command computeCommandEncoderWithDescriptor:d] retain];
             }
-        } else c->encoder = [[c->command computeCommandEncoder] retain];
+        } else if (c->replay && c->replay->active)
+            c->encoder = [[c->command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] retain];
+        else c->encoder = [[c->command computeCommandEncoder] retain];
         // GPU-address resources are not implicitly tracked by direct bindings.
         // Every split encoder needs the entire logical batch's declarations.
         if (c->profile) {
@@ -288,6 +299,12 @@ static id<MTLComputeCommandEncoder> encoder_for(FMContext *c,
     return c->encoder;
 }
 static int resident(FMContext *c, id<MTLBuffer> buffer, MTLResourceUsage usage) {
+    if (c->replay) {
+        if (!c->batch_pool) c->batch_pool = [[NSAutoreleasePool alloc] init];
+        NSValue *key = [NSValue valueWithPointer:buffer];
+        if (usage & MTLResourceUsageWrite) [c->replay->read_only removeObject:key];
+        else [c->replay->read_only addObject:key];
+    }
     if (c->profile && c->profile->method != FMProfileDispatch) {
         if (!buffer) { fail(@"Cannot declare a nil resident resource"); return 0; }
         NSValue *key = [NSValue valueWithPointer:buffer];
@@ -361,8 +378,17 @@ static int submit_command(FMContext *c) {
     [c->batch_pool drain]; c->batch_pool = nil;
     return ok;
 }
+int fm_profile_begin(void *opaque) {
+    FMContext *c = opaque;
+    if (c->profile || c->command || c->encoder || (c->replay && c->replay->active)) {
+        fail(@"Profiling requires an idle, unprofiled non-replay context");
+        return 0;
+    }
+    return profile_open(c);
+}
 int fm_finish(void *opaque) {
     FMContext *c = opaque;
+    if (!replay_encode(c)) return 0;
     int ok = submit_command(c);
     // End of the logical command/batch: do not retain no-copy mmap buffers into
     // the next model. Command fallback keeps these only between its dispatches.
@@ -376,6 +402,7 @@ void fm_close(void *opaque) {
     FMContext *c = opaque;
     if (!c) return;
     fm_finish(c);
+    replay_destroy(c->replay);
     if (c->profile) { profile_report(c); profile_destroy(c->profile); }
     for (size_t i = 0; i < FM_PIPELINE_CACHE_SIZE; ++i) free(c->pipeline_cache[i].name);
     [c->pipelines release]; [c->library release];
@@ -398,7 +425,7 @@ void *fm_wrap(void *opaque, void *bytes, size_t length) {
 void *fm_contents(void *buffer) { return [(id<MTLBuffer>)buffer contents]; }
 void fm_release(void *buffer) { [(id<MTLBuffer>)buffer release]; }
 
-int fm_dispatch(void *opaque, const char *name, void *const *buffers, size_t count,
+static int dispatch_impl(void *opaque, const char *name, void *const *buffers, size_t count,
                 const void *params, size_t param_size, size_t threads, size_t group) {
     FMContext *c = opaque;
     if (!c->batch_pool) c->batch_pool = [[NSAutoreleasePool alloc] init];
@@ -423,7 +450,13 @@ int fm_dispatch(void *opaque, const char *name, void *const *buffers, size_t cou
             id<MTLFunction> f = [c->library newFunctionWithName:key];
             if (!f) { fail([@"Missing Metal kernel: " stringByAppendingString:key]); return 0; }
             NSError *error = nil;
-            pipeline = [c->device newComputePipelineStateWithFunction:f error:&error];
+            if (c->replay) {
+                MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+                d.computeFunction = f;
+                d.supportIndirectCommandBuffers = YES;
+                pipeline = [c->device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&error];
+                [d release];
+            } else pipeline = [c->device newComputePipelineStateWithFunction:f error:&error];
             [f release];
             if (!pipeline) { fail(error.localizedDescription); return 0; }
             c->pipelines[key] = pipeline;
@@ -437,6 +470,8 @@ int fm_dispatch(void *opaque, const char *name, void *const *buffers, size_t cou
         }
     }
     if (group > pipeline.maxTotalThreadsPerThreadgroup) { fail(@"Invalid threadgroup size"); return 0; }
+    if (c->replay && c->replay->active)
+        return replay_record(c, pipeline, buffers, count, params, param_size, threads, group);
     id<MTLCounterSampleBuffer> samples = nil;
     NSUInteger sample_index = 0;
     if (c->profile && c->profile->method != FMProfileCommand) {
@@ -476,6 +511,18 @@ int fm_dispatch(void *opaque, const char *name, void *const *buffers, size_t cou
         }
     }
     return 1;
+}
+
+int fm_dispatch(void *opaque, const char *name, void *const *buffers, size_t count,
+                const void *params, size_t param_size, size_t threads, size_t group) {
+    int ok = dispatch_impl(opaque, name, buffers, count, params, param_size, threads, group);
+    FMContext *c = opaque;
+    if (!ok && c->replay && c->replay->active) {
+        // No ICB dispatch executes until finish. Never submit a partial frame.
+        c->replay->cursor = 0;
+        c->has_dispatch = 0;
+    }
+    return ok;
 }
 
 void *fm_map(const char *path, size_t *length, size_t *mapped_length) {

@@ -296,6 +296,10 @@ class Backend:
                                            prefill_seconds=prefill_seconds, decode_seconds=decode_seconds,
                                            kv_allocated_bytes=response['kv_allocated_bytes'],
                                            kv_valid_bytes=response['kv_valid_bytes'],
+                                           kv_storage=response.get('kv_storage', 'fp32'),
+                                           speculative_batches=response.get('speculative_batches', 0),
+                                           speculative_proposed=response.get('speculative_proposed', 0),
+                                           speculative_accepted=response.get('speculative_accepted', 0),
                                            effective_max_tokens=plan['budget'], sampling='greedy'))
             self.metrics.append(dict(result['nanoattention'], prompt_tokens=len(plan['ids']),
                                      completion_tokens=len(generated), finish_reason=parsed['finish_reason'],
@@ -489,7 +493,15 @@ def main():
     parser.add_argument('--context', type=int, default=32768)
     parser.add_argument('--max-tokens', type=int, default=4096, help='server output cap, including committed EOS')
     parser.add_argument('--timeout', type=float, default=900)
+    parser.add_argument('--kv-bf16', action='store_true', help='experimental BF16 global KV; may change logits/tokens')
+    parser.add_argument('--speculative-tokens', type=int, default=0, choices=range(33),
+                        help='opt-in exact greedy history drafting with batched target verification')
+    parser.add_argument('--speculative-query-group', type=int, default=2, choices=(2, 4, 8))
+    parser.add_argument('--speculative-expert-tile', type=int, default=0, choices=(0, 1, 2, 4, 8))
+    parser.add_argument('--speculative-weight-reuse', action='store_true')
     args = parser.parse_args()
+    if not args.speculative_tokens and (args.speculative_query_group != 2 or args.speculative_expert_tile or args.speculative_weight_reuse):
+        parser.error('speculative tuning requires --speculative-tokens')
     config = json.loads((args.checkpoint/'config.json').read_text())
     if not 0 < args.context <= config['max_position_embeddings'] or not 0 < args.max_tokens < args.context:
         parser.error('invalid context or output cap')
@@ -503,6 +515,13 @@ def main():
     eos = eos if isinstance(eos, list) else [eos]
     command = [str(args.binary.resolve()), 'session', str(args.checkpoint.resolve()),
                '--context', str(args.context), '--mlx-attention', '1', '--staged-row-tile', '2']
+    if args.kv_bf16:
+        command += ['--kv-bf16', '1']
+    if args.speculative_tokens:
+        command += ['--speculative-tokens', str(args.speculative_tokens),
+                    '--speculative-query-group', str(args.speculative_query_group),
+                    '--speculative-expert-tile', str(args.speculative_expert_tile),
+                    '--speculative-weight-reuse', str(int(args.speculative_weight_reuse))]
     backend = Backend(tokenizer, command, args.context, eos, config['vocab_size'], args.max_tokens, args.timeout)
     server = AdapterServer(('127.0.0.1', args.port), backend, os.environ.get('NANOATTENTION_API_KEY', 'local'))
     stopped = threading.Event()
