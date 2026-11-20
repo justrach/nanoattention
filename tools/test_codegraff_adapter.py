@@ -60,7 +60,7 @@ class CharacterTokenizer:
 
     def apply_chat_template(self, messages, tools, tokenize,
                             add_generation_prompt, return_dict=False):
-        assert add_generation_prompt is True
+        assert add_generation_prompt in (True, False)
         assert return_dict is False
         self.renders.append(copy.deepcopy(messages))
         text = "<tools>" + json.dumps(tools, sort_keys=True) + "</tools>"
@@ -79,15 +79,19 @@ class CharacterTokenizer:
                 text += "</tool_call>"
             if not text.endswith(EOS):
                 text += EOS
-        text += "<assistant>"
+        if add_generation_prompt:
+            text += "<assistant>"
         return self.encode(text) if tokenize else text
 
 
 class FakeNativeSession:
+    """Models the native protocol: truncate replays from the newest checkpoint
+    at or below N; checkpoint_at and --prefix-cache keep exact token prefixes."""
     def __init__(self, factory, command, timeout):
         self.factory = factory
         self.command, self.timeout = command, timeout
         self.requests, self.close_calls, self.cache = [], [], []
+        self.checkpoints = set()
         self.entered = False
         self.mutate = None
         self.failure = None
@@ -101,14 +105,52 @@ class FakeNativeSession:
         self.requests.append(copy.deepcopy(request))
         if self.failure is not None:
             raise self.failure
+        extra = {}
+        disk = "--prefix-cache" in self.command
+        restored = 0
         if request["reset"]:
-            self.cache = []
-        before = len(self.cache)
+            assert "truncate" not in request
+            self.cache, self.checkpoints = [], set()
+            if disk:
+                tokens = request["tokens"]
+                restored = max([len(k) for k in self.factory.disk
+                                if len(k) < len(tokens) and tuple(tokens[:len(k)]) == k] + [0])
+                self.cache = list(tokens[:restored])
+                if restored:
+                    self.checkpoints.add(restored)
+        elif "truncate" in request:
+            n = request["truncate"]
+            assert n <= len(self.cache)
+            best = max([p for p in self.checkpoints if p <= n] + [0])
+            extra.update(truncated_from=len(self.cache), rewind_checkpoint=best, replayed_tokens=n - best,
+                         replay_seconds=0.0625, rewind_source="memory" if best else "start")
+            self.cache = self.cache[:n]
+            self.checkpoints = set(p for p in self.checkpoints if p <= n)
+        before = len(self.cache) - restored
+        taken, written = 0, 0
+        for p in request.get("checkpoint_at", []):
+            assert before < p <= before + len(request["tokens"])
+            if p < len(self.cache):
+                continue
+            self.checkpoints.add(p)
+            taken += 1
+            if disk and p > len(self.cache) and tuple(request["tokens"][:p - before]) not in self.factory.disk:
+                self.factory.disk[tuple(self.cache + request["tokens"][len(self.cache) - before:p - before])] = True
+                written += 1
+        self.cache.extend(request["tokens"][restored:])
+        self.checkpoints.add(len(self.cache))
         generated = []
         if request["max_tokens"]:
             generated = [ord(char) for char in self.factory.outputs.pop(0) + EOS]
             generated = generated[:request["max_tokens"]]
-        self.cache.extend(request["tokens"] + generated)
+        self.cache.extend(generated)
+        self.checkpoints.add(len(self.cache))
+        if disk:
+            extra.update(restored_prefix_tokens=restored, restore_seconds=0.03125,
+                         snapshots_written=written, snapshot_bytes=written * 4096,
+                         snapshot_seconds=0.0, snapshot_failures=0)
+        if request.get("checkpoint_at"):
+            extra["checkpoints_taken"] = taken
         response = dict(id=request["id"], tokens=generated,
                         cache_before=before, cache_after=len(self.cache),
                         prefill_tokens=len(request["tokens"]),
@@ -116,7 +158,7 @@ class FakeNativeSession:
                         reused_prefix_tokens=before,
                         eos=bool(generated and generated[-1] == ord(EOS)),
                         prefill_seconds=0.125, decode_seconds=0.25 if generated else 0.0,
-                        kv_allocated_bytes=8192 * 8, kv_valid_bytes=len(self.cache) * 8)
+                        kv_allocated_bytes=8192 * 8, kv_valid_bytes=len(self.cache) * 8, **extra)
         if self.mutate is not None:
             self.mutate(response)
         return response
@@ -128,6 +170,7 @@ class FakeNativeSession:
 class FakeFactory:
     def __init__(self, outputs):
         self.outputs, self.workers = list(outputs), []
+        self.disk = {}
 
     def __call__(self, command, timeout):
         worker = FakeNativeSession(self, command, timeout)
@@ -136,12 +179,13 @@ class FakeFactory:
 
 
 class AdapterTests(unittest.TestCase):
-    def make_backend(self, outputs=("done",), context=8192, maximum=512):
+    def make_backend(self, outputs=("done",), context=8192, maximum=512, prefix_cache=False):
         tokenizer = CharacterTokenizer()
         factory = FakeFactory(outputs)
-        backend = adapter.Backend(tokenizer, ["not-a-real-executable"], context,
+        command = ["not-a-real-executable"] + (["--prefix-cache", "target/unused"] if prefix_cache else [])
+        backend = adapter.Backend(tokenizer, command, context,
                                   [ord(EOS)], 256, maximum=maximum, timeout=3,
-                                  worker_factory=factory)
+                                  worker_factory=factory, prefix_cache=prefix_cache)
         self.addCleanup(backend.close)
         return backend, tokenizer, factory
 
@@ -186,21 +230,119 @@ class AdapterTests(unittest.TestCase):
         backend.close()
         self.assertEqual(worker.close_calls, [True])
 
-    def test_changed_earlier_history_resets_instead_of_reusing_stale_prefix(self):
+    def system_payload(self, user="inspect", tools=None, system="You are a careful coder."):
+        return self.payload(messages=[dict(role="system", content=system),
+                                      dict(role="user", content=user)],
+                            tools=[copy.deepcopy(TOOL)] if tools is None else tools)
+
+    def test_changed_earlier_history_truncates_at_exact_common_token_prefix(self):
         backend, tokenizer, factory = self.make_backend([RAW_CALL, "new history"])
         payload = self.payload()
         first = backend.complete(payload)
+        cached = list(backend.cached_ids)
         changed = self.followup(payload, first)
         changed["messages"][0] = dict(role="user", content="different instruction")
         plan = backend.prepare(changed)
-        self.assertTrue(plan["reset"])
-        self.assertEqual(plan["reused"], 0)
-        self.assertEqual(plan["suffix"], plan["ids"])
+        self.assertEqual(plan["action"], "truncate")
+        self.assertFalse(plan["reset"])
+        common = next(i for i, (a, b) in enumerate(zip(plan["ids"], cached)) if a != b)
+        self.assertEqual(plan["reused"], common)
+        self.assertEqual(plan["ids"][:common], cached[:common])
+        self.assertNotEqual(plan["ids"][common], cached[common])
+        self.assertEqual(plan["suffix"], plan["ids"][common:])
         self.assertIn("tool_calls", tokenizer.renders[-1][1])
         result = backend.execute(plan)
-        self.assertTrue(factory.workers[0].requests[-1]["reset"])
-        self.assertTrue(result["nanoattention"]["cache_reset"])
+        worker = factory.workers[0]
+        self.assertEqual(len(factory.workers), 1)
+        request = worker.requests[-1]
+        self.assertEqual((request["reset"], request["truncate"]), (False, common))
+        self.assertEqual(request["tokens"], plan["suffix"])
+        self.assertEqual(worker.cache, backend.cached_ids)
+        meta = result["nanoattention"]
+        self.assertFalse(meta["cache_reset"])
+        self.assertEqual(meta["cache_action"], "truncate")
+        self.assertEqual(meta["truncated_from"], len(cached))
+        self.assertEqual(meta["reused_prefix_tokens"], common)
+        self.assertEqual(meta["rewind_checkpoint"] + meta["replayed_tokens"], common)
+        self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"],
+                         common - meta["replayed_tokens"])
+
+    def test_retried_request_rewinds_to_last_prompt_token(self):
+        backend, _, factory = self.make_backend(["first", "again"])
+        payload = self.payload()
+        backend.complete(payload)
+        plan = backend.prepare(payload)
+        self.assertEqual(plan["action"], "truncate")
+        self.assertEqual(plan["reused"], len(plan["ids"]) - 1)
+        self.assertEqual(plan["suffix"], plan["ids"][-1:])
+        result = backend.execute(plan)
+        self.assertEqual(result["choices"][0]["message"]["content"], "again")
         self.assertEqual(factory.workers[0].cache, backend.cached_ids)
+
+    def test_first_request_marks_exact_system_and_tool_prefix(self):
+        backend, tokenizer, factory = self.make_backend(["one", "two"])
+        payload = self.system_payload()
+        first = backend.complete(payload)
+        stable = tokenizer.apply_chat_template(payload["messages"][:1], tools=payload["tools"],
+                                               tokenize=True, add_generation_prompt=False)
+        request = factory.workers[0].requests[0]
+        self.assertTrue(request["reset"])
+        self.assertEqual(request["checkpoint_at"], [len(stable)])
+        self.assertEqual(request["tokens"][:len(stable)], stable)
+        self.assertEqual(first["nanoattention"]["stable_prefix_tokens"], len(stable))
+        self.assertEqual(first["nanoattention"]["checkpoint_at"], [len(stable)])
+        followup = dict(payload, messages=payload["messages"] + [
+            dict(role="assistant", content="one"), dict(role="user", content="more")])
+        backend.complete(followup)
+        self.assertNotIn("checkpoint_at", factory.workers[0].requests[1])
+        self.assertNotIn("truncate", factory.workers[0].requests[1])
+        # A divergence after the stable prefix rewinds to a memory checkpoint.
+        backend, _, factory = self.make_backend(["one", "two"])
+        backend.complete(payload)
+        result = backend.complete(self.system_payload(user="something else"))
+        meta = result["nanoattention"]
+        self.assertEqual(meta["cache_action"], "truncate")
+        self.assertEqual(meta["rewind_checkpoint"], len(stable))
+        self.assertEqual(meta["rewind_source"], "memory")
+        self.assertEqual(meta["replayed_tokens"], meta["reused_prefix_tokens"] - len(stable))
+
+    def test_prefix_cache_restores_stable_prefix_in_a_new_worker(self):
+        backend, tokenizer, factory = self.make_backend(["one", "two", "three"], prefix_cache=True)
+        payload = self.system_payload()
+        first = backend.complete(payload)
+        stable = len(tokenizer.apply_chat_template(payload["messages"][:1], tools=payload["tools"],
+                                                   tokenize=True, add_generation_prompt=False))
+        self.assertEqual(first["nanoattention"]["snapshots_written"], 1)
+        self.assertEqual(first["nanoattention"]["restored_prefix_tokens"], 0)
+        backend.abort()  # e.g. a failed request: the next one owns a fresh worker
+        result = backend.complete(self.system_payload(user="next task"))
+        self.assertEqual(len(factory.workers), 2)
+        request = factory.workers[1].requests[0]
+        self.assertTrue(request["reset"])
+        self.assertEqual(request["checkpoint_at"], [stable])
+        meta = result["nanoattention"]
+        self.assertEqual((meta["cache_action"], meta["restored_prefix_tokens"]), ("reset", stable))
+        self.assertEqual(meta["snapshots_written"], 0)
+        self.assertEqual(result["usage"]["prompt_tokens_details"]["cached_tokens"], stable)
+        self.assertEqual(factory.workers[1].cache, backend.cached_ids)
+        # A change inside the stable prefix resets (a disk snapshot may match)
+        # instead of rewinding into it; without a prefix cache it rewinds.
+        changed = self.system_payload(user="next task", tools=[])
+        self.assertEqual(backend.prepare(changed)["action"], "reset")
+        plain, _, _ = self.make_backend(["one"])
+        plain.complete(payload)
+        self.assertEqual(plain.prepare(changed)["action"], "truncate")
+
+    def test_command_passes_prefix_cache_only_when_configured(self):
+        import argparse
+        args = argparse.Namespace(binary=Path("zig-out/bin/flint"), checkpoint=Path("model"), context=8192,
+                                  kv_bf16=False, speculative_tokens=0, prefix_cache=None, prefix_cache_bytes=None)
+        self.assertNotIn("--prefix-cache", adapter.native_command(args))
+        args.prefix_cache, args.prefix_cache_bytes = Path("target/prefix-cache"), 1 << 30
+        command = adapter.native_command(args)
+        index = command.index("--prefix-cache")
+        self.assertEqual(Path(command[index + 1]), Path("target/prefix-cache").resolve())
+        self.assertEqual(command[command.index("--prefix-cache-bytes") + 1], str(1 << 30))
 
     def test_json_string_tool_arguments_normalize_without_mutating_client_history(self):
         backend, tokenizer, factory = self.make_backend()
@@ -263,6 +405,30 @@ class AdapterTests(unittest.TestCase):
         with patch.object(adapter, "NATIVE_CHUNK", 17), self.assertRaises(adapter.AdapterError):
             backend2.complete(payload)
         self.assertEqual(factory2.workers, [])
+
+    def test_malformed_rewind_and_restore_accounting_aborts_owned_worker(self):
+        bad_responses = [
+            dict(truncated_from=1), dict(rewind_checkpoint=10**6), dict(replayed_tokens=0),
+            dict(rewind_source="guess"), dict(replay_seconds=float("inf")),
+            dict(restored_prefix_tokens=1), dict(checkpoints_taken=0)]
+        for bad in bad_responses:
+            with self.subTest(bad=bad):
+                backend, _, factory = self.make_backend(["seed", "next"])
+                backend.complete(self.system_payload())
+                worker = factory.workers[0]
+                worker.mutate = lambda response, bad=bad: response.update(bad)
+                with self.assertRaises(adapter.AdapterError) as caught:
+                    # Diverges inside the stable prefix: truncate plus checkpoint_at.
+                    backend.complete(self.system_payload(system="You are a terse coder."))
+                self.assertEqual(caught.exception.status, 502)
+                self.assertEqual(worker.close_calls, [False])
+                self.assertEqual(backend.cached_ids, [])
+                self.assertTrue(backend.needs_reset)
+        backend, _, factory = self.make_backend(["seed", "next"], prefix_cache=True)
+        backend.complete(self.payload())
+        factory.workers[0].mutate = lambda response: response.pop("snapshots_written")
+        with self.assertRaises(adapter.AdapterError):
+            backend.complete(self.payload(messages=[dict(role="user", content="another")]))
 
     def test_malformed_native_accounting_aborts_owned_worker(self):
         bad_responses = [

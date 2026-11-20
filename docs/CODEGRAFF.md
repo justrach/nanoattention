@@ -91,6 +91,22 @@ python3 tools/guarded_run.py --lock /path/to/shared-inference.lock --timeout 144
   --context 32768 --max-tokens 4096 --timeout 900 --port 8080
 ```
 
+Add `--prefix-cache target/prefix-cache` (and optionally `--prefix-cache-bytes`)
+to the adapter, or to the launcher before its `--`, to keep exact on-disk
+snapshots of the system prompt and tool definitions across adapter restarts and
+worker failures. A new worker then restores that prefix instead of prefilling
+it: for a 2,682-token system prompt and tool list on the M3 Ultra (context
+8192), a 227 MB snapshot restored in 0.22 s in place of about 23 s of prefill,
+with bit-identical logits (see [measurements](../benchmarks/prefix-cache.md)).
+The first request of any new worker still pays about 2.4 s of first-forward
+warmup. A snapshot written at one `--context` is reused at another only if
+both select the same attention kernels (split-attention eligibility is in the
+settings key). Responses report
+`restored_prefix_tokens`, `restore_seconds`, `snapshots_written` and
+`snapshot_bytes`. Snapshots are invalidated by any rebuild of `flint` or change
+of checkpoint or engine settings. The directory is the user's choice; nothing
+is written without the flag.
+
 Only `127.0.0.1` is bound; non-loopback serving is deliberately unsupported.
 Use an appropriate private environment token instead of the placeholder on a
 shared machine. The server does not log prompts or tool arguments by default.
@@ -123,9 +139,21 @@ in response metadata. Context reserves every generated token, including EOS.
   terminal EOS) when the corresponding client message still matches.
 - It re-renders with the checkpoint's own template and compares **actual token
   IDs**. Only an exact cached prefix permits append-only inference.
-- Changed history/tool preambles or non-round-tripping output cause an explicit
-  native reset and full replay, reported as `cache_reset`; there is no fabricated
-  position, silent truncation or claim that a replay was a cache hit.
+- When the new request's IDs diverge from the cached IDs (edited history, a
+  retried request, non-round-tripping output), the adapter computes the exact
+  common token prefix itself and sends native `truncate` to it (keeping at least
+  one new token), instead of a reset. The engine restores its newest checkpoint
+  at or below that point and replays its own recorded tokens up to it, exactly.
+  Every response reports `cache_action` (`append`, `truncate` or `reset`),
+  `truncated_from`, `rewind_checkpoint`, `replayed_tokens`, `replay_seconds`
+  and `rewind_source`; `cached_tokens` excludes replayed tokens. A reset is used
+  only with no common prefix, after a failure, or when `--prefix-cache` is on
+  and the divergence lies inside the stable system/tool prefix (a disk snapshot
+  of the new prefix may then be restored instead).
+- The stable prefix is the leading system messages plus tool definitions,
+  rendered alone with the checkpoint's template. When it is an exact token
+  prefix of the request, a request that prefills across it marks it with
+  native `checkpoint_at` (reported as `stable_prefix_tokens`/`checkpoint_at`).
 - Prefixes are chunked into at most 65,536 IDs per native JSONL request so the
   native 1 MiB frame limit does not preclude a larger configured context. All
   intermediate chunks use zero generated tokens; generation occurs only on the
@@ -139,8 +167,9 @@ in response metadata. Context reserves every generated token, including EOS.
   fail closed, and reserved closing delimiters cannot be literal raw values.
 
 This is a **single active sequence**, not concurrent batching or a multi-user
-cache service. Concurrent inference returns 429. Switching conversations can
-reset the cache. Responses include counts/timings/KV allocation metadata;
+cache service. Concurrent inference returns 429. Switching conversations
+rewinds to their common prefix (usually the system/tool prefix) or, with
+`--prefix-cache`, may reset and restore a different prefix from disk. Responses include counts/timings/KV allocation metadata;
 authenticated `GET /v1/nanoattention/metrics` exposes only bounded content-free
 request counters. No prompt, tool arguments or credentials are returned there.
 

@@ -30,6 +30,7 @@ for _key, _value in {'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
 MAX_BODY = 8 * 1024 * 1024
 NATIVE_CHUNK = 65536  # At most 459 KiB of u32 IDs in the native 1 MiB JSONL frame.
 MODEL_ID = 'flint'
+REWIND_SOURCES = ('ring_intact', 'memory', 'disk', 'start')
 
 
 class AdapterError(ValueError):
@@ -106,6 +107,18 @@ def assistant_signature(message):
     return result
 
 
+def common_prefix(a, b):
+    n = min(len(a), len(b))
+    for i in range(n):
+        if a[i] != b[i]:
+            return i
+    return n
+
+
+def finite_seconds(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
 def validate_options(payload, maximum):
     if not isinstance(payload, dict) or payload.get('model', MODEL_ID) != MODEL_ID:
         raise AdapterError('unknown model; use flint')
@@ -157,16 +170,36 @@ def validate_options(payload, maximum):
 
 class Backend:
     def __init__(self, tokenizer, command, context, eos, vocab_size, maximum=4096,
-                 timeout=900, worker_factory=NativeSession):
+                 timeout=900, worker_factory=NativeSession, prefix_cache=False):
         self.tokenizer, self.command = tokenizer, command
         self.context, self.eos, self.vocab_size = context, set(eos), vocab_size
         self.maximum, self.timeout, self.worker_factory = maximum, timeout, worker_factory
+        # The engine was started with --prefix-cache: a reset may restore from disk.
+        self.prefix_cache = prefix_cache
         self.worker = None
         self.cached_ids, self.records = [], []
         self.needs_reset, self.closed, self.active = True, False, False
         self.epoch, self.sequence = 0, 0
         self.gate = threading.Semaphore(1)
         self.metrics, self.worker_starts, self.failures = [], 0, 0
+
+    def stable_prefix(self, rendered_messages, tools):
+        """Tokens of the leading system messages plus tool definitions, rendered
+        alone with the checkpoint's own template. prepare() claims a boundary
+        only if they are an exact token prefix of the full request."""
+        count = 0
+        while count < len(rendered_messages) and rendered_messages[count]['role'] == 'system':
+            count += 1
+        options = dict(tools=tools, add_generation_prompt=False)
+        try:
+            text = self.tokenizer.apply_chat_template(rendered_messages[:count], tokenize=False, **options)
+            prefix = list(self.tokenizer.apply_chat_template(rendered_messages[:count], tokenize=True,
+                                                             return_dict=False, **options))
+        except Exception:
+            return []
+        if list(self.tokenizer.encode(text, add_special_tokens=False)) != prefix:
+            return []
+        return prefix
 
     def prepare(self, payload):
         if self.closed:
@@ -185,6 +218,7 @@ class Backend:
             if 'reasoning_content' in current and current['reasoning_content'] != record['reasoning']:
                 continue
             rendered_messages[index] = dict(role='assistant', content=record['raw'])
+        stable_ids = self.stable_prefix(rendered_messages, tools)
         options = dict(tools=tools, add_generation_prompt=True)
         text = self.tokenizer.apply_chat_template(rendered_messages, tokenize=False, **options)
         ids = list(self.tokenizer.apply_chat_template(rendered_messages, tokenize=True,
@@ -195,16 +229,37 @@ class Backend:
             raise AdapterError('invalid template token IDs', 500)
         if len(ids) + budget > self.context:
             raise AdapterError('prompt plus reserved committed output exceeds context')
-        hit = (not self.needs_reset and len(ids) >= len(self.cached_ids)
-               and ids[:len(self.cached_ids)] == self.cached_ids)
-        reused = len(self.cached_ids) if hit else 0
+        stable = len(stable_ids) if 0 < len(stable_ids) < len(ids) and ids[:len(stable_ids)] == stable_ids else 0
+        # Exact token identity decides everything: append when the cached IDs are
+        # a prefix of the request; otherwise rewind to the common token prefix,
+        # leaving at least one new token. A reset happens only with nothing in
+        # common, or when the request diverges inside its stable system/tool
+        # prefix and a disk snapshot of that prefix may be restored instead.
+        cached = self.cached_ids
+        live = not self.needs_reset and bool(cached)
+        common = common_prefix(ids, cached) if live else 0
+        if live and common == len(cached) and len(ids) > len(cached):
+            action, reused = 'append', len(cached)
+        else:
+            keep = min(common, len(ids) - 1)
+            if keep > 0 and not (self.prefix_cache and keep < stable):
+                action, reused = 'truncate', keep
+            else:
+                action, reused = 'reset', 0
+        if ids[:reused] != cached[:reused]:
+            raise AdapterError('internal cache prefix mismatch', 500)
         suffix = ids[reused:]
         if not suffix:
             raise AdapterError('request has no new template suffix')
+        # Mark the stable boundary whenever this request will prefill across it.
+        checkpoint_at = [stable] if reused < stable < len(ids) and stable - reused <= NATIVE_CHUNK else []
         return dict(payload=payload, messages=messages, tools=tools, budget=budget,
-                    ids=ids, suffix=suffix, reused=reused, reset=not hit, epoch=self.epoch)
+                    ids=ids, suffix=suffix, reused=reused, reset=action == 'reset',
+                    action=action, truncated_from=len(cached) if action == 'truncate' else None,
+                    stable=stable, checkpoint_at=checkpoint_at, epoch=self.epoch)
 
     def _check_native(self, response, request, before):
+        """Strict accounting, including the rewind/prefix-cache extensions."""
         tokens = response.get('tokens') if isinstance(response, dict) else None
         if (not isinstance(tokens, list) or len(tokens) > request['max_tokens'] or
                 any(type(t) is not int or not 0 <= t < self.vocab_size for t in tokens)):
@@ -230,6 +285,26 @@ class Backend:
                 raise AdapterError('invalid native KV accounting', 502)
         if response['kv_valid_bytes'] > response['kv_allocated_bytes']:
             raise AdapterError('invalid native KV validity', 502)
+        if 'truncate' in request:
+            source, checkpoint = response.get('rewind_source'), response.get('rewind_checkpoint')
+            replayed = response.get('replayed_tokens')
+            if (response.get('truncated_from') != request['truncated_from'] or source not in REWIND_SOURCES or
+                    type(checkpoint) is not int or not 0 <= checkpoint <= request['truncate'] or
+                    type(replayed) is not int or replayed != request['truncate'] - checkpoint or
+                    not finite_seconds(response.get('replay_seconds'))):
+                raise AdapterError('native rewind accounting mismatch', 502)
+        elif any(key in response for key in ('truncated_from', 'rewind_checkpoint', 'replayed_tokens')):
+            raise AdapterError('native reported an unrequested rewind', 502)
+        restored = response.get('restored_prefix_tokens', 0)
+        if type(restored) is not int or not 0 <= restored < len(request['tokens']) or (restored and not request['reset']):
+            raise AdapterError('native prefix restore accounting mismatch', 502)
+        if self.prefix_cache and not all(type(response.get(k)) is int and response[k] >= 0
+                                         for k in ('restored_prefix_tokens', 'snapshots_written', 'snapshot_bytes')):
+            raise AdapterError('native prefix cache accounting missing', 502)
+        if request.get('checkpoint_at'):
+            honored = [p for p in request['checkpoint_at'] if p >= before + restored]
+            if response.get('checkpoints_taken') != len(honored):
+                raise AdapterError('native checkpoint accounting mismatch', 502)
         return tokens
 
     def execute(self, plan):
@@ -244,6 +319,8 @@ class Backend:
             before = plan['reused']
             suffix = plan['suffix']
             response = None
+            rewind = dict(rewind_checkpoint=None, replayed_tokens=0, replay_seconds=0.0, rewind_source=None)
+            restore = dict(restored_prefix_tokens=0, restore_seconds=0.0, snapshots_written=0, snapshot_bytes=0)
             for start in range(0, len(suffix), NATIVE_CHUNK):
                 if plan['epoch'] != self.epoch or self.closed:
                     raise AdapterError('request cancelled', 499)
@@ -253,11 +330,20 @@ class Backend:
                 request = dict(id=self.sequence, tokens=chunk,
                                max_tokens=plan['budget'] if final else 0,
                                reset=plan['reset'] and start == 0, return_logits=False)
+                if start == 0 and plan['action'] == 'truncate':
+                    request['truncate'] = plan['reused']
+                checkpoint_at = [p for p in plan['checkpoint_at'] if before < p <= before + len(chunk)]
+                if checkpoint_at:
+                    request['checkpoint_at'] = checkpoint_at
                 response = self.worker.request(request)
-                generated = self._check_native(response, request, before)
+                generated = self._check_native(dict(response), dict(request, truncated_from=plan['truncated_from']), before)
                 before = response['cache_after']
                 prefill_seconds += response['prefill_seconds']
                 decode_seconds += response['decode_seconds']
+                if 'truncate' in request:
+                    rewind = {key: response[key] for key in rewind}
+                for key in restore:
+                    restore[key] += response.get(key, 0)
             if plan['epoch'] != self.epoch or self.closed:
                 raise AdapterError('request cancelled', 499)
             self.cached_ids = plan['ids'] + generated
@@ -290,8 +376,12 @@ class Backend:
                         choices=[dict(index=0, message=message, finish_reason=parsed['finish_reason'])],
                         usage=dict(prompt_tokens=len(plan['ids']), completion_tokens=len(generated),
                                    total_tokens=len(plan['ids'])+len(generated),
-                                   prompt_tokens_details=dict(cached_tokens=plan['reused'])),
-                        nanoattention=dict(cache_reset=plan['reset'], reused_prefix_tokens=plan['reused'],
+                                   prompt_tokens_details=dict(cached_tokens=plan['reused'] - rewind['replayed_tokens']
+                                                              + restore['restored_prefix_tokens'])),
+                        nanoattention=dict(cache_reset=plan['reset'], cache_action=plan['action'],
+                                           truncated_from=plan['truncated_from'], **rewind, **restore,
+                                           stable_prefix_tokens=plan['stable'], checkpoint_at=plan['checkpoint_at'],
+                                           reused_prefix_tokens=plan['reused'],
                                            new_prefill_tokens=len(suffix), cache_after=response['cache_after'],
                                            prefill_seconds=prefill_seconds, decode_seconds=decode_seconds,
                                            kv_allocated_bytes=response['kv_allocated_bytes'],
@@ -485,6 +575,23 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+def native_command(args):
+    command = [str(args.binary.resolve()), 'session', str(args.checkpoint.resolve()),
+               '--context', str(args.context), '--mlx-attention', '1', '--staged-row-tile', '2']
+    if args.kv_bf16:
+        command += ['--kv-bf16', '1']
+    if args.speculative_tokens:
+        command += ['--speculative-tokens', str(args.speculative_tokens),
+                    '--speculative-query-group', str(args.speculative_query_group),
+                    '--speculative-expert-tile', str(args.speculative_expert_tile),
+                    '--speculative-weight-reuse', str(int(args.speculative_weight_reuse))]
+    if getattr(args, 'prefix_cache', None) is not None:
+        command += ['--prefix-cache', str(args.prefix_cache.resolve())]
+        if getattr(args, 'prefix_cache_bytes', None) is not None:
+            command += ['--prefix-cache-bytes', str(args.prefix_cache_bytes)]
+    return command
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('checkpoint', type=Path)
@@ -499,7 +606,13 @@ def main():
     parser.add_argument('--speculative-query-group', type=int, default=2, choices=(2, 4, 8))
     parser.add_argument('--speculative-expert-tile', type=int, default=0, choices=(0, 1, 2, 4, 8))
     parser.add_argument('--speculative-weight-reuse', action='store_true')
+    parser.add_argument('--prefix-cache', type=Path,
+                        help='opt-in directory of exact on-disk prefix snapshots (native --prefix-cache)')
+    parser.add_argument('--prefix-cache-bytes', type=int, default=None,
+                        help='prefix snapshot size cap (native default 4 GiB)')
     args = parser.parse_args()
+    if args.prefix_cache_bytes is not None and (args.prefix_cache is None or args.prefix_cache_bytes <= 0):
+        parser.error('--prefix-cache-bytes requires --prefix-cache and a positive size')
     if not args.speculative_tokens and (args.speculative_query_group != 2 or args.speculative_expert_tile or args.speculative_weight_reuse):
         parser.error('speculative tuning requires --speculative-tokens')
     config = json.loads((args.checkpoint/'config.json').read_text())
@@ -513,16 +626,8 @@ def main():
     tokenizer.chat_template = (args.checkpoint/'chat_template.jinja').read_text()
     eos = config['eos_token_id']
     eos = eos if isinstance(eos, list) else [eos]
-    command = [str(args.binary.resolve()), 'session', str(args.checkpoint.resolve()),
-               '--context', str(args.context), '--mlx-attention', '1', '--staged-row-tile', '2']
-    if args.kv_bf16:
-        command += ['--kv-bf16', '1']
-    if args.speculative_tokens:
-        command += ['--speculative-tokens', str(args.speculative_tokens),
-                    '--speculative-query-group', str(args.speculative_query_group),
-                    '--speculative-expert-tile', str(args.speculative_expert_tile),
-                    '--speculative-weight-reuse', str(int(args.speculative_weight_reuse))]
-    backend = Backend(tokenizer, command, args.context, eos, config['vocab_size'], args.max_tokens, args.timeout)
+    backend = Backend(tokenizer, native_command(args), args.context, eos, config['vocab_size'],
+                      args.max_tokens, args.timeout, prefix_cache=args.prefix_cache is not None)
     server = AdapterServer(('127.0.0.1', args.port), backend, os.environ.get('NANOATTENTION_API_KEY', 'local'))
     stopped = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):

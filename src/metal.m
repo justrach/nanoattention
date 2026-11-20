@@ -236,6 +236,11 @@ int fm_is_m3_ultra(void *context) {
     return [c->device.name isEqualToString:@"Apple M3 Ultra"];
 }
 
+const char *fm_device_name(void *context) {
+    FMContext *c = context;
+    return c->device.name.UTF8String;
+}
+
 void *fm_open(const char *source) {
     FMContext *c = calloc(1, sizeof(*c));
     if (!c) return NULL;

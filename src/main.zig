@@ -26,6 +26,10 @@ const usage =
     \\  flint session CHECKPOINT --context 32768 --mlx-attention 1 --staged-row-tile 2
     \\session accepts JSONL on stdin with new tokens/max_tokens and retains KV until EOF.
     \\Every generated token, including EOS, is committed to KV before its response.
+    \\Session requests may "truncate": N (rewind to the first N history tokens) and mark
+    \\"checkpoint_at": [P, ...]. Session-only: --rewind-checkpoints N (0..64, default 4),
+    \\--prefix-cache DIR (exact on-disk prefix snapshots; off by default) and
+    \\--prefix-cache-bytes B (size cap, default 4 GiB; least recently used are evicted).
     \\
     \\generate emits a JSON object with greedy-generated token IDs, including EOS.
     \\eval emits one JSON logits array per input token, for numerical verification.
@@ -94,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
     var speculative_expert_tile: u32 = 0;
     var speculative_weight_reuse = false;
     var trace_position: ?u32 = null;
+    var session_options: @import("session.zig").Options = .{};
+    var session_flags = false;
     var tokens: std.ArrayList(u32) = .empty;
     var has_tokens = false;
     while (args.next()) |flag| {
@@ -128,6 +134,18 @@ pub fn main(init: std.process.Init) !void {
             if (speculative_expert_tile != 0 and !@import("resident.zig").certified.validRowTile(speculative_expert_tile)) return error.InvalidStagedRowTile;
         } else if (std.mem.eql(u8, flag, "--speculative-weight-reuse")) {
             speculative_weight_reuse = (try std.fmt.parseInt(u1, value, 10)) != 0;
+        } else if (std.mem.eql(u8, flag, "--prefix-cache")) {
+            if (value.len == 0) return error.InvalidPrefixCacheDirectory;
+            session_options.prefix_cache = value;
+            session_flags = true;
+        } else if (std.mem.eql(u8, flag, "--prefix-cache-bytes")) {
+            session_options.prefix_cache_bytes = try std.fmt.parseInt(u64, value, 10);
+            if (session_options.prefix_cache_bytes == 0) return error.InvalidPrefixCacheBytes;
+            session_flags = true;
+        } else if (std.mem.eql(u8, flag, "--rewind-checkpoints")) {
+            session_options.rewind_checkpoints = try std.fmt.parseInt(u32, value, 10);
+            if (session_options.rewind_checkpoints > @import("session.zig").max_rewind_checkpoints) return error.InvalidRewindCheckpoints;
+            session_flags = true;
         } else if (std.mem.eql(u8, flag, "--trace-position")) {
             trace_position = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--logits-from")) {
@@ -152,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
     if (resident_workers != 0 and (staged_row_tile != 1 or attention_chunk != null)) return error.StagedTuningRequiresStaged;
     if (resident_workers == 0 and resident_row_tile != 1) return error.ResidentTuningRequiresResident;
     if (session_mode and (has_tokens or logits_from != null or trace_position != null)) return error.SessionRequiresJsonlInput;
+    if (session_flags and !session_mode) return error.SessionOptionRequiresSession;
     if (!session_mode and tokens.items.len == 0) return error.EmptyPrompt;
     if (mlx_attention and (resident_workers != 0 or attention_chunk != null)) return error.ConflictingAttentionMode;
     if (kv_bf16 and !mlx_attention) return error.Bf16KvRequiresMatchedStaged;
@@ -185,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
     // Validate the complete prompt before mutating the KV cache.
     for (tokens.items) |token| if (token >= model.cfg.vocab_size) return error.InvalidToken;
     std.debug.print("Mapped {d} checkpoint bytes in {d} shard(s); context={d}.\n", .{ model.store.bytes, model.store.shards.items.len, context });
-    if (session_mode) return @import("session.zig").run(&model, init.gpa);
+    if (session_mode) return @import("session.zig").run(&model, init.gpa, session_options);
     var logits: []const f32 = &.{};
     if (!evaluate) logits = try model.prefill(tokens.items);
     if (evaluate) for (tokens.items, 0..) |token, position| {
@@ -241,6 +260,8 @@ test {
     _ = @import("tiling_tests.zig");
     _ = @import("model.zig");
     _ = @import("session.zig");
+    _ = @import("prefix_cache.zig");
+    _ = @import("rewind.zig");
     _ = @import("attention_parallel_tests.zig");
     _ = @import("attention_split_tests.zig");
     _ = @import("attention_mlx_tests.zig");

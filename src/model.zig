@@ -609,7 +609,7 @@ pub const Model = struct {
         };
         self.resident_execution = .{ .descriptor = descriptor, .layers = layer_buffer, .program = program, .control = try self.alloc(@sizeOf(resident.Control) / 4), .workers = workers };
     }
-    fn splitAttentionSupported(self: *const Model) bool {
+    pub fn splitAttentionSupported(self: *const Model) bool {
         return self.context <= resident.certified.attention_max_context and
             self.cfg.num_attention_heads <= resident.certified.attention_max_heads and
             self.cfg.num_key_value_heads <= resident.certified.attention_max_heads and
@@ -683,6 +683,16 @@ pub const Model = struct {
         }
         self.position += 1;
         return self.scratch.logits.floats();
+    }
+    /// Rewind/restore support. The caller has already restored every state the
+    /// position does not hide (sliding rings, or a whole disk snapshot); entries
+    /// at or above `position` are rewritten before they are read again.
+    pub fn restorePosition(self: *Model, position: u32) !void {
+        if (self.failed) return error.ModelNeedsReset;
+        if (self.batch) |b| if (b.count != 0) return error.BatchPendingCommit;
+        if (position > self.context) return error.ContextExhausted;
+        try self.ctx.finish();
+        self.position = position;
     }
     pub fn reset(self: *Model) !void {
         try self.ctx.finish();

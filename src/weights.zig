@@ -79,7 +79,9 @@ fn floating(w: Weight) bool {
     return w.tensor.dtype == .f32 or w.tensor.dtype == .f16 or w.tensor.dtype == .bf16;
 }
 
-const Shard = struct {
+pub const Shard = struct {
+    /// File name within the checkpoint directory; part of prefix-snapshot identity.
+    name: []const u8,
     mapping: metal.Mapping,
     buffer: metal.Buffer,
     header: st.Header,
@@ -145,14 +147,19 @@ pub const Store = struct {
         errdefer header.deinit();
         const buffer = try ctx.wrap(mapping);
         errdefer buffer.deinit();
-        try self.shards.append(self.allocator, .{ .mapping = mapping, .header = header, .buffer = buffer });
+        const owned = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned);
+        try self.shards.append(self.allocator, .{ .name = owned, .mapping = mapping, .header = header, .buffer = buffer });
         self.bytes += mapping.bytes.len;
     }
     pub fn resident(self: *const Store, ctx: metal.Context) !void {
         for (self.shards.items) |shard| try ctx.resident(shard.buffer);
     }
     pub fn deinit(self: *Store) void {
-        for (self.shards.items) |*shard| shard.deinit();
+        for (self.shards.items) |*shard| {
+            shard.deinit();
+            self.allocator.free(shard.name);
+        }
         self.shards.deinit(self.allocator);
     }
     pub fn find(self: *const Store, name: []const u8) !?Weight {

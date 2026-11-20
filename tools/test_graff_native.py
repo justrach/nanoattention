@@ -165,6 +165,19 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(self.router.exists())
         self.assertTrue(server.terminated)
 
+    def test_opt_in_prefix_cache_reaches_only_owned_adapter(self):
+        self.args.prefix_cache = self.workspace / 'prefix-cache'
+        self.args.prefix_cache_bytes = 1 << 30
+        server, agent = FakeProcess(ready()), FakeProcess()
+        with patch.object(launcher.subprocess, 'Popen', side_effect=[server, agent]) as spawn:
+            self.assertEqual(launcher.run(self.args), 0)
+        adapter = spawn.call_args_list[0].args[0]
+        self.assertEqual(adapter[adapter.index('--prefix-cache') + 1], str(self.args.prefix_cache))
+        self.assertEqual(adapter[adapter.index('--prefix-cache-bytes') + 1], str(1 << 30))
+        for flag in ('--prefix-cache', '--prefix-cache-bytes'):
+            self.assertNotIn(flag, spawn.call_args_list[1].args[0])
+        self.assertTrue(server.terminated)
+
     def test_opt_in_speculation_reaches_only_owned_adapter(self):
         self.args.speculative_tokens = 4
         self.args.speculative_query_group = 4

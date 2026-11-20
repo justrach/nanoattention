@@ -170,6 +170,9 @@ def parse_args(argv=None):
     parser.add_argument('--speculative-query-group', type=int, default=2, choices=(2, 4, 8))
     parser.add_argument('--speculative-expert-tile', type=int, default=0, choices=(0, 1, 2, 4, 8))
     parser.add_argument('--speculative-weight-reuse', action='store_true')
+    parser.add_argument('--prefix-cache', type=Path,
+                        help='opt-in directory of exact on-disk prefix snapshots, passed to the adapter')
+    parser.add_argument('--prefix-cache-bytes', type=int, help='prefix snapshot size cap (default 4 GiB)')
     parser.add_argument('--timeout', type=float, default=1200,
                         help='native request and Graff session time budget in seconds')
     args = parser.parse_args(argv[:split])
@@ -178,6 +181,10 @@ def parse_args(argv=None):
         parser.error('speculative tuning requires --speculative-tokens')
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be finite and positive')
+    if args.prefix_cache_bytes is not None and (args.prefix_cache is None or args.prefix_cache_bytes <= 0):
+        parser.error('--prefix-cache-bytes requires --prefix-cache and a positive size')
+    if args.prefix_cache is not None:
+        args.prefix_cache = args.prefix_cache.resolve()
     if not 0 < args.max_tokens < args.context:
         parser.error('require 0 < --max-tokens < --context')
     if any(value == '--model' or value.startswith('--model=')
@@ -226,7 +233,10 @@ def run(args):
                 '--speculative-query-group', str(getattr(args, 'speculative_query_group', 2)),
                 '--speculative-expert-tile', str(getattr(args, 'speculative_expert_tile', 0))]
                 if getattr(args, 'speculative_tokens', 0) else []) +
-                (['--speculative-weight-reuse'] if getattr(args, 'speculative_weight_reuse', False) else []), env=env, stdout=subprocess.PIPE,
+                (['--speculative-weight-reuse'] if getattr(args, 'speculative_weight_reuse', False) else []) +
+                (['--prefix-cache', str(args.prefix_cache)] if getattr(args, 'prefix_cache', None) is not None else []) +
+                (['--prefix-cache-bytes', str(args.prefix_cache_bytes)] if getattr(args, 'prefix_cache_bytes', None) is not None else []),
+            env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, start_new_session=False)
         port = receive_ready(server, min(90, args.timeout), args.context)
         if built_in:

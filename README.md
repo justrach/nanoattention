@@ -25,6 +25,8 @@ zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zi
 
 # Requires NumPy; creates disposable tiny checkpoints.
 python3 tools/verify.py zig-out/bin/flint --staged-row-tile 2
+python3 tools/check_sessions.py
+python3 tools/check_prefix_cache.py
 ```
 
 Native builds automatically build the Lean proofs and reject generated Zig/Metal binding drift. All GPU verification is headless: no windows, activation, or desktop input.
@@ -56,7 +58,8 @@ For direct text input, the optional adapter applies that template and decodes ID
 `tools/codegraff_adapter.py` exposes loopback OpenAI chat/function-tool endpoints
 backed by one persistent native `flint session`. It uses the checkpoint's own
 local tokenizer/template, preserves exact native KV prefixes across compatible
-tool turns, and explicitly reports resets when history changes. All inference
+tool turns, rewinds to the exact common token prefix when earlier history
+changes, and reports every append, rewind, reset and disk restore. All inference
 remains Zig/Metal; Python is only the transport/tokenizer/protocol bridge.
 See [Codegraff setup and verification](docs/CODEGRAFF.md) and the
 [project-router example](examples/codegraff-router.json). SSE is buffered, not
@@ -176,8 +179,8 @@ Every sampled token—including final EOS or the last length-limited token—is
 forwarded into KV before returning. Context capacity reserves that final commit.
 A requested `reset` is explicit and validated before mutation. Full-attention
 layers retain the sequence; sliding layers keep their bounded 513-token ring.
-KV remains FP32, not quantized. Editing earlier history requires an explicit
-reset; this is append-only session reuse, not a cross-conversation prefix trie.
+KV remains FP32, not quantized. Editing earlier history needs an explicit
+`truncate` (below) or `reset`; without them the session is append-only.
 
 Staged generation, sessions, and benchmarks compute the terminal normalization
 and vocabulary projection only for the **last new prefix token**. Every prefix
@@ -187,6 +190,107 @@ Decode still computes full logits for each forwarded token. Diagnostic `eval`
 continues to compute every supplied token's logits; resident execution retains
 its original certified full-forward plan. This is not batched prefill. See the
 [controlled prefill optimization measurements](benchmarks/prefill-elision.md).
+
+### Rewind and the persistent prefix cache
+
+Both are opt-in and exact: the state after a rewind or restore is bit-identical
+to a fresh sequential run of the same tokens. Without the new flags and fields,
+session output is unchanged. The differences from the session protocol
+specification they implement are listed below.
+
+- `"truncate": N` rolls the cache back to its first `N` history tokens before
+  the request's own tokens (not with `reset`; `N` at most the cached length).
+  Full-attention KV needs no copy: lowering the position hides later entries.
+  The 513-slot sliding rings do, so the session keeps in-memory checkpoints of
+  the rings (73.5 MB each for Flint) at the end of every request's prefill and
+  decode and at every `checkpoint_at` position; `--rewind-checkpoints N` (0–64,
+  default 4) bounds them. A rewind restores the newest checkpoint at `c <= N`
+  and replays recorded history `c..N` through the normal prefill path.
+- `"checkpoint_at": [P, ...]` marks absolute positions inside the request's
+  own prefill span (strictly increasing). Prefill runs in segments ending at
+  each position; the extra work is one output head per segment.
+- `--prefix-cache DIR` writes a disk snapshot at each `checkpoint_at` position:
+  the token IDs and only the valid KV (positions `0..P` of full layers, the
+  valid ring slots, physical order). On `reset: true` the session restores the
+  longest snapshot whose stored token IDs equal a prefix of the request, then
+  prefills the rest. `--prefix-cache-bytes B` caps the directory (default
+  4 GiB); least recently used files (by mtime, refreshed on use) are evicted
+  first and a snapshot larger than the cap is not written.
+- A snapshot is used only if its format version, checkpoint identity (SHA-256
+  of `config.json` plus every shard's name, size, safetensors header and 32
+  evenly spaced 4 KiB pages; the 22 GB of weights are not hashed, so an edit
+  that misses every sampled page is not detected), and settings key match.
+  The settings key covers the Metal device name, a SHA-256 of the running
+  `flint` executable (any rebuild invalidates old snapshots), and every engine
+  setting that selects kernels or storage (attention mode, KV dtype, row tiles,
+  attention chunking and split-attention eligibility, resident mode,
+  speculation and the other tuning fields). The configured context is not part
+  of the key: full-attention layout does not depend on it, it changes kernel
+  choice only through split-attention eligibility (in the key), and ring
+  capacity is checked per layer. Writes go to a hidden temporary file renamed
+  into place. Truncated files fail a size check before any KV is touched; other corruption
+  fails an XXH3 checksum over tokens, layout and state. Files that fail for the
+  current key are removed; files for other checkpoints, settings or versions are
+  left alone. Temporary files left by a writer that no longer exists are removed
+  when a session opens the directory.
+
+Measured on the real checkpoint with a 2,682-token chat-templated system prompt
+and tool list ([details](benchmarks/prefix-cache.md)): its snapshot is 227 MB
+and restores in 0.22 s, replacing about 23 s of prefill; a new process answered
+its first request in 3.3 s instead of 24.7 s (about 2.4 s of the 3.3 s is any new
+process's first-forward warmup). Within one session, `truncate` back to the
+prefix and a different 37-token user turn prefilled in 0.29 s. Every compared
+row's all-vocabulary logits and greedy tokens were bit-identical to a fresh run.
+
+New response fields appear only when used (no new flag or field gives the
+same output as before): `truncated_from`, `rewind_checkpoint`, `replayed_tokens`,
+`replay_seconds`, `rewind_source` (`none`, `ring_intact`, `memory`, `disk` or
+`start`) after a `truncate`; `restored_prefix_tokens`, `restore_seconds`,
+`snapshots_written`, `snapshot_bytes`, `snapshot_seconds`, `snapshot_failures`
+with `--prefix-cache`; `checkpoints_taken` with `checkpoint_at`; and
+`checkpoint_seconds` (ring copies) with any of them. `prefill_seconds` counts
+only prefill compute, not restores, replays, ring copies or snapshot writes.
+
+Differences from `PROTOCOL.md`, each the closest correct behaviour:
+
+- A disk restore always leaves at least one request token to prefill, because
+  snapshots do not store logits. A snapshot equal to the whole request is not
+  used; `tokens` stays nonempty, so to rewind without new input send
+  `truncate: N-1` with the `N`th token.
+- `prefill_tokens` keeps its meaning (the request's tokens appended to the
+  cache); `prefill_tokens - restored_prefix_tokens` of them were computed.
+- A rewind needs no checkpoint while no ring slot has been reused (`ring_intact`:
+  the cached length is at most the ring capacity), and it may restore a disk
+  snapshot of `history[0..c]` when that is longer than the best in-memory
+  checkpoint (`disk`). A disk restore is also kept as an in-memory checkpoint.
+- Checkpoints from `checkpoint_at` and disk restores are evicted only after
+  every automatic checkpoint, so the system-prompt boundary survives many turns.
+  `checkpoint_at` positions inside a restored prefix are skipped (the restore
+  point itself counts); `checkpoints_taken` reports how many were honoured.
+- A failed snapshot write is reported on stderr and in `snapshot_failures`,
+  not fatal: the live cache is unaffected. A failed lookup (for example a
+  removed directory) is also reported and not fatal: a reset then prefills
+  everything, and a rewind replays from position 0, since the lookup may have
+  written into the cache. Files are not `fsync`ed; the checksum detects a torn
+  file after a crash.
+- In-memory checkpoints are host copies of the rings, taken even when no
+  `truncate` ever follows (the client cannot know in advance): one ring copy
+  per checkpoint, up to `--rewind-checkpoints` × 73.5 MB of host memory for
+  Flint. Their time is outside `prefill_seconds` and `decode_seconds`.
+
+`tools/check_prefix_cache.py` checks rewind and the disk cache on tiny F32 and
+INT4 checkpoints: every rewound or restored row's prefill and final logits are
+bit-identical to a fresh native `eval`, close to the independent NumPy model,
+and its greedy tokens match NumPy. It covers truncation to a checkpoint, between
+checkpoints, after ring wrap, to 0, before any ring reuse and without
+checkpoints; restore into a new process, restore then continue then truncate,
+a snapshot written after a truncate and restored as the longest match,
+truncation served from disk, a different context, and rejection of snapshots
+from a different checkpoint, changed config, changed weight bytes with the same
+sizes, or different settings, plus corrupt, truncated and oversized files and a
+cache directory removed under a live session. With `--baseline BINARY` (built
+from the base commit) it also requires plain session responses to be
+byte-identical to that binary's, timing fields aside.
 
 `tools/check_sessions.py` checks real persistent tiny checkpoints against both an
 independent NumPy implementation and fresh native replay, including ring wrap,
@@ -228,7 +332,7 @@ See [proof documentation](proofs/README.md). Certificates cover execution-plan o
 
 ## Current limits
 
-No batched prefill, lazy tensor graph, autograd/training, batching, speculative decoding, native tokenizer/template renderer, HTTP server, tool-call parser, or multi-device execution. Generation currently implements greedy selection, not Flint's recommended stochastic sampling. mmap avoids an extra full weight copy but does not guarantee enough physical memory or device buffer capacity. Strict numerical checks cover the tested 4K/8K prefixes and the recorded multi-turn coding stream through 28,623 cached tokens against sequential FP32 MLX. The coding check compares every greedy choice and six all-vocabulary boundary rows, not every logit at every position. The separate 32K timing fixture has no additional full-model all-logit validation claim. Batched-reference equivalence, contexts beyond the measured range and broad task-quality parity remain unverified.
+No batched prefill, lazy tensor graph, autograd/training, batching, speculative decoding, native tokenizer/template renderer, HTTP server, tool-call parser, or multi-device execution. Generation currently implements greedy selection, not Flint's recommended stochastic sampling. mmap avoids an extra full weight copy but does not guarantee enough physical memory or device buffer capacity. Strict numerical checks cover the tested 4K/8K prefixes and the recorded multi-turn coding stream through 28,623 cached tokens against sequential FP32 MLX. The coding check compares every greedy choice and six all-vocabulary boundary rows, not every logit at every position. The separate 32K timing fixture has no additional full-model all-logit validation claim. Batched-reference equivalence, contexts beyond the measured range and broad task-quality parity remain unverified. The session prefix cache is a local directory for one engine at a time: concurrent processes sharing a directory are safe only to the extent of atomic renames and checksums, eviction is not coordinated between them, and snapshots never carry across machines or rebuilds.
 
 ## License and attribution
 

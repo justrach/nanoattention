@@ -1,8 +1,13 @@
-//! Persistent, append-only JSONL inference. The caller owns the one loaded Model.
-//! No sockets, prompt replay, implicit resets, or GPU work in the CPU-only tests.
+//! Persistent JSONL inference. The caller owns the one loaded Model.
+//! History is append-only unless a request asks for an explicit `reset` or a
+//! `truncate` rewind; opt-in `--prefix-cache` restores exact on-disk prefixes.
+//! No sockets, implicit resets, or GPU work in the CPU-only tests.
 const std = @import("std");
 const Model = @import("model.zig").Model;
+const prefix_cache = @import("prefix_cache.zig");
+const rewind = @import("rewind.zig");
 const Allocator = std.mem.Allocator;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 extern "c" fn read(c_int, [*]u8, usize) isize;
 extern "c" fn write(c_int, [*]const u8, usize) isize;
@@ -10,6 +15,14 @@ const Timespec = extern struct { sec: i64, nsec: i64 };
 extern "c" fn clock_gettime(c_int, *Timespec) c_int;
 
 pub const max_line_bytes = 1024 * 1024;
+pub const max_checkpoint_at = 64;
+pub const max_rewind_checkpoints = 64;
+
+pub const Options = struct {
+    prefix_cache: ?[]const u8 = null,
+    prefix_cache_bytes: u64 = prefix_cache.default_cap_bytes,
+    rewind_checkpoints: u32 = rewind.default_limit,
+};
 
 pub const Request = struct {
     id: u32 = 0,
@@ -17,6 +30,10 @@ pub const Request = struct {
     max_tokens: u32 = 128,
     reset: bool = false,
     return_logits: bool = false,
+    /// Roll the cache back to its first N history tokens before this request.
+    truncate: ?u32 = null,
+    /// Absolute cached-token positions inside this request's prefill span.
+    checkpoint_at: []const u32 = &.{},
 };
 
 pub const Response = struct {
@@ -39,6 +56,35 @@ pub const Response = struct {
     prefill_logits: ?[]const f32,
     final_logits: ?[]const f32,
 };
+
+/// Fields appended only when a request or flag uses rewind or the prefix cache,
+/// so responses without them stay byte-identical to the append-only protocol.
+pub const Extra = struct {
+    truncated_from: ?u32 = null,
+    rewind_checkpoint: ?u32 = null,
+    replayed_tokens: ?u32 = null,
+    replay_seconds: ?f64 = null,
+    /// "none" (no-op), "ring_intact", "memory", "disk" or "start".
+    rewind_source: ?[]const u8 = null,
+    restored_prefix_tokens: ?u32 = null,
+    restore_seconds: ?f64 = null,
+    snapshots_written: ?u32 = null,
+    snapshot_bytes: ?u64 = null,
+    snapshot_seconds: ?f64 = null,
+    snapshot_failures: ?u32 = null,
+    checkpoints_taken: ?u32 = null,
+    checkpoint_seconds: ?f64 = null,
+};
+
+/// Splice extra fields into a complete JSON object. Both inputs are complete
+/// serializations; "{}" (no extras) returns the base unchanged.
+pub fn merge(a: Allocator, base: []const u8, extra: []const u8) ![]const u8 {
+    if (base.len < 2 or base[0] != '{' or base[base.len - 1] != '}' or extra.len < 2 or extra[0] != '{' or extra[extra.len - 1] != '}')
+        return error.InvalidResponseJson;
+    if (extra.len == 2) return base;
+    if (base.len == 2) return extra;
+    return std.mem.concat(a, u8, &.{ base[0 .. base.len - 1], ",", extra[1..] });
+}
 
 /// Bounded framing, independent of file descriptors. A returned slice remains
 /// valid until the next push. Newline is not counted in the 1 MiB limit; a CR
@@ -101,7 +147,8 @@ pub fn parse(a: Allocator, line: []const u8) !Request {
         const name = field.key_ptr.*;
         if (!std.mem.eql(u8, name, "id") and !std.mem.eql(u8, name, "tokens") and
             !std.mem.eql(u8, name, "max_tokens") and !std.mem.eql(u8, name, "reset") and
-            !std.mem.eql(u8, name, "return_logits")) return error.UnknownRequestField;
+            !std.mem.eql(u8, name, "return_logits") and !std.mem.eql(u8, name, "truncate") and
+            !std.mem.eql(u8, name, "checkpoint_at")) return error.UnknownRequestField;
     }
     const token_value = object.get("tokens") orelse return error.MissingTokens;
     const items = switch (token_value) {
@@ -111,12 +158,24 @@ pub fn parse(a: Allocator, line: []const u8) !Request {
     if (items.len == 0) return error.EmptyPrompt;
     const tokens = try a.alloc(u32, items.len);
     for (items, tokens) |item, *token| token.* = try jsonU32(item);
+    var checkpoint_at: []u32 = &.{};
+    if (object.get("checkpoint_at")) |field| {
+        const positions = switch (field) {
+            .array => |array| array.items,
+            else => return error.InvalidCheckpointPositions,
+        };
+        if (positions.len > max_checkpoint_at) return error.TooManyCheckpointPositions;
+        checkpoint_at = try a.alloc(u32, positions.len);
+        for (positions, checkpoint_at) |item, *position| position.* = try jsonU32(item);
+    }
     return .{
         .id = if (object.get("id")) |v| try jsonU32(v) else 0,
         .tokens = tokens,
         .max_tokens = if (object.get("max_tokens")) |v| try jsonU32(v) else 128,
         .reset = if (object.get("reset")) |v| try jsonBool(v) else false,
         .return_logits = if (object.get("return_logits")) |v| try jsonBool(v) else false,
+        .truncate = if (object.get("truncate")) |v| try jsonU32(v) else null,
+        .checkpoint_at = checkpoint_at,
     };
 }
 
@@ -124,16 +183,27 @@ pub const Preflight = struct { cache_before: u32, required: u64 };
 
 /// Reserve a forward for EVERY generated token, including EOS and the final
 /// max_tokens token. Using u64 prevents the u32 context arithmetic wrapping.
-/// A reset changes only the effective position here, never the actual model.
+/// A reset or truncate changes only the effective position here, never the
+/// actual model. checkpoint_at positions must strictly increase inside
+/// (cache_before, cache_before + tokens.len].
 pub fn validate(request: Request, position: u32, context: u32, vocab_size: u32) !Preflight {
     if (request.tokens.len == 0) return error.EmptyPrompt;
     if (context == 0) return error.InvalidContextLength;
     if (vocab_size == 0) return error.InvalidVocabulary;
     for (request.tokens) |token| if (token >= vocab_size) return error.InvalidToken;
-    const before = if (request.reset) @as(u32, 0) else position;
+    if (request.truncate) |n| {
+        if (request.reset) return error.TruncateWithReset;
+        if (n > position) return error.InvalidTruncate;
+    }
+    const before = if (request.reset) @as(u32, 0) else request.truncate orelse position;
     const with_prompt = std.math.add(u64, before, @intCast(request.tokens.len)) catch return error.ContextExhausted;
     const required = std.math.add(u64, with_prompt, request.max_tokens) catch return error.ContextExhausted;
     if (required > context) return error.ContextExhausted;
+    var previous: u64 = before;
+    for (request.checkpoint_at) |p| {
+        if (p <= previous or p > with_prompt) return error.InvalidCheckpointPosition;
+        previous = p;
+    }
     return .{ .cache_before = before, .required = required };
 }
 
@@ -192,97 +262,359 @@ fn output(bytes: []const u8) !void {
     }
 }
 
-fn handle(model: *Model, gpa: Allocator, history: *std.ArrayList(u32), line: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const request = try parse(a, line);
-    const preflight = try validate(request, model.position, model.context, model.cfg.vocab_size);
-    if (model.failed and !request.reset) return error.ModelNeedsReset;
-    // Validate geometry and worst-case accounting before reset or any forward.
-    _ = try kvBytes(model, @intCast(preflight.required));
-    const generated = try a.alloc(u32, request.max_tokens);
-    const prefill_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, model.cfg.vocab_size) else null;
-    const final_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, model.cfg.vocab_size) else null;
-    // Also detect a failed clock before mutating the model.
-    _ = try now();
-    try history.ensureUnusedCapacity(gpa, request.tokens.len + request.max_tokens + 1);
-    if (request.reset) {
-        try model.reset();
-        history.clearRetainingCapacity();
+const Session = struct {
+    model: *Model,
+    gpa: Allocator,
+    history: std.ArrayList(u32) = .empty,
+    layers: []prefix_cache.Layer,
+    checkpoints: rewind.Checkpoints,
+    cache: ?prefix_cache.Cache = null,
+
+    /// In-memory checkpoint at the current position. The device must be idle.
+    fn checkpoint(self: *Session, pinned: bool, extra: *Extra) !void {
+        try self.model.ctx.finish();
+        const start = try now();
+        try self.checkpoints.take(self.layers, self.model.position, pinned);
+        if (extra.checkpoint_seconds) |*seconds| seconds.* += try elapsed(start, try now());
     }
-    history.appendSliceAssumeCapacity(request.tokens);
 
-    const prefill_start = try now();
-    var logits = try model.prefill(request.tokens);
-    try finiteLogits(logits, model.cfg.vocab_size);
-    const prefill_seconds = try elapsed(prefill_start, try now());
-    if (prefill_copy) |copy| @memcpy(copy, logits);
+    /// Disk snapshot of the current position. A failed write is reported, not
+    /// fatal: the in-memory state is unchanged and stays exact.
+    fn snapshot(self: *Session, extra: *Extra) !void {
+        const cache = if (self.cache) |*c| c else return;
+        try self.model.ctx.finish();
+        const start = try now();
+        const position = self.model.position;
+        const written = cache.write(self.history.items[0..position], self.layers) catch |err| {
+            std.debug.print("Prefix snapshot at {d} not written: {s}\n", .{ position, @errorName(err) });
+            extra.snapshot_failures.? += 1;
+            extra.snapshot_seconds.? += try elapsed(start, try now());
+            return;
+        };
+        switch (written.outcome) {
+            .written => {
+                extra.snapshots_written.? += 1;
+                extra.snapshot_bytes.? += written.bytes;
+            },
+            .existing => {},
+            .too_large => std.debug.print("Prefix snapshot at {d} exceeds --prefix-cache-bytes; not written\n", .{position}),
+        }
+        extra.snapshot_seconds.? += try elapsed(start, try now());
+    }
 
-    const decode_start = try now();
-    const result = try @import("speculative_generation.zig").generate(model, gpa, history, generated, logits);
-    const count = result.count;
-    const eos = result.eos;
-    logits = result.logits;
-    try finiteLogits(logits, model.cfg.vocab_size);
-    const decode_seconds = try elapsed(decode_start, try now());
-    if (final_copy) |copy| @memcpy(copy, logits);
-    const expected: u64 = @as(u64, preflight.cache_before) + request.tokens.len + count;
-    if (model.position != expected) return error.CachePositionMismatch;
-    const bytes = try kvBytes(model, model.position);
-    const response: Response = .{
-        .id = request.id,
-        .tokens = generated[0..count],
-        .eos = eos,
-        .cache_before = preflight.cache_before,
-        .cache_after = model.position,
-        .prefill_tokens = request.tokens.len,
-        .decode_forward_tokens = count,
-        .reused_prefix_tokens = preflight.cache_before,
-        .prefill_seconds = prefill_seconds,
-        .decode_seconds = decode_seconds,
-        .kv_allocated_bytes = bytes.allocated,
-        .kv_valid_bytes = bytes.valid,
-        .kv_storage = if (model.kv_bf16) "bf16_global_fp32_sliding" else "fp32",
-        .speculative_batches = result.batches,
-        .speculative_proposed = result.proposed,
-        .speculative_accepted = result.accepted,
-        .prefill_logits = prefill_copy,
-        .final_logits = final_copy,
+    /// Serve `truncate: n`: newest of (intact rings, memory checkpoint, disk
+    /// snapshot of history[0..c]) at c <= n, then replay recorded history c..n.
+    fn rewindTo(self: *Session, n: u32, extra: *Extra) !void {
+        const model = self.model;
+        const from = model.position;
+        if (self.history.items.len != from) return error.HistoryPositionMismatch;
+        try model.ctx.finish();
+        var c: u32 = n;
+        var source: []const u8 = "none";
+        if (n != from and rewind.ringsIntact(self.layers, from, n)) {
+            source = "ring_intact";
+        } else if (n != from) {
+            c = 0;
+            source = "start";
+            var memory = self.checkpoints.best(n);
+            var disk = false;
+            if (self.cache) |*cache| {
+                const start = try now();
+                // A failed lookup may have written into the layers: assume it did.
+                const result = cache.restoreLongest(self.history.items[0..n], if (memory) |m| m.position else 0, n, self.layers) catch |err| failed: {
+                    std.debug.print("Prefix cache lookup failed: {s}\n", .{@errorName(err)});
+                    break :failed prefix_cache.Restored{ .clobbered = true };
+                };
+                extra.restore_seconds = try elapsed(start, try now());
+                if (result.position != 0) {
+                    c = result.position;
+                    source = "disk";
+                    disk = true;
+                }
+                // A failed load overwrote cached KV: only a replay from 0 is exact.
+                if (result.clobbered and !disk) {
+                    self.checkpoints.clear();
+                    memory = null;
+                }
+            }
+            if (!disk) if (memory) |m| {
+                const start = try now();
+                rewind.Checkpoints.restore(m, self.layers);
+                if (extra.checkpoint_seconds) |*seconds| seconds.* += try elapsed(start, try now());
+                c = m.position;
+                source = "memory";
+            };
+        }
+        self.checkpoints.dropAbove(n);
+        try model.restorePosition(c);
+        var replay_seconds: f64 = 0;
+        if (n > c) {
+            const start = try now();
+            _ = try model.prefill(self.history.items[c..n]);
+            replay_seconds = try elapsed(start, try now());
+        }
+        if (model.position != n) return error.CachePositionMismatch;
+        self.history.shrinkRetainingCapacity(n);
+        extra.truncated_from = from;
+        extra.rewind_checkpoint = c;
+        extra.replayed_tokens = n - c;
+        extra.replay_seconds = replay_seconds;
+        extra.rewind_source = source;
+    }
+
+    fn handle(self: *Session, line: []const u8) !void {
+        const model = self.model;
+        const gpa = self.gpa;
+        const history = &self.history;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = try parse(a, line);
+        const preflight = try validate(request, model.position, model.context, model.cfg.vocab_size);
+        if (model.failed and !request.reset) return error.ModelNeedsReset;
+        // Validate geometry and worst-case accounting before reset or any forward.
+        _ = try kvBytes(model, @intCast(preflight.required));
+        const generated = try a.alloc(u32, request.max_tokens);
+        const prefill_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, model.cfg.vocab_size) else null;
+        const final_copy: ?[]f32 = if (request.return_logits) try a.alloc(f32, model.cfg.vocab_size) else null;
+        // Also detect a failed clock before mutating the model.
+        _ = try now();
+        try history.ensureUnusedCapacity(gpa, request.tokens.len + request.max_tokens + 1);
+        var extra: Extra = .{};
+        if (self.cache != null) extra = .{ .restored_prefix_tokens = 0, .restore_seconds = 0, .snapshots_written = 0, .snapshot_bytes = 0, .snapshot_seconds = 0, .snapshot_failures = 0 };
+        if (self.cache != null or request.truncate != null or request.checkpoint_at.len != 0) extra.checkpoint_seconds = 0;
+        if (request.checkpoint_at.len != 0) extra.checkpoints_taken = 0;
+        var restored: u32 = 0;
+        if (request.reset) {
+            try model.reset();
+            history.clearRetainingCapacity();
+            self.checkpoints.clear();
+            if (self.cache) |*cache| {
+                // Leave at least one token to prefill: it produces the logits.
+                const start = try now();
+                // A failed lookup leaves position 0: prefilling everything is exact.
+                const result = cache.restoreLongest(request.tokens, 0, @intCast(request.tokens.len - 1), self.layers) catch |err| failed: {
+                    std.debug.print("Prefix cache lookup failed: {s}\n", .{@errorName(err)});
+                    break :failed prefix_cache.Restored{};
+                };
+                if (result.position != 0) {
+                    try model.restorePosition(result.position);
+                    restored = result.position;
+                    history.appendSliceAssumeCapacity(request.tokens[0..restored]);
+                }
+                extra.restore_seconds = try elapsed(start, try now());
+                extra.restored_prefix_tokens = restored;
+                if (restored != 0) try self.checkpoint(true, &extra);
+            }
+        } else if (request.truncate) |n| try self.rewindTo(n, &extra);
+        const before = preflight.cache_before;
+        if (model.position != before + restored or history.items.len != model.position) return error.CachePositionMismatch;
+        history.appendSliceAssumeCapacity(request.tokens[restored..]);
+
+        // Prefill in segments ending at each checkpoint_at position. Positions
+        // inside a restored snapshot are already on disk; the restore point
+        // itself is an in-memory checkpoint above.
+        var prefill_seconds: f64 = 0;
+        var logits: []const f32 = &.{};
+        var start: usize = restored;
+        for (request.checkpoint_at) |p| {
+            const end = p - before;
+            if (end < restored) continue;
+            if (end > start) {
+                const segment = try now();
+                logits = try model.prefill(request.tokens[start..end]);
+                prefill_seconds += try elapsed(segment, try now());
+                start = end;
+            }
+            try self.checkpoint(true, &extra);
+            if (end > restored) try self.snapshot(&extra);
+            extra.checkpoints_taken.? += 1;
+        }
+        if (start < request.tokens.len) {
+            const segment = try now();
+            logits = try model.prefill(request.tokens[start..]);
+            prefill_seconds += try elapsed(segment, try now());
+        }
+        try finiteLogits(logits, model.cfg.vocab_size);
+        if (prefill_copy) |copy| @memcpy(copy, logits);
+        try self.checkpoint(false, &extra);
+
+        const decode_start = try now();
+        const result = try @import("speculative_generation.zig").generate(model, gpa, history, generated, logits);
+        const count = result.count;
+        const eos = result.eos;
+        logits = result.logits;
+        try finiteLogits(logits, model.cfg.vocab_size);
+        const decode_seconds = try elapsed(decode_start, try now());
+        if (final_copy) |copy| @memcpy(copy, logits);
+        const expected: u64 = @as(u64, preflight.cache_before) + request.tokens.len + count;
+        if (model.position != expected) return error.CachePositionMismatch;
+        if (count != 0) try self.checkpoint(false, &extra);
+        const bytes = try kvBytes(model, model.position);
+        const response: Response = .{
+            .id = request.id,
+            .tokens = generated[0..count],
+            .eos = eos,
+            .cache_before = preflight.cache_before,
+            .cache_after = model.position,
+            .prefill_tokens = request.tokens.len,
+            .decode_forward_tokens = count,
+            .reused_prefix_tokens = preflight.cache_before,
+            .prefill_seconds = prefill_seconds,
+            .decode_seconds = decode_seconds,
+            .kv_allocated_bytes = bytes.allocated,
+            .kv_valid_bytes = bytes.valid,
+            .kv_storage = if (model.kv_bf16) "bf16_global_fp32_sliding" else "fp32",
+            .speculative_batches = result.batches,
+            .speculative_proposed = result.proposed,
+            .speculative_accepted = result.accepted,
+            .prefill_logits = prefill_copy,
+            .final_logits = final_copy,
+        };
+        // Serialize completely before writing: failures never emit fake success or
+        // a partially serialized response. Transport failures still propagate.
+        const json = try merge(a, try std.json.Stringify.valueAlloc(a, response, .{}), try std.json.Stringify.valueAlloc(a, extra, .{ .emit_null_optional_fields = false }));
+        try output(json);
+        try output("\n");
+    }
+};
+
+fn kvLayers(gpa: Allocator, model: *const Model) ![]prefix_cache.Layer {
+    const layers = try gpa.alloc(prefix_cache.Layer, model.layers.len);
+    for (model.layers, layers, 0..) |layer, *view, i| view.* = .{
+        .keys = layer.keys.structs(u8),
+        .values = layer.values.structs(u8),
+        .capacity = layer.capacity,
+        .ring = model.cfg.sliding(i),
     };
-    // Serialize completely before writing: failures never emit fake success or
-    // a partially serialized response. Transport failures still propagate.
-    const json = try std.json.Stringify.valueAlloc(a, response, .{});
-    try output(json);
-    try output("\n");
+    return layers;
+}
+
+fn hashExecutable(digest: *[32]u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var size: u32 = buffer.len;
+    if (std.c._NSGetExecutablePath(&buffer, &size) != 0) return error.ExecutablePathFailed;
+    const path = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&buffer)), 0);
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return error.ExecutableReadFailed;
+    defer _ = std.c.close(fd);
+    var h = Sha256.init(.{});
+    var chunk: [65536]u8 = undefined;
+    while (true) {
+        const n = read(fd, &chunk, chunk.len);
+        if (n < 0) return error.ExecutableReadFailed;
+        if (n == 0) break;
+        h.update(chunk[0..@intCast(n)]);
+    }
+    h.final(digest);
+}
+
+pub const shard_samples = 32;
+pub const shard_sample_bytes = 4096;
+
+/// The safetensors header (tensor names, dtypes, offsets) plus `shard_samples`
+/// evenly spaced 4 KiB pages: a re-quantized checkpoint with the same sizes
+/// almost surely differs in them. About 128 KiB of reads per shard, not a hash
+/// of the weights: an edit that avoids every sampled page goes undetected.
+pub fn sampleShard(h: *Sha256, bytes: []const u8) void {
+    if (bytes.len >= 8) {
+        const header = std.mem.readInt(u64, bytes[0..8], .little);
+        h.update(bytes[0..@intCast(@min(bytes.len, 8 +| header))]);
+    }
+    const page = @min(bytes.len, shard_sample_bytes);
+    for (0..shard_samples) |i| {
+        const start = (bytes.len - page) * i / (shard_samples - 1);
+        h.update(bytes[start..][0..page]);
+    }
+}
+
+/// Snapshot identity and settings. Identity: config bytes plus every shard's
+/// name, size, header and sampled pages (no 22 GB hash). Settings: device, this exact executable (any
+/// rebuild invalidates), and every Model field that selects kernels, storage
+/// or batched verification, since any of them can change stored bits.
+pub fn snapshotKey(model: *const Model) !prefix_cache.Key {
+    var key: prefix_cache.Key = undefined;
+    var h = Sha256.init(.{});
+    h.update("flint-prefix-identity-v2\x00");
+    h.update(std.mem.asBytes(&@as(u64, model.config_map.bytes.len)));
+    h.update(model.config_map.bytes);
+    for (model.store.shards.items) |shard| {
+        h.update(std.mem.asBytes(&@as(u64, shard.name.len)));
+        h.update(shard.name);
+        h.update(std.mem.asBytes(&@as(u64, shard.mapping.bytes.len)));
+        sampleShard(&h, shard.mapping.bytes);
+    }
+    h.final(&key.identity);
+    var executable: [32]u8 = undefined;
+    try hashExecutable(&executable);
+    const m = model;
+    const resident_workers: u32 = if (m.resident_execution) |e| e.workers else 0;
+    const resident_row_tile: u32 = if (m.resident_execution) |e| e.descriptor.structs(@import("resident.zig").Descriptor)[0].row_tile else 0;
+    const fields = .{
+        .{ "mlx_attention", @intFromBool(m.mlx_attention) },                   .{ "kv_bf16", @intFromBool(m.kv_bf16) },
+        .{ "bf16_blocks", m.bf16_blocks },                                     .{ "bf16_vector_loads", @intFromBool(m.bf16_vector_loads) },
+        .{ "staged_row_tile", m.staged_row_tile },                             .{ "head_row_tile", m.head_row_tile },
+        .{ "qkv_row_tile", m.qkv_row_tile },                                   .{ "gate_row_tile", m.gate_row_tile },
+        .{ "projection_row_tile", m.projection_row_tile },                     .{ "down_row_tile", m.down_row_tile },
+        .{ "attention_chunk", m.attention_chunk },                             .{ "split_attention", @intFromBool(m.splitAttentionSupported()) },
+        .{ "resident_workers", resident_workers },                             .{ "resident_row_tile", resident_row_tile },
+        .{ "packed_router", @intFromBool(m.packed_router) },                   .{ "fixed_loops", @intFromBool(m.fixed_loops) },
+        .{ "affine_loads", @intFromBool(m.affine_loads) },                     .{ "fixed_attention", @intFromBool(m.fixed_attention) },
+        .{ "gqa_reuse", m.gqa_reuse },                                         .{ "gqa_blocks", m.gqa_blocks },
+        .{ "gqa_prefetch", m.gqa_prefetch },                                   .{ "wide_attention", @intFromBool(m.wide_attention) },
+        .{ "ring_attention", @intFromBool(m.ring_attention) },                 .{ "prepared_inputs", @intFromBool(m.prepared_inputs) },
+        .{ "prepared_fused_norm", @intFromBool(m.prepared_fused_norm) },       .{ "prepared_fused_gate", @intFromBool(m.prepared_fused_gate) },
+        .{ "parallel_down", @intFromBool(m.parallel_down) },                   .{ "speculative_tokens", m.speculative_tokens },
+        .{ "batch_query_group", m.batch_query_group },                         .{ "batch_weight_reuse", @intFromBool(m.batch_weight_reuse) },
+        .{ "batch_mlp_weight_reuse", @intFromBool(m.batch_mlp_weight_reuse) }, .{ "batch_shared_attention", @intFromBool(m.batch_shared_attention) },
+    };
+    var settings = Sha256.init(.{});
+    var text: [256]u8 = undefined;
+    settings.update(try std.fmt.bufPrint(&text, "flint-prefix-settings-v1 device={s} executable={s}", .{ m.ctx.deviceName(), &std.fmt.bytesToHex(executable, .lower) }));
+    inline for (fields) |field| settings.update(try std.fmt.bufPrint(&text, " {s}={d}", .{ field[0], @as(u32, field[1]) }));
+    settings.final(&key.settings);
+    return key;
 }
 
 /// Consume stdin through EOF, retaining the caller's Model between requests.
 /// Propagate every invalid request / I/O / inference error to main (!void), so
 /// the process exits nonzero; stderr has a diagnostic, stdout has no error JSON.
-pub fn run(model: *Model, gpa: Allocator) !void {
-    return runImpl(model, gpa) catch |err| {
+pub fn run(model: *Model, gpa: Allocator, options: Options) !void {
+    return runImpl(model, gpa, options) catch |err| {
         std.debug.print("Session failed: {s}\n", .{@errorName(err)});
         return err;
     };
 }
 
-fn runImpl(model: *Model, gpa: Allocator) !void {
+fn runImpl(model: *Model, gpa: Allocator, options: Options) !void {
+    if (options.rewind_checkpoints > max_rewind_checkpoints) return error.InvalidRewindCheckpoints;
     const storage = try gpa.alloc(u8, max_line_bytes);
     defer gpa.free(storage);
     var lines: LineBuffer = .{ .storage = storage };
-    var history: std.ArrayList(u32) = .empty;
-    defer history.deinit(gpa);
+    var session: Session = .{
+        .model = model,
+        .gpa = gpa,
+        .layers = try kvLayers(gpa, model),
+        .checkpoints = try rewind.Checkpoints.init(gpa, options.rewind_checkpoints),
+    };
+    defer {
+        session.history.deinit(gpa);
+        session.checkpoints.deinit();
+        gpa.free(session.layers);
+        if (session.cache) |*cache| cache.deinit();
+    }
+    if (options.prefix_cache) |directory|
+        session.cache = try prefix_cache.Cache.init(gpa, directory, options.prefix_cache_bytes, try snapshotKey(model));
     var chunk: [8192]u8 = undefined;
     while (true) {
         const n = read(0, &chunk, chunk.len);
         if (n < 0) return error.InputFailed;
         if (n == 0) {
-            if (lines.finish()) |line| try handle(model, gpa, &history, line);
+            if (lines.finish()) |line| try session.handle(line);
             return;
         }
         for (chunk[0..@intCast(n)]) |byte| {
-            if (try lines.push(byte)) |line| try handle(model, gpa, &history, line);
+            if (try lines.push(byte)) |line| try session.handle(line);
         }
     }
 }
@@ -386,4 +718,81 @@ test "session finite guards include final logits and timing" {
     try std.testing.expectEqual(@as(f64, 0.5), try elapsed(1, 1.5));
     try std.testing.expectError(error.InvalidTiming, elapsed(2, 1));
     try std.testing.expectError(error.InvalidTiming, elapsed(0, std.math.inf(f64)));
+}
+
+test "session rewind and checkpoint fields parse strictly and validate before mutation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a, "{\"tokens\":[1,2,3],\"truncate\":4,\"checkpoint_at\":[5,7]}");
+    try std.testing.expectEqual(@as(?u32, 4), request.truncate);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7 }, request.checkpoint_at);
+    const checked = try validate(request, 9, 200, 4);
+    try std.testing.expectEqual(@as(u32, 4), checked.cache_before);
+    try std.testing.expectError(error.ContextExhausted, validate(request, 9, 16, 4));
+    try std.testing.expectEqual(@as(u64, 4 + 1 + 128), (try validate(.{ .tokens = &.{1}, .truncate = 4 }, 9, 200, 4)).required);
+    try std.testing.expectError(error.InvalidTruncate, validate(request, 3, 16, 4));
+    try std.testing.expectError(error.TruncateWithReset, validate(.{ .tokens = &.{1}, .truncate = 0, .reset = true }, 3, 16, 4));
+    try std.testing.expectError(error.InvalidRequestInteger, parse(a, "{\"tokens\":[1],\"truncate\":-1}"));
+    try std.testing.expectError(error.InvalidRequestInteger, parse(a, "{\"tokens\":[1],\"truncate\":null}"));
+    try std.testing.expectError(error.InvalidCheckpointPositions, parse(a, "{\"tokens\":[1],\"checkpoint_at\":3}"));
+    try std.testing.expectError(error.InvalidRequestInteger, parse(a, "{\"tokens\":[1],\"checkpoint_at\":[\"3\"]}"));
+    var many: std.ArrayList(u8) = .empty;
+    try many.appendSlice(a, "{\"tokens\":[1],\"checkpoint_at\":[");
+    for (0..max_checkpoint_at + 1) |i| try many.appendSlice(a, if (i == 0) "1" else ",1");
+    try many.appendSlice(a, "]}");
+    try std.testing.expectError(error.TooManyCheckpointPositions, parse(a, many.items));
+    // Positions must strictly increase inside (cache_before, cache_before + tokens].
+    const span: Request = .{ .tokens = &.{ 1, 2, 3 }, .max_tokens = 0 };
+    for ([_][]const u32{ &.{3}, &.{ 4, 4 }, &.{ 5, 4 }, &.{7} }) |positions| {
+        var bad = span;
+        bad.checkpoint_at = positions;
+        try std.testing.expectError(error.InvalidCheckpointPosition, validate(bad, 3, 16, 4));
+    }
+    var good = span;
+    good.checkpoint_at = &.{ 4, 6 };
+    _ = try validate(good, 3, 16, 4);
+    good.reset = true;
+    good.checkpoint_at = &.{ 1, 3 };
+    _ = try validate(good, 3, 16, 4);
+}
+
+test "snapshot identity samples shard header and pages without reading everything" {
+    const bytes = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(bytes);
+    for (bytes, 0..) |*b, i| b.* = @truncate(i *% 31);
+    std.mem.writeInt(u64, bytes[0..8], 100, .little);
+    const digest = struct {
+        fn of(data: []const u8) [32]u8 {
+            var h = Sha256.init(.{});
+            sampleShard(&h, data);
+            var out: [32]u8 = undefined;
+            h.final(&out);
+            return out;
+        }
+    }.of;
+    const base = digest(bytes);
+    try std.testing.expectEqual(base, digest(bytes));
+    for ([_]usize{ 50, 107, bytes.len - 1 }) |offset| {
+        bytes[offset] ^= 1;
+        try std.testing.expect(!std.mem.eql(u8, &base, &digest(bytes)));
+        bytes[offset] ^= 1;
+    }
+    // A byte between sampled pages is not covered.
+    bytes[shard_sample_bytes + 1] ^= 1;
+    try std.testing.expectEqual(base, digest(bytes));
+    _ = digest(bytes[0..3]);
+    _ = digest(&.{});
+}
+
+test "session extra fields are appended only when present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try std.json.Stringify.valueAlloc(a, Extra{}, .{ .emit_null_optional_fields = false });
+    try std.testing.expectEqualStrings("{}", none);
+    try std.testing.expectEqualStrings("{\"id\":1}", try merge(a, "{\"id\":1}", none));
+    const some = try std.json.Stringify.valueAlloc(a, Extra{ .truncated_from = 9, .rewind_source = "memory" }, .{ .emit_null_optional_fields = false });
+    try std.testing.expectEqualStrings("{\"id\":1,\"truncated_from\":9,\"rewind_source\":\"memory\"}", try merge(a, "{\"id\":1}", some));
+    try std.testing.expectError(error.InvalidResponseJson, merge(a, "[1]", some));
 }
