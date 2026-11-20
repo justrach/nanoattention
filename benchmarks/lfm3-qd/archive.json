@@ -1117,7 +1117,7 @@
    "dispatch_bin": "<=64",
    "family": "mlx-multi",
    "candidate": {
-    "name": "mlx-prefill-multi",
+    "name": "mlx-prefill-c2",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -1135,23 +1135,28 @@
      "conv_rows": true,
      "mlx_linear": true,
      "mlx_attention": true,
-     "mlx_multi": true
+     "mlx_multi": true,
+     "head_trim": true,
+     "mlx_qmm2": true,
+     "mlx_glu2": true,
+     "mlx_attention2": true,
+     "conv_rows2": true
     }
    },
-   "tokens_per_second": 3398.2902388203493,
+   "tokens_per_second": 3497.0766840152914,
    "rounds": [
-    3400.8183447734273,
-    3398.2902388203493,
-    3397.3882545035945
+    3497.0766840152914,
+    3505.888797074581,
+    2733.640849823888
    ],
    "prompt_tokens": 64,
-   "dispatches_per_token": 5.4375,
+   "dispatches_per_token": 5.0625,
    "admission": "mlx-arith",
-   "trial": "20261120T172342-mlx-prefill-multi",
-   "binary_sha256": "030a45dcab0246c362a3f9e8e641fa62a2cc5357838b048eb977e649403622c2",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:26:51+00:00",
-   "parent": "mlx-prefill"
+   "trial": "20261120T203506-mlx-prefill-c2",
+   "binary_sha256": "bab0b90f833aff55c0d4106528ce2bc31696c659f1715f8ddccf3c2e3a63f5e7",
+   "worktree": "$NANO_WORK/c2-prefill-mlx",
+   "updated": "2026-11-20T12:37:00+00:00",
+   "parent": "mlx-prefill-trim"
   },
   "prefill|<=1024|<=64|mlx-multi": {
    "objective": "prefill",
@@ -1159,7 +1164,7 @@
    "dispatch_bin": "<=64",
    "family": "mlx-multi",
    "candidate": {
-    "name": "mlx-prefill-trim",
+    "name": "mlx-prefill-c2",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -1178,23 +1183,27 @@
      "mlx_linear": true,
      "mlx_attention": true,
      "mlx_multi": true,
-     "head_trim": true
+     "head_trim": true,
+     "mlx_qmm2": true,
+     "mlx_glu2": true,
+     "mlx_attention2": true,
+     "conv_rows2": true
     }
    },
-   "tokens_per_second": 4851.769898837575,
+   "tokens_per_second": 5491.7944868365785,
    "rounds": [
-    4857.708053801819,
-    4851.769898837575,
-    4844.241549058306
+    4936.486128438281,
+    5491.7944868365785,
+    5492.089027380088
    ],
    "prompt_tokens": 1024,
-   "dispatches_per_token": 0.240234375,
+   "dispatches_per_token": 0.2177734375,
    "admission": "mlx-arith",
-   "trial": "20261120T173733-mlx-prefill-trim",
-   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:39:41+00:00",
-   "parent": "mlx-prefill-multi"
+   "trial": "20261120T203506-mlx-prefill-c2",
+   "binary_sha256": "bab0b90f833aff55c0d4106528ce2bc31696c659f1715f8ddccf3c2e3a63f5e7",
+   "worktree": "$NANO_WORK/c2-prefill-mlx",
+   "updated": "2026-11-20T12:37:00+00:00",
+   "parent": "mlx-prefill-trim"
   },
   "prefill|<=4096|<=64|mlx-multi": {
    "objective": "prefill",
@@ -1202,7 +1211,7 @@
    "dispatch_bin": "<=64",
    "family": "mlx-multi",
    "candidate": {
-    "name": "mlx-prefill-trim",
+    "name": "mlx-prefill-c2",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -1221,23 +1230,131 @@
      "mlx_linear": true,
      "mlx_attention": true,
      "mlx_multi": true,
-     "head_trim": true
+     "head_trim": true,
+     "mlx_qmm2": true,
+     "mlx_glu2": true,
+     "mlx_attention2": true,
+     "conv_rows2": true
     }
    },
-   "tokens_per_second": 4750.478120808996,
+   "tokens_per_second": 5481.226531526275,
    "rounds": [
-    4788.167988825172,
-    4750.478120808996,
-    4745.761140369782
+    5479.0342671169,
+    5481.226531526275,
+    5481.659326028862
    ],
    "prompt_tokens": 4096,
-   "dispatches_per_token": 0.1171875,
+   "dispatches_per_token": 0.10595703125,
    "admission": "mlx-arith",
-   "trial": "20261120T173733-mlx-prefill-trim",
-   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:39:41+00:00",
-   "parent": "mlx-prefill-multi"
+   "trial": "20261120T203506-mlx-prefill-c2",
+   "binary_sha256": "bab0b90f833aff55c0d4106528ce2bc31696c659f1715f8ddccf3c2e3a63f5e7",
+   "worktree": "$NANO_WORK/c2-prefill-mlx",
+   "updated": "2026-11-20T12:37:00+00:00",
+   "parent": "mlx-prefill-trim"
+  },
+  "decode|<=256|<=256|gated-sync": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": "<=256",
+   "family": "gated-sync",
+   "candidate": {
+    "name": "split-attn-gated",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "d2_gate": true
+    }
+   },
+   "tokens_per_second": 306.9566447771856,
+   "rounds": [
+    307.10835891154403,
+    306.9566447771856,
+    299.42466019093126
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 197.99609375,
+   "admission": "empirical",
+   "trial": "20261120T202607-split-attn-gated",
+   "binary_sha256": "ecdc570a66baf44a13d117d84e8f4f417976da0bf551247780ecff88da2e662e",
+   "worktree": "$NANO_WORK/c2-decode",
+   "updated": "2026-11-20T12:33:29+00:00",
+   "parent": "split-attn"
+  },
+  "decode|<=1024|<=256|gated-sync": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=256",
+   "family": "gated-sync",
+   "candidate": {
+    "name": "split-attn-gated-nr",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "d2_gate": true,
+     "d2_norm_regs": true
+    }
+   },
+   "tokens_per_second": 302.89011603484136,
+   "rounds": [
+    302.6616491047136,
+    302.89011603484136,
+    303.550953284523
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 197.99609375,
+   "admission": "empirical",
+   "trial": "20261120T203852-split-attn-gated-nr",
+   "binary_sha256": "e5a210681a5c85436fc10dfa5e1cc58d1399978c413af70db90cf3d75801e0cc",
+   "worktree": "$NANO_WORK/c2-decode",
+   "updated": "2026-11-20T12:50:46+00:00",
+   "parent": "split-attn-gated"
+  },
+  "decode|<=4096|<=256|gated-sync": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=256",
+   "family": "gated-sync",
+   "candidate": {
+    "name": "split-attn-gated-nr",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "d2_gate": true,
+     "d2_norm_regs": true
+    }
+   },
+   "tokens_per_second": 278.4654811880722,
+   "rounds": [
+    279.41527984181687,
+    278.4654811880722,
+    278.45336559595904
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 197.99609375,
+   "admission": "empirical",
+   "trial": "20261120T203852-split-attn-gated-nr",
+   "binary_sha256": "e5a210681a5c85436fc10dfa5e1cc58d1399978c413af70db90cf3d75801e0cc",
+   "worktree": "$NANO_WORK/c2-decode",
+   "updated": "2026-11-20T12:50:46+00:00",
+   "parent": "split-attn-gated"
   }
  },
  "baselines": {
