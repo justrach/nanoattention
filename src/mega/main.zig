@@ -60,6 +60,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
+    // ---- cli ----
+    // run, chat, tokenize, detokenize, --version and the full --help (src/mega/cli.zig).
+    if (try @import("cli.zig").dispatch(init, args, usage)) return;
+    // ---- end cli ----
     const command = args.next() orelse return io.out(usage);
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "help")) return io.out(usage);
     // decode search: kernel timing on synthetic weights (no checkpoint); run under the inference lock.
@@ -327,3 +331,5 @@ test {
 }
 test { _ = @import("plan.zig"); }
 test { _ = @import("decode2_tests.zig"); } // decode climb 2
+// ---- cli ----
+test { _ = @import("cli.zig"); _ = @import("tokenizer.zig"); _ = @import("sample.zig"); _ = @import("chat.zig"); }

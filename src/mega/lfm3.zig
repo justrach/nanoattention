@@ -301,3 +301,79 @@ test "LFM3 config fails closed on unsupported features" {
     try std.testing.expectError(error.UnsupportedConvBias, parse(a, "{\"model_type\":\"lfm3\",\"conv_bias\":true}"));
     try std.testing.expectError(error.UnsupportedUntiedHead, parse(a, "{\"model_type\":\"lfm3\",\"tie_word_embeddings\":false}"));
 }
+
+// ---- chat template (cli) ----
+// The text-only path of the checkpoint's chat_template.jinja, written directly
+// (no Jinja interpreter); tools/nano_tokenizer_check.py template compares it
+// with the real template. The system message is trimmed and written only if
+// non-empty; user (and later system) content is trimmed; an assistant turn
+// before the last user turn becomes "<think></think>" + its text after the last
+// "</think>" (trimmed, if there was one); a later one keeps its text and gets
+// "<think></think>" unless it contains "</think>". The generation prompt ends
+// in "<think>" with thinking on, "<think></think>" with it off.
+const chat = @import("chat.zig");
+
+pub const chat_template: chat.Template = .{
+    .render = renderChat,
+    .next_turn = nextTurn,
+    .think_open = "<think>",
+    .think_close = "</think>",
+};
+
+fn renderChat(a: std.mem.Allocator, messages: []const chat.Message, options: chat.Options) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "<|startoftext|>");
+    var msgs = messages;
+    if (msgs.len > 0 and msgs[0].role == .system) {
+        const system = chat.trim(msgs[0].content);
+        if (system.len > 0) try out.print(a, "<|im_start|>system\n{s}<|im_end|>\n", .{system});
+        msgs = msgs[1..];
+    }
+    var last_user: ?usize = null;
+    for (msgs, 0..) |m, i| if (m.role == .user) {
+        last_user = i;
+    };
+    for (msgs, 0..) |m, i| {
+        try out.print(a, "<|im_start|>{s}\n", .{@tagName(m.role)});
+        if (m.role != .assistant) {
+            try out.print(a, "{s}<|im_end|>\n", .{chat.trim(m.content)});
+            continue;
+        }
+        const keep_thinking = last_user == null or i > last_user.?;
+        if (keep_thinking) {
+            if (std.mem.indexOf(u8, m.content, "</think>") == null) try out.appendSlice(a, "<think></think>");
+            try out.appendSlice(a, m.content);
+        } else {
+            var content = m.content;
+            if (std.mem.lastIndexOf(u8, content, "</think>")) |p| content = chat.trim(content[p + "</think>".len ..]);
+            try out.print(a, "<think></think>{s}", .{content});
+        }
+        try out.appendSlice(a, "<|im_end|>\n");
+    }
+    if (options.generate) try out.print(a, "<|im_start|>assistant\n{s}", .{if (options.thinking) "<think>" else "<think></think>"});
+    return out.items;
+}
+
+fn nextTurn(a: std.mem.Allocator, closed: bool, user: []const u8, options: chat.Options) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}\n<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n{s}", .{
+        if (closed) "" else "<|im_end|>", chat.trim(user), if (options.thinking) "<think>" else "<think></think>",
+    });
+}
+
+test "LFM3 chat template: one turn, system, history, continuation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = try renderChat(a, &.{.{ .role = .user, .content = " hi " }}, .{});
+    try std.testing.expectEqualStrings("<|startoftext|><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think></think>", one);
+    const sys = try renderChat(a, &.{ .{ .role = .system, .content = "  S\n" }, .{ .role = .user, .content = "u" } }, .{ .thinking = true });
+    try std.testing.expectEqualStrings("<|startoftext|><|im_start|>system\nS<|im_end|>\n<|im_start|>user\nu<|im_end|>\n<|im_start|>assistant\n<think>", sys);
+    // A reply in state plus the next turn's text is the template's render of the longer conversation.
+    const whole = try renderChat(a, &.{ .{ .role = .user, .content = " hi " }, .{ .role = .assistant, .content = "Hello." }, .{ .role = .user, .content = "more" } }, .{});
+    const next = try nextTurn(a, true, "more", .{});
+    try std.testing.expectEqualStrings(whole, try std.mem.concat(a, u8, &.{ one, "Hello.<|im_end|>", next }));
+    const cut = try nextTurn(a, false, "more", .{});
+    try std.testing.expectEqualStrings(whole, try std.mem.concat(a, u8, &.{ one, "Hello.", cut }));
+    const hidden = try renderChat(a, &.{ .{ .role = .user, .content = "q" }, .{ .role = .assistant, .content = "<think>x</think>  y " }, .{ .role = .user, .content = "r" } }, .{ .generate = false });
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "<|im_start|>assistant\n<think></think>y<|im_end|>") != null);
+}

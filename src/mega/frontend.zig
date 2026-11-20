@@ -17,3 +17,12 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
     std.debug.print("No megakernel front end for model_type \"{s}\"\n", .{model_type});
     return error.UnsupportedModelType;
 }
+
+// ---- cli: chat templates (src/mega/chat.zig) ----
+pub const chat = @import("chat.zig");
+
+/// The model's chat template, if its front end supplies one.
+pub fn chatTemplate(model_type: []const u8) ?chat.Template {
+    if (std.mem.eql(u8, model_type, "lfm3")) return lfm3.chat_template;
+    return null;
+}

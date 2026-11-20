@@ -209,7 +209,7 @@ including initial-prefill latency, incomplete responses, and verification limits
 
 `zig build` also produces **`nano`**, a second executable built on a model-agnostic core (`src/mega/`). A model is described as a program of generic operations over declared state (activations, append-only and ring KV, short conv windows); a per-architecture front end emits the program from `config.json`, and nothing below the front end knows which model it runs. The first model on it is [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) (24 layers: 13 gated short convolutions, 6 full-attention and 5 sliding-attention), from its official 4-bit MLX export. `nano` has `inspect`, `generate`, `eval`, `bench` and `session`; `nano session` speaks the same JSONL protocol as `flint session`.
 
-Every performance choice is a run-time knob. With no knobs, `nano` runs the plain reference executor (one dispatch per operation), which is what everything else is checked against. Two presets select the tuned paths:
+Every performance choice is a run-time knob. With no knobs, the engine commands (`session`, `eval`, `bench`) run the plain reference executor (one dispatch per operation), which is what everything else is checked against. Two presets select the tuned paths; `nano run` and `nano chat` ([below](#nano-as-a-command-line-tool)) use the first by default:
 
 ```sh
 ./zig-out/bin/nano session /path/to/lfm3-1.7b-mlx-4bit --context 4608 --knobs src/mega/presets/exact.json
@@ -243,7 +243,20 @@ With MLX's own arithmetic, ingestion is ahead of stock MLX in both precisions wh
 
 The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
 
-The speed came from a quality-diversity search over exact candidates ([method](docs/QD.md), [archive](benchmarks/lfm3-qd/), [decode](benchmarks/lfm3-decode-search.md), [prefill](benchmarks/lfm3-prefill-search.md)). See also [the megakernel's design and how to add a model](docs/MEGAKERNEL.md), [the model as implemented](docs/LFM3.md), [what stock MLX does on prefill](docs/MLX-PREFILL.md), and [the first measurements](benchmarks/lfm3-megakernel.md). Limits: one sequence, greedy decoding, float32 activations, no rewind or prefix cache in `nano session` yet, and Flint itself is not ported to the megakernel.
+The speed came from a quality-diversity search over exact candidates ([method](docs/QD.md), [archive](benchmarks/lfm3-qd/), [decode](benchmarks/lfm3-decode-search.md), [prefill](benchmarks/lfm3-prefill-search.md)). See also [the megakernel's design and how to add a model](docs/MEGAKERNEL.md), [the model as implemented](docs/LFM3.md), [what stock MLX does on prefill](docs/MLX-PREFILL.md), and [the first measurements](benchmarks/lfm3-megakernel.md). Limits: one sequence, float32 activations, greedy decoding in `nano session` (the command-line tool below also samples), no rewind or prefix cache in `nano session` yet, and Flint itself is not ported to the megakernel.
+
+### `nano` as a command-line tool
+
+`nano` also takes text: a native tokenizer (identical to the `tokenizers` library on a 51,299-string corpus), the model's chat template and the tuned presets built in, no Python.
+
+```sh
+export NANO_MODEL=/path/to/lfm3-1.7b-mlx-4bit
+./zig-out/bin/nano run "What is the capital of Australia? Answer in one sentence."
+./zig-out/bin/nano chat
+./zig-out/bin/nano tokenize "Hello world"
+```
+
+`run` streams one reply (`--stats`, `--json`, `--system`, `--think`, sampling options, `--prefill mlx` for MLX's faster batched prompt arithmetic); `chat` keeps the model's state between turns. See [docs/CLI.md](docs/CLI.md).
 
 ## Execution architecture
 
