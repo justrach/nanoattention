@@ -1,0 +1,8 @@
+{"name": "mlx-prefill-c2", "parent": "mlx-prefill-trim", "family": "mlx-multi",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 2048, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true, "conv_rows": true,
+           "mlx_linear": true, "mlx_attention": true, "mlx_multi": true, "head_trim": true,
+           "mlx_qmm2": true, "mlx_glu2": true, "mlx_attention2": true, "conv_rows2": true},
+ "hypothesis": "mlx-arith tier. mlx-prefill-trim with the restructured kernels of mlx2.metal, every output's bits unchanged (logits sha256 equal to mlx-prefill-trim's on window and long): mlx_qmm2 (stock's unsplit qmm_t chain in 64 x 16 tiles, x straight from device memory, double-buffered dequantized weights: 0.92-0.94 of stock MLX's time per op), mlx_glu2 (gate, up and silu product in one launch: 0.89-0.91 of stock's two qmm + multiply), mlx_attention2 (heaviest query blocks first, queries in registers, 2 barriers per key block: full attention 0.74-0.95 of stock), conv_rows2 (no 64-bit modulo per tap). Screens: L1024 4,847 -> 5,479; L4096 4,793 -> 5,482 (2 rounds each, partly separate sessions); L64 +1.8%. Expect +12% prefill at 1,024 and 4,096, +2% at 64.",
+ "expected": {"prefill": 12}}

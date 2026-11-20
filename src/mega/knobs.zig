@@ -73,6 +73,27 @@ pub const Knobs = struct {
     /// products that share an input (q/k/v projections; w1 and w3) in one launch
     /// (mk_mlx_qmm_multi): every tile is mk_mlx_qmm_t's, so the bits are the same.
     mlx_multi: bool = false,
+    // ---- c2-prefill-mlx (prefill, mlx-arith tier) ----
+    /// NOT the reference arithmetic: with mlx_linear, the products stock MLX runs
+    /// unsplit (plain and, with mlx_multi, multi-matrix) through mk_mlx2_qmm /
+    /// mk_mlx2_multi (mlx2.metal): 64 x 16 tiles, x read straight from device memory,
+    /// double-buffered dequantized weights. Each output is the same ascending-k fma
+    /// chain as stock's affine_qmm_t, so the bits are stock MLX's
+    /// (tools/nano_mlx_ops.py check --variants mlx,mlx2). mlx-arith tier only.
+    mlx_qmm2: bool = false,
+    /// With mlx_linear and fuse_glu: the gate and up products (both unsplit in stock
+    /// MLX) and the GLU product in one launch (mk_mlx2_glu): equal bit for bit to
+    /// mk_mlx_qmm_t twice then mk_binary. mlx-arith tier only.
+    mlx_glu2: bool = false,
+    /// NOT the reference arithmetic: with mlx_attention, multi-row attention through
+    /// mk_mlx2_attention[_gated] (mlx2.metal): mk_mlx_attention's arithmetic step for
+    /// step, scheduled heaviest query blocks first, queries held in registers, separate K
+    /// and V tiles (two barriers per key block instead of four). Bits are stock MLX's
+    /// (tools/nano_mlx_ops.py check --variants ..mlx2). mlx-arith tier only.
+    mlx_attention2: bool = false,
+    /// With conv_rows: mk_gated_conv_rows2 (mlx2.metal), the same arithmetic with the
+    /// ring slot advanced per tap instead of a 64-bit modulo per tap. Exact tier.
+    conv_rows2: bool = false,
 
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};

@@ -912,3 +912,180 @@ test "mlx qmm port: plain and split-K match CPU; mk_mlx_qmm_multi equals one lau
         try close(acc, f[M * K + t * 40 + o], 1e-4);
     };
 }
+
+// ---- c2-prefill-mlx (prefill, mlx-arith tier) ----
+// The restructured kernels of mlx2.metal against the kernels they replace, bit for bit,
+// on random and adversarial inputs (signed zeros, subnormals, infinities, NaN, heavy
+// cancellation, ragged sizes, weights 2 bytes off a word boundary). Bit identity of
+// the replaced kernels with stock MLX is tools/nano_mlx_ops.py's.
+
+/// Random normal values, or (adversarial) a mix of +-0, subnormals, +-inf, NaN,
+/// cancelling +-1e30 pairs and ordinary values.
+fn c2Fill(r: *std.Random.DefaultPrng, out: []f32, adversarial: bool, scale: f32) void {
+    const special = [_]f32{ 0.0, -0.0, std.math.floatTrueMin(f32), -std.math.floatTrueMin(f32), 1e-39, -3e-40, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 1e30, -1e30, 65504.0, -1.0e-30 };
+    for (out) |*v| {
+        v.* = scale * r.random().floatNorm(f32);
+        if (adversarial and r.random().uintLessThan(u32, 8) == 0) v.* = special[r.random().uintLessThan(usize, special.len)];
+    }
+}
+
+test "c2-prefill-mlx: mk_mlx2_qmm, mk_mlx2_multi and mk_mlx2_glu equal mk_mlx_qmm_t (and mk_binary) bit for bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(2026);
+    const K: u32 = 256;
+    const group: u32 = 64;
+    const ns = [_]u32{ 96, 40, 40 }; // the last two are a GLU's gate and up (same width)
+    for ([_]bool{ false, true }) |adversarial| {
+        var total: usize = 2;
+        for (ns) |n| total += n * K / 2 + 2 * (n * K / group) * 2;
+        const wbuf = try ctx.alloc((total + 3) / 4);
+        defer wbuf.deinit();
+        const bytes = wbuf.structs(u8);
+        var mats: [3]gpu.Mat = undefined;
+        var off: usize = 2; // data 2 bytes off a word boundary, as LFM3's
+        const M: u32 = 70; // a full 64-row tile and a ragged one; 40 outputs: 2.5 tiles of 16
+        var yoff: u32 = M * K;
+        for (ns, 0..) |n, j| {
+            const w_off = off;
+            const s_off = w_off + n * K / 2;
+            const b_off = s_off + (n * K / group) * 2;
+            off = b_off + (n * K / group) * 2;
+            for (0..n * K / group) |g| {
+                var s = bf16(0.01 + 0.05 * r.random().float(f32));
+                var b = bf16(-0.3 + 0.1 * r.random().float(f32));
+                if (adversarial) switch (g % 9) {
+                    0 => { s = 0; b = 0x8000; }, // +0 scale, -0 bias
+                    1 => s = 0x0001, // subnormal scale
+                    2 => s = bf16(-0.04), // negative scale
+                    3 => b = bf16(1e30), // cancelling bias
+                    4 => s = 0x7f80, // +inf scale
+                    5 => b = 0x7fc0, // NaN bias
+                    else => {},
+                };
+                std.mem.writeInt(u16, bytes[s_off + 2 * g ..][0..2], s, .little);
+                std.mem.writeInt(u16, bytes[b_off + 2 * g ..][0..2], b, .little);
+            }
+            for (0..n * K / 2) |i| bytes[w_off + i] = r.random().int(u8);
+            mats[j] = .{ .w = w_off, .s = s_off, .b = b_off, .m = n, .y = yoff, .ys = n, .sdtype = 2, .bdtype = 2 };
+            yoff += M * n;
+        }
+        // arena: x | reference per matrix | mlx2 per matrix | multi | glu reference | glu
+        const per = yoff - M * K;
+        const buf = try ctx.alloc(M * K + 3 * per + 2 * M * ns[1]);
+        defer buf.deinit();
+        const splitk = try ctx.alloc(64);
+        defer splitk.deinit();
+        const f = buf.floats();
+        c2Fill(&r, f[0 .. M * K], adversarial, 1);
+        for (mats) |mt| {
+            var p: gpu.Params = .{ .rows = M, .x = 0, .xs = K, .y = mt.y, .ys = mt.ys, .n = K, .m = mt.m, .w = mt.w, .s = mt.s, .b = mt.b, .sdtype = 2, .bdtype = 2, .bits = 4, .group = group, .kind = 1, .dim = K };
+            try gpu.dispatch(ctx, "mk_mlx_qmm_t_bf16_g64", &.{ wbuf, wbuf, wbuf, buf, splitk }, &p, ((mt.m + 31) / 32) * ((M + 31) / 32) * 128, 128);
+            p.y += per;
+            try gpu.dispatch(ctx, "mk_mlx2_qmm_bf16_g64", &.{ wbuf, wbuf, wbuf, buf }, &p, ((mt.m + 15) / 16) * ((M + 63) / 64) * 64, 64);
+        }
+        var x: gpu.ParamsX = .{ .p = .{ .rows = M, .x = 0, .xs = K, .n = K, .group = group }, .count = 3 };
+        var tgs: usize = 0;
+        for (mats, 0..) |mt, j| {
+            x.mat[j] = mt;
+            x.mat[j].y += 2 * per;
+            tgs += ((mt.m + 15) / 16) * ((M + 63) / 64);
+        }
+        try gpu.dispatch(ctx, "mk_mlx2_multi_bf16_g64", &.{ wbuf, buf }, &x, tgs * 64, 64);
+        // GLU: silu(gate) * up through mk_binary on the reference products, and fused.
+        const g0 = M * K + 3 * per;
+        const bp: gpu.Params = .{ .rows = M, .x = mats[1].y, .xs = ns[1], .y = mats[2].y, .ys = ns[1], .z = g0, .zs = ns[1], .n = ns[1], .every = 1, .kind = 1, .act_a = 1, .act_b = 0 };
+        try gpu.dispatch(ctx, "mk_binary", &.{buf}, &bp, M * ns[1], 256);
+        var gx: gpu.ParamsX = .{ .p = .{ .rows = M, .x = 0, .xs = K, .n = K, .group = group, .y = g0 + M * ns[1], .ys = ns[1] }, .count = 2, .act_a = 1, .act_b = 0, .kind = 1 };
+        gx.mat[0] = mats[1];
+        gx.mat[1] = mats[2];
+        try gpu.dispatch(ctx, "mk_mlx2_glu_bf16_g64", &.{ wbuf, buf }, &gx, ((ns[1] + 15) / 16) * ((M + 63) / 64) * 64, 64);
+        try ctx.finish();
+        try bitsEqual(f[M * K ..][0..per], f[M * K + per ..][0..per]);
+        try bitsEqual(f[M * K ..][0..per], f[M * K + 2 * per ..][0..per]);
+        try bitsEqual(f[g0..][0 .. M * ns[1]], f[g0 + M * ns[1] ..][0 .. M * ns[1]]);
+        if (!adversarial) for (f[M * K ..][0..per]) |v| try testing.expect(std.math.isFinite(v));
+    }
+}
+
+test "c2-prefill-mlx: mk_mlx2_attention[_gated] equals mk_mlx_attention[_gated] bit for bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(4242);
+    // (T, KL, window, capacity): ragged, a later chunk, sliding windows in stock's key layout, ring wrap.
+    for ([_][4]u32{ .{ 70, 70, 0, 70 }, .{ 40, 300, 0, 300 }, .{ 9, 9, 0, 9 }, .{ 64, 64, 256, 319 }, .{ 100, 700, 256, 355 }, .{ 300, 300, 256, 555 } }) |c| {
+        for ([_]bool{ false, true }) |adversarial| {
+            const T = c[0];
+            const KL = c[1];
+            const cap = c[3];
+            const qw: u32 = 16 * 128;
+            const kw: u32 = 4 * 128;
+            const Kc = try ctx.alloc(cap * kw);
+            defer Kc.deinit();
+            const Vc = try ctx.alloc(cap * kw);
+            defer Vc.deinit();
+            // arena: q | gate | out | out2 | gated | gated2
+            const buf = try ctx.alloc(T * qw + T * 16 + 4 * T * qw);
+            defer buf.deinit();
+            const f = buf.floats();
+            c2Fill(&r, f[0 .. T * qw + T * 16], adversarial, 2);
+            for (0..KL) |t| {
+                const slot = t % cap;
+                c2Fill(&r, Kc.floats()[slot * kw ..][0..kw], adversarial, 2);
+                c2Fill(&r, Vc.floats()[slot * kw ..][0..kw], adversarial, 1);
+            }
+            const o = T * qw + T * 16;
+            var p: gpu.Params = .{ .rows = T, .pos = KL - T, .x = 0, .xs = qw, .ys = qw, .heads = 16, .kv_heads = 4, .dim = 128, .window = c[2], .capacity = cap, .scale = 0.08838834764831845, .z = T * qw, .zs = 16, .act_b = 2 };
+            const tgs = ((T + 31) / 32) * 16 * 128;
+            for ([_][:0]const u8{ "mk_mlx_attention", "mk_mlx2_attention", "mk_mlx_attention_gated", "mk_mlx2_attention_gated" }, 0..) |name, k| {
+                p.y = o + @as(u32, @intCast(k)) * T * qw;
+                try gpu.dispatch(ctx, name, &.{ buf, Kc, Vc }, &p, tgs, 128);
+            }
+            try ctx.finish();
+            try bitsEqual(f[o..][0 .. T * qw], f[o + T * qw ..][0 .. T * qw]);
+            try bitsEqual(f[o + 2 * T * qw ..][0 .. T * qw], f[o + 3 * T * qw ..][0 .. T * qw]);
+        }
+    }
+}
+
+test "c2-prefill-mlx: mk_gated_conv_rows2 equals mk_gated_conv_rows bit for bit" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(99);
+    const C = 64;
+    for ([_]u32{ 4, 7 }) |taps| for ([_]bool{ false, true }) |adversarial| {
+        const rows = 5;
+        const cap = taps - 1 + rows;
+        const cw = try ctx.alloc(C * taps / 2 + 1);
+        defer cw.deinit();
+        const halves = std.mem.bytesAsSlice(u16, std.mem.sliceAsBytes(cw.floats()));
+        for (halves) |*h| h.* = bf16(r.random().floatNorm(f32));
+        if (adversarial) {
+            halves[0] = 0x8000; // -0
+            halves[1] = 0x0001; // subnormal
+        }
+        var outs: [2][]f32 = undefined;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const src = try arena.allocator().alloc(f32, 4 * 3 * rows * C);
+        c2Fill(&r, src, adversarial, 1);
+        for (0..2) |mode| {
+            const ring = try ctx.alloc(cap * C);
+            defer ring.deinit();
+            const buf = try ctx.alloc(4 * rows * C);
+            defer buf.deinit();
+            outs[mode] = try arena.allocator().alloc(f32, 4 * rows * C);
+            // Four batches of 5 rows from position 0: the first taps - 1 positions read
+            // zeros before the start, later batches wrap the ring.
+            for (0..4) |batch| {
+                @memcpy(buf.floats()[0 .. 3 * rows * C], src[batch * 3 * rows * C ..][0 .. 3 * rows * C]);
+                const p: gpu.Params = .{ .rows = rows, .pos = @intCast(batch * rows), .x = 0, .xs = C, .y = rows * C, .ys = C, .z = 2 * rows * C, .zs = C, .m = 3 * rows * C, .every = C, .n = C, .taps = taps, .capacity = cap, .kind = 1, .act_b = 1, .dtype = 2 };
+                try gpu.dispatch(ctx, "mk_gated_conv_store", &.{ ring, buf }, &p, rows * C, 256);
+                try gpu.dispatch(ctx, if (mode == 0) "mk_gated_conv_rows" else "mk_gated_conv_rows2", &.{ ring, cw, buf }, &p, rows * C, 256);
+                try ctx.finish();
+                @memcpy(outs[mode][batch * rows * C ..][0 .. rows * C], buf.floats()[3 * rows * C ..][0 .. rows * C]);
+            }
+        }
+        try bitsEqual(outs[0], outs[1]);
+    };
+}

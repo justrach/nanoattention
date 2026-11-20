@@ -159,13 +159,15 @@ def mlx_sdpa(q, k, v, t, kl, window, heads=16, kv_heads=4, origin=0):
     return np.array(o[0].transpose(1, 0, 2).reshape(t, heads * 128))
 
 
-def engine_attention(binary, q, k, v, gate, t, kl, window, capacity, workdir, repeats=0):
+def engine_attention(binary, q, k, v, gate, t, kl, window, capacity, workdir, repeats=0, attention2=False):
     for name, arr in (("q", q), ("k", k), ("v", v), ("g", gate)):
         arr.astype("<f4").tofile(workdir / ("%s.f32" % name))
     out = workdir / "o.f32"
     cmd = [str(binary), "mlx-op", "attention", "--t", str(t), "--kl", str(kl), "--window", str(window),
            "--capacity", str(capacity or kl), "--q", str(workdir / "q.f32"), "--k", str(workdir / "k.f32"),
            "--v", str(workdir / "v.f32"), "--gate", str(workdir / "g.f32"), "--out", str(out), "--repeats", str(repeats)]
+    if attention2:  # c2-prefill-mlx: mk_mlx2_attention*
+        cmd += ["--attention2", "1"]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
         raise SystemExit("nano mlx-op failed (%s):\n%s" % (" ".join(cmd), proc.stderr[-3000:]))
@@ -174,7 +176,7 @@ def engine_attention(binary, q, k, v, gate, t, kl, window, capacity, workdir, re
     return o, json.loads(proc.stdout.strip().splitlines()[-1])
 
 
-def check_attention(args, rng, workdir, results):
+def check_attention(args, rng, workdir, results, attention2=False):
     ok = True
     for t, kl, window, capacity in ATTENTION + ROTATING:
         layout = "rotating" if window else "full"
@@ -184,17 +186,17 @@ def check_attention(args, rng, workdir, results):
         v = rng.standard_normal((kl, 4 * 128)).astype(np.float32)
         gate = rng.standard_normal((t, 16)).astype(np.float32)
         want = mlx_sdpa(q, k, v, t, kl, window, origin=origin)
-        got, info = engine_attention(args.binary, q, k, v, gate, t, kl, window, capacity, workdir)
+        got, info = engine_attention(args.binary, q, k, v, gate, t, kl, window, capacity, workdir, attention2=attention2)
         diff = got.view(np.uint32) != want.view(np.uint32)
-        row = {"op": "scaled_dot_product_attention", "ported": True, "t": t, "kl": kl, "window": window,
+        row = {"op": "scaled_dot_product_attention", "ported": True, "t": t, "kl": kl, "window": window, "kernel": info["kernels"],
                "key_layout": layout, "key_origin": origin,
                "capacity": capacity or kl, "words": int(diff.size), "differing_words": int(diff.sum()),
                "max_abs": float(np.abs(got.astype(np.float64) - want).max()), "bit_identical": bool(not diff.any()),
                "gate_epilogue_bit_identical": info["gate_epilogue_bit_identical"]}
         ok = ok and row["bit_identical"] and row["gate_epilogue_bit_identical"]
         results.append(row)
-        print("sdpa T %5d KL %5d window %3d capacity %5d keys from %4d: %s, gated epilogue %s%s" % (
-            t, kl, window, capacity or kl, origin, "bit-identical" if row["bit_identical"] else "DIFFERS",
+        print("sdpa%s T %5d KL %5d window %3d capacity %5d keys from %4d: %s, gated epilogue %s%s" % (
+            " (mlx2)" if attention2 else "", t, kl, window, capacity or kl, origin, "bit-identical" if row["bit_identical"] else "DIFFERS",
             "bit-identical" if row["gate_epilogue_bit_identical"] else "DIFFERS",
             "" if row["bit_identical"] else " (%d of %d words, max abs %.3g)" % (row["differing_words"], row["words"], row["max_abs"])), flush=True)
     return ok
@@ -210,6 +212,9 @@ def check(args):
         workdir = pathlib.Path(tmp)
         if args.ops in ("all", "attention"):
             ok = check_attention(args, rng, workdir, results) and ok
+            # c2-prefill-mlx: the rescheduled attention (mk_mlx2_attention*) on the same cases.
+            if "mlx2" in args.variants.split(","):
+                ok = check_attention(args, rng, workdir, results, attention2=True) and ok
         for name, k, n, base in (LINEARS if args.ops in ("all", "linear") else []):
             if n > args.max_out:
                 continue
@@ -267,6 +272,27 @@ def check(args):
                     results.append(row)
                     print("%-18s %5d->%-6d M %5d random scales %-4s split_k %-2s %s" % (
                         name, k, n, m, dname, row["split_k"], "bit-identical" if row["bit_identical"] else "DIFFERS"), flush=True)
+        # c2-prefill-mlx: the fused GLU kernel, and the mlx2 kernels' float16 / float32
+        # scale storage, when the mlx2 variant is checked.
+        if "mlx2" in args.variants.split(",") and args.ops in ("all", "linear"):
+            ok = check_glu(args, rng, workdir, results, batches, real_cache) and ok
+            if args.sources != "real":
+                for name, k, n, base in LINEARS:
+                    if name not in ("ffn.w2", "q/o/out_proj", "k/v_proj"):
+                        continue
+                    words, scales, biases = random_matrix(rng, n, k)
+                    x = rng.standard_normal((1000, k)).astype(np.float32)
+                    want = mlx_qmm(x, words, scales, biases)
+                    for sdtype, dname in ((1, "f16"), (0, "f32")):
+                        got, info = engine_qmm(args.binary, x, words, scales, biases, workdir, "mlx2", sdtype=sdtype)
+                        diff = got.view(np.uint32) != want.view(np.uint32)
+                        row = {"op": "quantized_matmul", "ported": True, "linear": name, "k": k, "n": n, "m": 1000, "source": "random",
+                               "variant": "mlx2", "scale_dtype": dname, "kernel": info.get("kernels"), "split_k": info.get("split_k"),
+                               "words": int(diff.size), "differing_words": int(diff.sum()), "bit_identical": bool(not diff.any())}
+                        ok = ok and row["bit_identical"]
+                        results.append(row)
+                        print("%-18s %5d->%-6d M %5d random scales %-4s mlx2 split_k %-2s %s" % (
+                            name, k, n, 1000, dname, row["split_k"], "bit-identical" if row["bit_identical"] else "DIFFERS"), flush=True)
     report = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "binary": str(args.binary), "mlx": mx.__version__,
               "device": mx.device_info().get("architecture") if hasattr(mx, "device_info") else None,
               "all_bit_identical": ok, "cases": results}
@@ -274,6 +300,77 @@ def check(args):
     out.write_text(json.dumps(report, indent=1))
     print("ALL BIT-IDENTICAL" if ok else "DIFFERENCES FOUND", "(%d cases) -> %s" % (len(results), out))
     return 0 if ok else 1
+
+
+# ---- c2-prefill-mlx (prefill, mlx-arith tier): the fused GLU kernel (mk_mlx2_glu) ----
+
+def split_k(m, n, k, group=GROUP):
+    """MLX qmm_splitk's partitions (exec.mlxSplitK); 1 = unsplit affine_qmm_t."""
+    split = max(1, 512 // (((n + 31) // 32) * ((m + 31) // 32)))
+    align = max(group, 32)
+    split = min(split, k // align)
+    while split > 1 and k % (split * align) != 0:
+        split -= 1
+    return max(split, 1)
+
+
+def engine_glu(binary, x, gate, up, workdir, repeats=0):
+    """`nano mlx-op glu`: mk_mlx2_glu and the sequence it replaces (port qmm twice, mk_binary).
+    Returns the gate and up products (to compare with stock MLX) and the JSON line, whose
+    fused_equals_sequence says whether the fused output equals the sequence's bit for bit."""
+    m, k = x.shape
+    n = gate[0].shape[0]
+    blob = bytearray(b"\0\0")
+    for words, _, _ in (gate, up):
+        blob += words.astype("<u4").tobytes()
+    for _, s, b in (gate, up):
+        for a in (s, b):
+            h = (a.astype(np.float32).view(np.uint32) >> 16).astype("<u2")
+            assert np.array_equal((h.astype(np.uint32) << 16).view(np.float32), a), "scales/biases must be bf16"
+            blob += h.tobytes()
+    (workdir / "glu.bin").write_bytes(bytes(blob))
+    x.astype("<f4").tofile(workdir / "x.f32")
+    out = workdir / "glu.f32"
+    cmd = [str(binary), "mlx-op", "glu", "--m", str(m), "--k", str(k), "--n", str(n), "--group", str(GROUP),
+           "--weights", str(workdir / "glu.bin"), "--x", str(workdir / "x.f32"), "--out", str(out), "--repeats", str(repeats)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise SystemExit("nano mlx-op failed (%s):\n%s" % (" ".join(cmd), proc.stderr[-3000:]))
+    res = [np.fromfile(str(out) + suffix, dtype="<f4").reshape(m, n) for suffix in (".gate", ".up")]
+    for suffix in ("", ".gate", ".up"):
+        pathlib.Path(str(out) + suffix).unlink()
+    return res[0], res[1], json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def check_glu(args, rng, workdir, results, batches, real_cache):
+    """Fused GLU cases: the gate and up products bit-identical to stock MLX's, and the fused
+    output bit-identical to the port's sequence (mk_binary on those same products)."""
+    ok = True
+    k, n = 2048, 7680
+    for source in args.sources.split(","):
+        if source == "real":
+            for base in ("layers.0.feed_forward.w1", "layers.0.feed_forward.w3"):
+                if base not in real_cache:
+                    real_cache[base] = real_matrix(base)
+            gate, up = real_cache["layers.0.feed_forward.w1"], real_cache["layers.0.feed_forward.w3"]
+        else:
+            gate, up = random_matrix(rng, n, k), random_matrix(rng, n, k)
+        for m in batches:
+            if n * m > args.max_elems or m < vector_limit(k, n) or split_k(m, n, k) != 1:
+                continue
+            x = rng.standard_normal((m, k)).astype(np.float32) * (0.5 if source == "real" else 1.0)
+            g, u, info = engine_glu(args.binary, x, gate, up, workdir)
+            same = [bool(np.array_equal(got.view(np.uint32), mlx_qmm(x, *wsb).view(np.uint32))) for got, wsb in ((g, gate), (u, up))]
+            row = {"op": "glu (quantized_matmul x2 + silu product)", "ported": True, "k": k, "n": n, "m": m, "source": source,
+                   "variant": "mlx2", "kernel": info["kernels"], "gate_bit_identical": same[0], "up_bit_identical": same[1],
+                   "fused_equals_sequence": info["fused_equals_sequence"],
+                   "bit_identical": same[0] and same[1] and info["fused_equals_sequence"]}
+            ok = ok and row["bit_identical"]
+            results.append(row)
+            print("%-18s %5d->%-6d M %5d %-6s mlx2     gate %s, up %s, fused GLU %s" % (
+                "ffn glu (w1, w3)", k, n, m, source, "bit-identical" if same[0] else "DIFFERS",
+                "bit-identical" if same[1] else "DIFFERS", "equals the sequence" if info["fused_equals_sequence"] else "DIFFERS"), flush=True)
+    return ok
 
 
 # ---------------------------------------------------------------- timing
@@ -436,6 +533,24 @@ def speed(args):
                 print("%-18s %5d->%-6d M %5d split %-2d engine %8.1f us  MLX %8.1f us  ratio %.2f  %s" % (
                     name, k, n, m, info["split_k"], info["us_per_op"], mlx_us, info["us_per_op"] / max(mlx_us, 1e-9),
                     "bit-identical" if same else "DIFFERS"), flush=True)
+        # c2-prefill-mlx: fused GLU against stock's silu(w1 x) * (w3 x) (two qmm, compiled silu, multiply).
+        if args.variant == "mlx2" and args.ops != "attention":
+            import mlx.nn as nn
+            gate, up = random_matrix(rng, 7680, 2048), random_matrix(rng, 7680, 2048)
+            G, U = [tuple(mx.array(a) for a in wsb) for wsb in (gate, up)]
+            for m in [int(b) for b in args.batches.split(",")]:
+                if m < vector_limit(2048, 7680) or split_k(m, 7680, 2048) != 1:
+                    continue
+                x = rng.standard_normal((m, 2048)).astype(np.float32)
+                _, _, info = engine_glu(args.binary, x, gate, up, workdir, args.repeats)
+                q = lambda v, wsb: mx.quantized_matmul(v, *wsb, transpose=True, group_size=GROUP, bits=4)
+                sec, dep = chain_time(mx, lambda v: nn.silu(q(v, G)) * q(v, U), mx.array(x), args.repeats)
+                mlx_us = 1e6 * max(sec - dep, 0)
+                rows.append({"linear": "ffn glu (w1, w3, silu product)", "k": 2048, "n": 7680, "m": m, "engine_us": info["us_per_op"],
+                             "mlx_us": mlx_us, "split_k": 1, "bit_identical": info["fused_equals_sequence"]})
+                print("%-18s %5d->%-6d M %5d split 1  engine %8.1f us  MLX %8.1f us  ratio %.2f  %s" % (
+                    "ffn glu", 2048, 7680, m, info["us_per_op"], mlx_us, info["us_per_op"] / max(mlx_us, 1e-9),
+                    "fused equals sequence" if info["fused_equals_sequence"] else "DIFFERS"), flush=True)
         for t, kl, window in ((1024, 1024, 0), (1024, 1024, 256), (2048, 2048, 0), (2048, 4096, 0), (2048, 2048, 256), (2048, 4096, 256)):
             if args.ops == "linear":
                 break
@@ -443,7 +558,8 @@ def speed(args):
             k = rng.standard_normal((kl, 4 * 128)).astype(np.float32)
             v = rng.standard_normal((kl, 4 * 128)).astype(np.float32)
             gate = rng.standard_normal((t, 16)).astype(np.float32)
-            got, info = engine_attention(args.binary, q, k, v, gate, t, kl, window, 0, workdir, args.repeats)
+            got, info = engine_attention(args.binary, q, k, v, gate, t, kl, window, 0, workdir, args.repeats,
+                                         attention2=args.variant == "mlx2")
             origin = rotating_origin(t, kl, window) if window else 0
             same = bool(np.array_equal(got.view(np.uint32), mlx_sdpa(q, k, v, t, kl, window, origin=origin).view(np.uint32)))
             K = mx.array(k[origin:].reshape(kl - origin, 4, 128)).transpose(1, 0, 2)[None]

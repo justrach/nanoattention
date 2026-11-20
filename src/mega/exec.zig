@@ -391,7 +391,11 @@ pub const Engine = struct {
                 p.n = l.x.width;
                 p.m = l.out.width;
                 const qb = quantBuffers(w);
-                if (rows > 1 and self.splitk != null and mlxApplies(w, p.n, p.m, rows)) {
+                // c2-prefill-mlx (knob mlx_qmm2): the products stock MLX runs unsplit, restructured.
+                if (rows > 1 and self.knobs.mlx_qmm2 and self.splitk != null and mlxApplies(w, p.n, p.m, rows) and mlx2Applies(&p, 64)) {
+                    try mlx2Linear(self.ctx, qb, self.arena, &p);
+                    self.prepWritten(l.out);
+                } else if (rows > 1 and self.splitk != null and mlxApplies(w, p.n, p.m, rows)) {
                     // prefill-mlx (mlx-arith tier): MLX's arithmetic, not the reference's.
                     _ = try mlxLinear(self.ctx, qb, self.arena, self.splitk.?, &p);
                     self.prepWritten(l.out);
@@ -550,6 +554,11 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             {
                 // prefill-mlx: gate, up and the silu product as MLX runs them, three operations
                 // (with mlx_multi gate and up in one launch when neither is split).
+                // c2-prefill-mlx (knob mlx_glu2): gate, up and the product in one launch.
+                if (self.knobs.mlx_glu2 and try encodeMlx2Glu(self, l0, l1, b, row0, rows)) {
+                    self.prepWritten(b.out);
+                    return;
+                }
                 var done: [4]bool = @splat(false);
                 if (self.knobs.mlx_multi) try encodeMlxMulti(self, ops[i..][0..2], &done, row0, rows);
                 for (0..3) |k| if (k == 2 or !done[k]) try self.encode(ops[i + k], row0, rows);
@@ -637,7 +646,9 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             if (rows > 1 and self.knobs.conv_rows) {
                 // prefill-mlx (exact): store every row's product, then convolve all rows in parallel.
                 try gpu.dispatch(self.ctx, "mk_gated_conv_store", &.{ self.caches[cv.src].?, self.arena }, &p, @as(usize, rows) * p.n, 256);
-                try gpu.dispatch(self.ctx, "mk_gated_conv_rows", &.{ self.caches[cv.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+                // c2-prefill-mlx (knob conv_rows2): the same arithmetic without a modulo per tap.
+                const rows_kernel: [:0]const u8 = if (self.knobs.conv_rows2) "mk_gated_conv_rows2" else "mk_gated_conv_rows";
+                try gpu.dispatch(self.ctx, rows_kernel, &.{ self.caches[cv.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
                 return;
             }
             try gpu.dispatch(self.ctx, "mk_gated_conv", &.{ self.caches[cv.src].?, w.buffer, self.arena }, &p, p.n, 64);
@@ -867,6 +878,11 @@ fn encodeMlxAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@
     p.window = a.window;
     p.scale = a.scale;
     p.capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+    // c2-prefill-mlx (knob mlx_attention2): the same arithmetic, rescheduled.
+    if (self.knobs.mlx_attention2 and mlx2AttentionApplies(&p)) {
+        try mlx2Attention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, &p, gate != null);
+        return true;
+    }
     try mlxAttention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, &p, gate != null);
     return true;
 }
@@ -904,6 +920,14 @@ fn encodeMlxMulti(self: *Engine, lin: []const ir.Op, done: *[4]bool, row0: u32, 
         tgs += @as(usize, (l.out.width + 31) / 32) * ((rows + 31) / 32);
     }
     if (x.count < 2) return;
+    // c2-prefill-mlx (knob mlx_qmm2): the same products (each unsplit, checked above) through mk_mlx2_multi.
+    if (self.knobs.mlx_qmm2 and x.p.n % 64 == 0 and x.p.x % 2 == 0 and x.p.xs % 2 == 0) {
+        var tgs2: usize = 0;
+        for (x.mat[0..x.count]) |mt| tgs2 += @as(usize, (mt.m + mlx2_bn - 1) / mlx2_bn) * ((rows + mlx2_bm - 1) / mlx2_bm);
+        try gpu.dispatch(self.ctx, mlx2Name("multi", x.mat[0].sdtype, x.p.group), &.{ buf.?, self.arena }, &x, tgs2 * 64, 64);
+        for (pick[0..x.count]) |k| done[k] = true;
+        return;
+    }
     const names = [3][3][:0]const u8{
         .{ "mk_mlx_qmm_multi_f32_g32", "mk_mlx_qmm_multi_f32_g64", "mk_mlx_qmm_multi_f32_g128" },
         .{ "mk_mlx_qmm_multi_f16_g32", "mk_mlx_qmm_multi_f16_g64", "mk_mlx_qmm_multi_f16_g128" },
@@ -983,6 +1007,100 @@ pub fn mlxLinear(ctx: metal.Context, qb: [3]metal.Buffer, arena: metal.Buffer, s
         try gpu.dispatch(ctx, names[dt][g], &.{ qb[0], qb[1], qb[2], arena, splitk }, p, tgs * 128, 128);
     }
     return split;
+}
+
+// ---- c2-prefill-mlx (prefill, mlx-arith tier) ----
+
+/// mk_mlx2_* tile (mlx2.metal): 64 tokens x 16 outputs per matrix, 64 threads.
+pub const mlx2_bm: u32 = 64;
+pub const mlx2_bn: u32 = 16;
+
+/// The restructured kernels reproduce stock's unsplit affine_qmm_t only: MLX's split
+/// for this product must be 1 (partitions are part of its bits). They also need K a
+/// multiple of their K block and x fragments 8-byte aligned (even word offset and
+/// row stride). p: rows, n = K, m = N, group, x/xs.
+pub fn mlx2Applies(p: *const gpu.Params, kblock: u32) bool {
+    return mlxSplitK(p.rows, p.m, p.n, p.group) == 1 and p.n % kblock == 0 and p.x % 2 == 0 and p.xs % 2 == 0 and
+        (p.group == 32 or p.group == 64 or p.group == 128) and p.sdtype <= 2;
+}
+
+fn mlx2Name(comptime kind: []const u8, sdtype: u32, group: u32) [:0]const u8 {
+    const names = comptime blk: {
+        var n: [3][3][:0]const u8 = undefined;
+        for (.{ "f32", "f16", "bf16" }, 0..) |dt, i| for (.{ 32, 64, 128 }, 0..) |g, j| {
+            n[i][j] = std.fmt.comptimePrint("mk_mlx2_{s}_{s}_g{d}", .{ kind, dt, g });
+        };
+        break :blk n;
+    };
+    const g: usize = switch (group) {
+        32 => 0,
+        64 => 1,
+        else => 2,
+    };
+    return names[@min(sdtype, 2)][g];
+}
+
+/// knob mlx_qmm2: one product stock MLX runs unsplit (mlxApplies and mlx2Applies(p, 64)),
+/// through mk_mlx2_qmm; p as for mlxLinear.
+pub fn mlx2Linear(ctx: metal.Context, qb: [3]metal.Buffer, arena: metal.Buffer, p: *const gpu.Params) !void {
+    if (p.sdtype != p.bdtype or !mlx2Applies(p, 64)) return error.NotPorted;
+    const tgs = @as(usize, (p.m + mlx2_bn - 1) / mlx2_bn) * ((p.rows + mlx2_bm - 1) / mlx2_bm);
+    try gpu.dispatch(ctx, mlx2Name("qmm", p.sdtype, p.group), &.{ qb[0], qb[1], qb[2], arena }, p, tgs * 64, 64);
+}
+
+/// knob mlx_glu2: gate l0, up l1 and their product b (a GLU step of plan.zig) in one
+/// mk_mlx2_glu launch, when both products are ones stock MLX runs unsplit with the
+/// same weight buffer (codes, scales and biases), group and scale dtype. False when
+/// it does not apply (the caller then runs them as before).
+pub fn mlx2Glu(ctx: metal.Context, wbuf: metal.Buffer, arena: metal.Buffer, x: *const gpu.ParamsX) !void {
+    if (x.count != 2 or x.mat[0].m != x.mat[1].m or x.mat[0].sdtype != x.mat[1].sdtype or x.mat[0].sdtype != x.mat[0].bdtype or
+        x.mat[1].sdtype != x.mat[1].bdtype) return error.NotPorted;
+    var q = x.p;
+    q.m = x.mat[0].m;
+    q.sdtype = x.mat[0].sdtype;
+    if (!mlx2Applies(&q, 32)) return error.NotPorted;
+    const tgs = @as(usize, (q.m + mlx2_bn - 1) / mlx2_bn) * ((q.rows + mlx2_bm - 1) / mlx2_bm);
+    try gpu.dispatch(ctx, mlx2Name("glu", q.sdtype, q.group), &.{ wbuf, arena }, x, tgs * 64, 64);
+}
+
+fn encodeMlx2Glu(self: *Engine, l0: @FieldType(ir.Op, "linear"), l1: @FieldType(ir.Op, "linear"), b: @FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
+    const w0 = self.bound[l0.w];
+    const w1 = self.bound[l1.w];
+    for ([_]weights.Weight{ w0, w1 }) |w| {
+        if (@intFromPtr(w.buffer.handle) != @intFromPtr(w0.buffer.handle) or
+            @intFromPtr(w.quant.?.scales.handle) != @intFromPtr(w0.buffer.handle) or
+            @intFromPtr(w.quant.?.biases.handle) != @intFromPtr(w0.buffer.handle)) return false;
+    }
+    if (w0.quant.?.group_size != w1.quant.?.group_size) return false;
+    var x: gpu.ParamsX = .{ .p = .{ .rows = rows, .row0 = row0, .pos = self.position }, .count = 2, .act_a = @backingInt(b.a_act), .act_b = @backingInt(b.b_act), .kind = @backingInt(b.kind) };
+    const xin = self.words(l0.x);
+    const o = self.words(b.out);
+    x.p.x = xin.off;
+    x.p.xs = xin.stride;
+    x.p.y = o.off;
+    x.p.ys = o.stride;
+    x.p.n = l0.x.width;
+    x.p.group = w0.quant.?.group_size;
+    x.mat[0] = mat(self, w0, l0.out);
+    x.mat[1] = mat(self, w1, l1.out);
+    var q = x.p;
+    q.m = x.mat[0].m;
+    q.sdtype = x.mat[0].sdtype;
+    if (x.mat[0].m != x.mat[1].m or x.mat[0].sdtype != x.mat[1].sdtype or x.mat[0].sdtype != x.mat[0].bdtype or !mlx2Applies(&q, 32)) return false;
+    try mlx2Glu(self.ctx, w0.buffer, self.arena, &x);
+    return true;
+}
+
+/// knob mlx_attention2: the query fragments are read as float2 (even offset and row stride).
+pub fn mlx2AttentionApplies(p: *const gpu.Params) bool {
+    return p.x % 2 == 0 and p.xs % 2 == 0;
+}
+
+/// mk_mlx2_attention[_gated]: mlxAttention's arithmetic and parameters, rescheduled.
+pub fn mlx2Attention(ctx: metal.Context, arena: metal.Buffer, keys: metal.Buffer, values: metal.Buffer, p: *const gpu.Params, gated: bool) !void {
+    if (!mlx2AttentionApplies(p)) return error.NotPorted;
+    const tgs = @as(usize, (p.rows + 31) / 32) * p.heads;
+    try gpu.dispatch(ctx, if (gated) "mk_mlx2_attention_gated" else "mk_mlx2_attention", &.{ arena, keys, values }, p, tgs * 128, 128);
 }
 
 /// Slices per row of the two-stage argmax.

@@ -80,7 +80,9 @@ comptime {
     if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 4 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
 }
 
-pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal");
+pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+    // c2-prefill-mlx (prefill, mlx-arith tier)
+    "\n" ++ @embedFile("mlx2.metal");
 
 pub fn open() !metal.Context {
     const handle = fm_open(source) orelse {

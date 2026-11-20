@@ -103,8 +103,12 @@ A **knob** selects among compiled-in variants at run time: `nano ... --knobs FIL
 | `mlx_linear` | bool | **mlx-arith tier**: multi-row 4-bit linears at or above MLX's vector limit through the port of MLX's `affine_qmm_t` / split K |
 | `mlx_attention` | bool | **mlx-arith tier**: attention of more than 8 rows (head dim 128) through the port of MLX's steel attention |
 | `mlx_multi` | bool | with `mlx_linear`: unsplit MLX products sharing an input in one launch |
+| `mlx_qmm2` | bool | (c2-prefill-mlx) with `mlx_linear`: the products stock MLX runs unsplit (plain and `mlx_multi`) through `mk_mlx2_qmm` / `mk_mlx2_multi` (mlx2.metal): stock's output bits in 64 x 16 tiles, x read from device memory, double-buffered dequantized weights |
+| `mlx_glu2` | bool | (c2-prefill-mlx) with `mlx_linear` and `fuse_glu`: gate, up and the GLU product in one `mk_mlx2_glu` launch, equal bit for bit to the two products then `mk_binary` |
+| `mlx_attention2` | bool | (c2-prefill-mlx) with `mlx_attention`: `mk_mlx2_attention[_gated]`, the port's arithmetic rescheduled (heaviest query blocks first, queries in registers, two barriers per key block) |
+| `conv_rows2` | bool | (c2-prefill-mlx) with `conv_rows`: `mk_gated_conv_rows2`, the same arithmetic without a 64-bit modulo per tap |
 
-None of these changes any row's arithmetic except the three `mlx_*` knobs, which replace it by stock MLX's (section 5, "Two tiers"); QD admission (below) checks that bit for bit rather than trusting it. Fusion is a planner pass (`plan.build`) over structural patterns (op kinds, views, activations, weight formats and liveness of intermediates via `plan.deadAfter`), so it applies to any program with the pattern, not to LFM3 by name.
+None of these changes any row's arithmetic except the `mlx_*` knobs, which replace it by stock MLX's (section 5, "Two tiers"); QD admission (below) checks that bit for bit rather than trusting it. Fusion is a planner pass (`plan.build`) over structural patterns (op kinds, views, activations, weight formats and liveness of intermediates via `plan.deadAfter`), so it applies to any program with the pattern, not to LFM3 by name.
 
 ### Adding a variant
 

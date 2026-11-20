@@ -16,5 +16,9 @@
  "mlx_linear": true,
  "mlx_attention": true,
  "mlx_multi": true,
- "head_trim": true
+ "head_trim": true,
+ "mlx_qmm2": true,
+ "mlx_glu2": true,
+ "mlx_attention2": true,
+ "conv_rows2": true
 }
