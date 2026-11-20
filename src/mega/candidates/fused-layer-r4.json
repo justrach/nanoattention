@@ -1,0 +1,4 @@
+{"name": "fused-layer-r4", "parent": "fused-layer", "family": "fused-layer",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true, "decode_rows": 4},
+ "hypothesis": "Mutation of fused-layer: 4 output rows per SIMD group in single-row forwards instead of 2, so each lane's 16-input segment (loaded and prescaled once) serves 4 weight rows: half the activation loads and half the SIMD groups. Decode is weight-bandwidth bound, so expect a small gain (a few percent) at most.",
+ "expected": {"decode": 3.0}}

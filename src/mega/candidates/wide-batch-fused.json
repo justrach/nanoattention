@@ -1,0 +1,4 @@
+{"name": "wide-batch-fused", "parent": "wide-batch", "family": "wide-batch",
+ "knobs": {"batch": 256, "prefill_rows": 4, "prefill_tokens": 4, "fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true},
+ "hypothesis": "Mutation of wide-batch: add every fusion. In prefill the fused GLU reads the normed input once for both gate and up matrices and never writes the two 7680-wide intermediates; the gated conv fusion walks batch rows serially per channel, which may lose parallelism at 256 rows. Expect a modest prefill gain on balance.",
+ "expected": {"prefill": 5.0}}

@@ -205,6 +205,35 @@ that every length has been benchmarked or quality-validated.
 See [16K/32K timings and the executed coding/cache trial](benchmarks/larger-context-sessions.md),
 including initial-prefill latency, incomplete responses, and verification limits.
 
+## The megakernel and LFM3 (`nano`)
+
+`zig build` also produces **`nano`**, a second executable built on a model-agnostic core (`src/mega/`). A model is described as a program of generic operations over declared state (activations, append-only and ring KV, short conv windows); a per-architecture front end emits the program from `config.json`, and nothing below the front end knows which model it runs. The first model on it is [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) (24 layers: 13 gated short convolutions, 6 full-attention and 5 sliding-attention), from its official 4-bit MLX export. `nano` has `inspect`, `generate`, `eval`, `bench` and `session`; `nano session` speaks the same JSONL protocol as `flint session`.
+
+Every performance choice is a run-time knob. With no knobs, `nano` runs the plain reference executor (one dispatch per operation), which is what everything else is checked against. Two presets select the tuned paths:
+
+```sh
+./zig-out/bin/nano session /path/to/lfm3-1.7b-mlx-4bit --context 4608 --knobs src/mega/presets/exact.json
+./zig-out/bin/nano session /path/to/lfm3-1.7b-mlx-4bit --context 4608 --knobs src/mega/presets/mlx-prefill.json
+```
+
+- `exact.json`: every kernel bit-identical to the reference executor, for decode and for batched prompt ingestion.
+- `mlx-prefill.json`: decode as above; prompt ingestion through ports of stock MLX's batched quantized matmul and attention. Each ported kernel is bit-identical to the stock MLX operation on the same inputs (`tools/nano_mlx_ops.py check`), so batched ingestion is no longer bit-identical to token-at-a-time decoding, exactly as in MLX.
+
+Same M3 Ultra, same 4-bit checkpoint, each engine in its own process under one lock, interleaved, three rounds, medians; 256 decode tokens after an actual prompt of that length:
+
+| Prompt tokens | | `exact` | `mlx-prefill` | Stock MLX FP32 | Stock MLX BF16 |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 64 | decode tok/s | **240.0** | **240.8** | 164.5 | 169.1 |
+| 1,024 | decode tok/s | **234.0** | **235.9** | 162.2 | 166.3 |
+| 4,096 | decode tok/s | **223.8** | **225.3** | 162.9 | 166.6 |
+| 64 | prefill tok/s | 1,203 | **3,458** | 2,454 | 2,621 |
+| 1,024 | prefill tok/s | 1,275 | 4,787 | 4,563 | **5,308** |
+| 4,096 | prefill tok/s | 990 | 4,748 | 4,587 | **5,398** |
+
+Decode is ahead of stock MLX at every length. Exact prompt ingestion is a quarter of stock MLX's; with MLX's own arithmetic it passes stock FP32 and stays 10 to 12% behind stock BF16 at the longer lengths, which would need a BF16 activation mode. The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
+
+The speed came from a quality-diversity search over exact candidates ([method](docs/QD.md), [archive](benchmarks/lfm3-qd/), [decode](benchmarks/lfm3-decode-search.md), [prefill](benchmarks/lfm3-prefill-search.md)). See also [the megakernel's design and how to add a model](docs/MEGAKERNEL.md), [the model as implemented](docs/LFM3.md), [what stock MLX does on prefill](docs/MLX-PREFILL.md), and [the first measurements](benchmarks/lfm3-megakernel.md). Limits: one sequence, greedy decoding, float32 activations, no rewind or prefix cache in `nano session` yet, and Flint itself is not ported to the megakernel.
+
 ## Execution architecture
 
 - `src/model.zig`, `weights.zig`, `safetensors.zig`: validated model metadata, mmap-backed shared checkpoints, expert descriptors, bounded sliding/full KV caches, and eager scheduling.

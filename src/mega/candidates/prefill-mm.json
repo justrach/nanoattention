@@ -1,0 +1,6 @@
+{"name": "prefill-mm", "parent": "split-attn", "family": "prefill-mm",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 1024, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true},
+ "hypothesis": "The exact matrix-matrix linear (mk_q4_prep + mk_mm*_q4_r2_t8_h): each (token, 16-input segment)'s reference xsum and prescaled inputs are computed once and stored, and a SIMD group unpacks 2 rows' codes per segment once (as exact half) and applies them to 8 tokens, keeping every output's reference expression tree. Profile: linears are ~92% of prefill GPU time and ran at ~1 TMAC/s because every SIMD group re-loaded and re-prescaled its tokens' inputs. On split-attn's decode knobs with 1,024-token forwards. Screen at 1,024 tokens (prefill-mlx screen 1, 2 rounds): 1,144 vs wide-batch-fused 682 tok/s. Expect +60% prefill at 1,024 and 4,096, less at 64 (one 64-row forward).",
+ "expected": {"prefill": 50.0}}

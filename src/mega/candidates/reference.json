@@ -1,0 +1,3 @@
+{"name": "reference", "family": "per-op", "knobs": {},
+ "hypothesis": "The reference executor itself: one dispatch per op, no fusion, default tiles, prefill batch 64. Seeds the archive; everything else is measured against it.",
+ "expected": {}}

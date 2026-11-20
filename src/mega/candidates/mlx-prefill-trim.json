@@ -1,0 +1,7 @@
+{"name": "mlx-prefill-trim", "parent": "mlx-prefill-multi", "family": "mlx-multi",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 2048, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true, "conv_rows": true,
+           "mlx_linear": true, "mlx_attention": true, "mlx_multi": true, "head_trim": true},
+ "hypothesis": "mlx-arith tier. mlx-prefill-multi plus head_trim: rows without logits stop after layer 23's conv store, as stock MLX's chunked prefill does (its lazy graph evaluates only the caches, so layer 23's conv output, out_proj and feed-forward never run for chunk tokens). The last row's tail then runs with one row, below MLX's vector limit, on the exact kernels (stock MLX runs its last token alone too, through qmv). Screen at 1,024: 4,821 vs 4,655 (+3.6%). Expect +3.5% prefill at every length.",
+ "expected": {"prefill": 3.5}}

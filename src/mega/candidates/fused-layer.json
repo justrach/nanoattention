@@ -1,0 +1,3 @@
+{"name": "fused-layer", "family": "fused-layer", "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true},
+ "hypothesis": "Every fusion the planner has: q/k/v/gate projections in one launch, GLU, sandwich norms, the gated conv chain (mul, store, conv, mul) in one launch, attention with the gate epilogue. About 40% fewer dispatches per decode token than the reference.",
+ "expected": {"decode": 10.0}}

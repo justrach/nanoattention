@@ -1,0 +1,3 @@
+{"name": "fused-mlp", "family": "fused-mlp", "knobs": {"fuse_glu": true, "fuse_norms": true},
+ "hypothesis": "Gate and up projections in one launch with the SwiGLU product as epilogue (the 2 x 7680-wide intermediates never stored), and post-norm + residual add + next pre-norm in one launch: 4 fewer dispatches and 2 fewer intermediate round trips per layer. Expect a few percent on decode, where launches and barriers dominate.",
+ "expected": {"decode": 5.0}}

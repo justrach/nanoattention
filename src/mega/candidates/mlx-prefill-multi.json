@@ -1,0 +1,7 @@
+{"name": "mlx-prefill-multi", "parent": "mlx-prefill", "family": "mlx-multi",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 2048, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true, "conv_rows": true,
+           "mlx_linear": true, "mlx_attention": true, "mlx_multi": true},
+ "hypothesis": "mlx-arith tier. mlx-prefill plus mlx_multi: the unsplit MLX-arithmetic products that share an input (q/k/v projections; w1 and w3) in one launch (mk_mlx_qmm_multi), each tile exactly mk_mlx_qmm_t's, so the outputs keep stock MLX's bits; only launches and the barriers between them go (stock MLX overlaps such independent kernels too). Profile at 1,024 (after the dtype-specialised qmm): qmm 205 of 221.5 ms GPU; per-launch tail and barrier cost of the 46 separate launches is ~1-2%. Screens: +1.0% at 1,024, +0.4% at 4,096, +1.4% at 64 over mlx-prefill on the same binary. Expect +1% prefill.",
+ "expected": {"prefill": 1.0}}

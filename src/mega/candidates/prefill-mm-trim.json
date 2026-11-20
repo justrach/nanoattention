@@ -1,0 +1,7 @@
+{"name": "prefill-mm-trim", "parent": "prefill-mm", "family": "prefill-mm",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 1024, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true,
+           "conv_rows": true, "head_trim": true},
+ "hypothesis": "Exact tier. prefill-mm plus two exact schedule changes. (1) conv_rows: multi-row forwards run the fused gated conv as two launches (mk_gated_conv_store writes every row's B*x into the ring, mk_gated_conv_rows convolves every (row, channel) in parallel with mk_gated_conv's tap order) instead of one thread per channel walking all rows serially; screen 4: +3% at 1,024 (1,173 vs 1,136). (2) head_trim: rows without logits stop after the program's last persistent store (LFM3: layer 23's conv store), so layer 23's conv output, out_proj and feed-forward (~3.5% of the linear MACs per prompt token) run for the last row only; stock MLX's chunked prefill skips the same ops because it evaluates only cache state. Screen: +3.3% at 1,024 (1,282 vs 1,241). Every row that runs keeps its reference expression tree; logits sha equal to the pin on short/window/long. Expect +6% prefill at 1,024 and 4,096, less at 64.",
+ "expected": {"prefill": 6.0}}

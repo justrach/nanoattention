@@ -1,0 +1,7 @@
+{"name": "mlx-prefill", "parent": "prefill-mm", "family": "mlx-prefill",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1,
+           "batch": 2048, "prefill_mm": true, "mm_rows": 2, "mm_tokens": 8, "mm_half": true, "conv_rows": true,
+           "mlx_linear": true, "mlx_attention": true},
+ "hypothesis": "mlx-arith tier. prefill-mm's knobs plus conv_rows, with every multi-row affine 4-bit linear at or above MLX's vector limit run by the port of MLX's affine_qmm_t / qmm_t_splitk (mk_mlx_qmm_t*, bit-identical to float32 mx.quantized_matmul at the same batch) and multi-row attention by the port of MLX's steel_attention (mk_mlx_attention*, bit-identical to mx.fast.scaled_dot_product_attention), in forwards of 2,048 rows (stock mlx_vlm's prefill chunk). Decode is unchanged (split-attn's exact kernels). Profile of prefill-mm: the exact linears are ~90% of GPU time at ~1.1 TMAC/s; MLX's 32x32x32 simdgroup-matrix tiles dequantize each weight block once per 32 tokens. Screens (prefill-mlx screen 5): 4,055 tok/s at 1,024 and 4,075 at 4,096 vs prefill-mm 1,134 / 884. Expect about +250% prefill at 1,024 and 4,096 and +150% at 64 over prefill-mm.",
+ "expected": {"prefill": 150.0}}

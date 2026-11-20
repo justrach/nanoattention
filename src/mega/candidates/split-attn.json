@@ -1,0 +1,5 @@
+{"name": "split-attn", "parent": "fused-layer", "family": "split-attn",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1},
+ "hypothesis": "Profile (fused-layer, 4,096-token prompt): attention is 10.8 of ~15 ms per decode token, because each head's 8-SIMD online softmax walks 512 positions serially at ~3.5 us a step. Split it: a parallel launch computes every position's q.k with mk_attention's lane ownership, fma order and simd_sum; the chain then reproduces each SIMD's recurrence over the stored scores in the same order, with the prefix max, f and es computed 32 steps at a time (max is exact in any association) and value loads pipelined. Plus one launch for q/k norms, ropes and K/V stores (-5 dispatches per attention layer) and a two-stage argmax. Expect decode at 4,096 to rise from ~65 to above 200 tok/s, at 1,024 from ~128 to ~230, and ~+15% at 64.",
+ "expected": {"decode": 50.0}}

@@ -1,6 +1,6 @@
 const std = @import("std");
-const metal = @import("metal.zig");
-const st = @import("safetensors.zig");
+pub const metal = @import("metal.zig");
+pub const st = @import("safetensors.zig");
 
 pub const Quant = struct {
     scales: metal.Buffer,

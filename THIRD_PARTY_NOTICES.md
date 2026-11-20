@@ -43,4 +43,21 @@ iteration order. Explicit expert-weight rounding preserves a materialization
 boundary from MLX's separate multiply and reduction operations; it does not
 change model weights or expert selection semantics.
 
+## MLX batched quantized matrix multiply and steel attention (megakernel)
+
+The megakernel's `mlx-arith` prefill kernels in `src/mega/mlx.metal` are ports of
+MLX v0.32.4's float32 batched kernels: `affine_qmm_t`, `affine_qmm_t_splitk`,
+`QuantizedBlockLoader` and `dequantize` from
+`mlx/backend/metal/kernels/quantized.h`, `BlockLoader` and `BlockMMA` from
+`steel/gemm/{loader.h, mma.h}`, the split-K accumulation of
+`steel/gemm/kernels/steel_gemm_splitk.h`, and the `attention` kernel of
+`steel/attn/kernels/steel_attention.h` with `steel/attn/{loader.h, mma.h}`. The
+host-side choices in `src/mega/exec.zig` (`mlxVectorLimit`, `mlxSplitK`) follow
+`mlx/backend/metal/quantized.cpp` (`get_qmv_batch_limit`, `qmm_splitk`). The
+tiles, operand order and accumulation order are MLX's, so that the outputs
+equal stock MLX's bit for bit (`tools/nano_mlx_ops.py` checks this against an
+installed MLX); buffer addressing, the ring caches, scale-dtype specialisation,
+the multi-matrix launch and the key origin for sliding windows are this
+engine's. The Apple copyright and MIT notice are included in the shader.
+
 MLX is copyright © 2023 Apple Inc. and licensed under the MIT License; a copy is included in `licenses/mlx-MIT.txt`. This engine does not link to or execute MLX. MLX is used separately only for optional reference comparisons and benchmarks. The integer proofs do not establish IEEE754 equivalence of MLX's or this implementation's reductions; unchanged numerical checks remain required.

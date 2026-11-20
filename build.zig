@@ -44,10 +44,35 @@ pub fn build(b: *std.Build) void {
     const speculative_bench = b.addExecutable(.{ .name = "flint-speculative-bench", .root_module = speculative_module });
     speculative_bench.step.dependOn(&proofs.step);
     b.installArtifact(speculative_bench);
+    // nano: the model-agnostic megakernel. Shares the weights/metal/safetensors
+    // files through one module so their types are identical to Flint's.
+    const shared = b.createModule(.{
+        .root_source_file = b.path("src/weights.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const nano_module = b.createModule(.{
+        .root_source_file = b.path("src/mega/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "weights", .module = shared }},
+    });
+    nano_module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = &.{ "-std=c11", "-fno-objc-arc" } });
+    nano_module.linkFramework("Foundation", .{});
+    nano_module.linkFramework("Metal", .{});
+    const nano = b.addExecutable(.{ .name = "nano", .root_module = nano_module });
+    b.installArtifact(nano);
+    const nano_tests = b.addTest(.{ .root_module = nano_module });
+    const run_nano_tests = b.addRunArtifact(nano_tests);
+    b.step("test-mega", "Run megakernel IR, front-end, state and headless Metal kernel tests").dependOn(&run_nano_tests.step);
     const tests = b.addTest(.{ .root_module = module });
     tests.step.dependOn(&proofs.step);
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run checkpoint and headless Metal kernel tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run checkpoint and headless Metal kernel tests");
+    test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_nano_tests.step);
     const parity = b.addSystemCommand(&.{"python3"});
     parity.addFileArg(b.path("tools/verify.py"));
     parity.addArtifactArg(exe);

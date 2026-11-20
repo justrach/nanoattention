@@ -1,0 +1,1059 @@
+//! Binds a Program to a checkpoint and Metal buffers, and executes forwards of
+//! T consecutive tokens as one command buffer. Model-agnostic: everything comes
+//! from the program's weight table, state table and op list.
+const std = @import("std");
+const ir = @import("ir.zig");
+const gpu = @import("gpu.zig");
+const knobs_mod = @import("knobs.zig");
+const plan = @import("plan.zig");
+const weights = @import("weights");
+const metal = weights.metal;
+const Knobs = knobs_mod.Knobs;
+
+pub const Trace = struct {
+    /// [traces][rows][width] float32, filled by forwardTraced.
+    data: []f32,
+    width: u32,
+};
+
+/// prefill objective (prefill search): which input rows `Engine.prep` holds.
+pub const PrepKey = struct { state: u32, col: u32, width: u32, row0: u32, rows: u32 };
+
+pub const Stats = struct { dispatches: u64 = 0, submissions: u64 = 0, gpu_seconds: f64 = 0 };
+
+pub const Engine = struct {
+    gpa: std.mem.Allocator,
+    program: *const ir.Program,
+    ctx: metal.Context,
+    store: *const weights.Store,
+    knobs: Knobs,
+    batch: u32,
+    context: u32,
+    /// All tokens/scratch states share one buffer; offsets in words.
+    arena: metal.Buffer,
+    offsets: []u32,
+    /// Persistent states (sequence/ring), one buffer each.
+    caches: []?metal.Buffer,
+    tables: metal.Buffer,
+    table_offsets: []u32,
+    bound: []weights.Weight,
+    /// Launch schedule from the fusion knobs; one step per op for the reference.
+    steps: []plan.Step,
+    /// Ops at index >= head_start run only on rows with logits: the program's
+    /// head_start, or earlier with knobs.head_trim (traced forwards use the program's).
+    head_start: u32,
+    position: u32 = 0,
+    failed: bool = false,
+    last: Stats = .{},
+    /// Rows [out_first, T) of the last forward have logits.
+    out_first: u32 = 0,
+    out_end: u32 = 0,
+    // prefill objective (prefill search): prepared inputs of the matrix-matrix
+    // linears (mk_q4_prep layout, prefill.metal); null unless knobs.prefill_mm.
+    prep: ?metal.Buffer = null,
+    /// Word offset of the xsum region in `prep`.
+    prep_xsum: u32 = 0,
+    /// The input rows `prep` holds now; cleared by any write that could change them.
+    prep_key: ?PrepKey = null,
+    // ---- decode search ----
+    /// Split decode attention: per-head scores of one row, `scores_stride` words per head.
+    scores: ?metal.Buffer = null,
+    scores_stride: u32 = 0,
+    /// Two-stage argmax partials: batch x argmax_groups x 3 words.
+    partials: ?metal.Buffer = null,
+    // ---- prefill-mlx ----
+    /// Split-K partial sums of the MLX-arithmetic linears; null unless knobs.mlx_linear.
+    splitk: ?metal.Buffer = null,
+
+    pub fn init(gpa: std.mem.Allocator, program: *const ir.Program, ctx: metal.Context, store: *const weights.Store, knobs: Knobs, context: u32) !Engine {
+        try knobs.validate();
+        if (context == 0 or context > program.meta.max_context) return error.InvalidContextLength;
+        const batch = @min(knobs.batch, context);
+        const n = program.states.len;
+        const offsets = try gpa.alloc(u32, n);
+        errdefer gpa.free(offsets);
+        const caches = try gpa.alloc(?metal.Buffer, n);
+        @memset(caches, null);
+        errdefer {
+            for (caches) |c| if (c) |b| b.deinit();
+            gpa.free(caches);
+        }
+        var total: usize = 0;
+        for (program.states, 0..) |s, i| {
+            offsets[i] = 0;
+            switch (s.kind) {
+                .tokens, .scratch => {
+                    offsets[i] = std.math.cast(u32, total) orelse return error.ArenaTooLarge;
+                    total += @as(usize, s.capacity(batch, context)) * s.width;
+                    total = (total + 63) / 64 * 64;
+                },
+                .sequence, .ring => {
+                    const buf = try ctx.alloc(@as(usize, s.capacity(batch, context)) * s.width);
+                    @memset(buf.floats(), 0);
+                    caches[i] = buf;
+                },
+                .position => {},
+            }
+        }
+        if (total > std.math.maxInt(u32)) return error.ArenaTooLarge;
+        const arena = try ctx.alloc(@max(total, 1));
+        errdefer arena.deinit();
+        @memset(arena.floats(), 0);
+        const table_offsets = try gpa.alloc(u32, program.tables.len);
+        errdefer gpa.free(table_offsets);
+        var table_words: usize = 0;
+        for (program.tables, 0..) |t, i| {
+            table_offsets[i] = @intCast(table_words);
+            table_words += t.len;
+        }
+        const tables = try ctx.alloc(@max(table_words, 1));
+        errdefer tables.deinit();
+        for (program.tables, 0..) |t, i| @memcpy(tables.floats()[table_offsets[i]..][0..t.len], t);
+        const bound = try gpa.alloc(weights.Weight, program.weights.len);
+        errdefer gpa.free(bound);
+        for (program.weights, 0..) |w, i| bound[i] = try store.get(w.name, w.shape);
+        const info = try gpa.alloc(plan.WeightInfo, bound.len);
+        defer gpa.free(info);
+        for (bound, info) |w, *f| {
+            const same = if (w.quant) |q| q.scales.handle == w.buffer.handle and q.biases.handle == w.buffer.handle else true;
+            f.* = .{
+                .q4 = w.tensor.shape.len == 2 and q4Fast(w, @intCast(w.tensor.shape[1])),
+                .buffer = if (same) @intFromPtr(w.buffer.handle) else 0,
+                .group = if (w.quant) |q| q.group_size else 0,
+            };
+        }
+        // prefill-mlx (knob head_trim): rows without logits stop after the last op that
+        // writes a persistent state; the plan respects both boundaries.
+        const head_start = if (knobs.head_trim) trimmedHead(program) else program.head_start;
+        var planned = program.*;
+        planned.head_start = head_start;
+        var steps = try plan.build(gpa, &planned, knobs.fusion(), info);
+        errdefer gpa.free(steps);
+        if (head_start != program.head_start) steps = try splitAcross(gpa, steps, program.head_start);
+        // prefill objective (prefill search): room for the widest q4 linear input.
+        var prep: ?metal.Buffer = null;
+        var prep_xsum: u32 = 0;
+        if (knobs.prefill_mm) {
+            var max_segs: usize = 0;
+            for (program.ops) |op| switch (op) {
+                .linear => |l| if (q4Fast(bound[l.w], l.x.width)) {
+                    max_segs = @max(max_segs, l.x.width / 16);
+                },
+                else => {},
+            };
+            const padded = (max_segs + 31) / 32 * 512;
+            prep_xsum = std.math.cast(u32, @as(usize, batch) * padded) orelse return error.ArenaTooLarge;
+            prep = try ctx.alloc(@max(@as(usize, batch) * (padded + max_segs), 1));
+        }
+        errdefer if (prep) |b| b.deinit();
+        // decode search: scores scratch for split decode attention (largest visible span x heads).
+        var scores: ?metal.Buffer = null;
+        var scores_stride: u32 = 0;
+        if (knobs.decode_attention != 0) {
+            var words_needed: usize = 0;
+            for (program.ops) |op| switch (op) {
+                .attention => |at| {
+                    const cap = program.states[at.keys].capacity(batch, context);
+                    const span = if (at.window != 0) @min(at.window, cap) else cap;
+                    scores_stride = @max(scores_stride, span);
+                    words_needed = @max(words_needed, @as(usize, at.heads));
+                },
+                else => {},
+            };
+            if (scores_stride != 0) scores = try ctx.alloc(words_needed * scores_stride);
+        }
+        errdefer if (scores) |b| b.deinit();
+        const partials: ?metal.Buffer = if (knobs.decode_argmax != 0) try ctx.alloc(@as(usize, batch) * argmax_groups * 3) else null;
+        errdefer if (partials) |b| b.deinit();
+        const splitk: ?metal.Buffer = if (knobs.mlx_linear) try ctx.alloc(mlx_splitk_words) else null;
+        errdefer if (splitk) |b| b.deinit();
+        return .{
+            .gpa = gpa,
+            .program = program,
+            .ctx = ctx,
+            .store = store,
+            .knobs = knobs,
+            .batch = batch,
+            .context = context,
+            .arena = arena,
+            .offsets = offsets,
+            .caches = caches,
+            .tables = tables,
+            .table_offsets = table_offsets,
+            .bound = bound,
+            .steps = steps,
+            .head_start = head_start,
+            .prep = prep,
+            .prep_xsum = prep_xsum,
+            .scores = scores,
+            .scores_stride = scores_stride,
+            .partials = partials,
+            .splitk = splitk,
+        };
+    }
+
+    pub fn deinit(self: *Engine) void {
+        self.arena.deinit();
+        self.tables.deinit();
+        for (self.caches) |c| if (c) |b| b.deinit();
+        self.gpa.free(self.caches);
+        self.gpa.free(self.offsets);
+        self.gpa.free(self.table_offsets);
+        self.gpa.free(self.bound);
+        self.gpa.free(self.steps);
+        if (self.prep) |b| b.deinit();
+        if (self.scores) |b| b.deinit();
+        if (self.partials) |b| b.deinit();
+        if (self.splitk) |b| b.deinit();
+    }
+
+    /// Logical reset: positions >= 0 are rewritten before any read, and conv
+    /// reads of negative positions are zeros, so stale rows are never observed.
+    pub fn reset(self: *Engine) void {
+        self.position = 0;
+        self.failed = false;
+        self.out_first = 0;
+        self.out_end = 0;
+    }
+
+    fn words(self: *const Engine, v: ir.View) struct { off: u32, stride: u32 } {
+        const s = self.program.states[v.state];
+        return .{ .off = self.offsets[v.state] + v.col, .stride = s.width };
+    }
+
+    /// Bytes of persistent state: allocated, and holding information now.
+    pub fn stateBytes(self: *const Engine, position: u32) struct { allocated: u64, valid: u64 } {
+        var allocated: u64 = 0;
+        var valid: u64 = 0;
+        for (self.program.states) |s| if (s.persistent()) {
+            allocated += @as(u64, s.capacity(self.batch, self.context)) * s.width * 4;
+            valid += @as(u64, s.validRows(self.batch, self.context, position)) * s.width * 4;
+        };
+        return .{ .allocated = allocated, .valid = valid };
+    }
+
+    /// Run tokens.len (<= batch) consecutive positions. Head ops (final norm,
+    /// vocabulary projection, argmax) run only for rows [out_first, tokens.len).
+    pub fn forward(self: *Engine, tokens: []const u32, out_first: u32) !void {
+        return self.forwardTraced(tokens, out_first, null);
+    }
+
+    pub fn forwardTraced(self: *Engine, tokens: []const u32, out_first: u32, trace: ?Trace) !void {
+        const T: u32 = @intCast(tokens.len);
+        if (self.failed) return error.EngineNeedsReset;
+        if (T == 0 or T > self.batch) return error.InvalidBatchLength;
+        if (out_first > T) return error.InvalidOutputRows;
+        if (@as(u64, self.position) + T > self.context) return error.ContextExhausted;
+        for (tokens) |t| if (t >= self.program.meta.vocab) return error.InvalidToken;
+        if (trace) |t| if (t.data.len < self.program.traces.len * @as(usize, T) * t.width) return error.TraceTooSmall;
+        errdefer self.failed = true;
+        const tok = self.words(self.program.tokens);
+        const words_ = self.arena.structs(u32);
+        for (tokens, 0..) |t, i| words_[tok.off + i * tok.stride] = t;
+        const before = self.ctx.stats();
+        var next_trace: usize = 0;
+        self.prep_key = null;
+        for (self.steps) |step| {
+            const first = step.first();
+            const head = first >= (if (trace != null) self.program.head_start else self.head_start);
+            if (head and out_first == T) break;
+            const row0: u32 = if (head) out_first else 0;
+            // prefill objective (prefill search): only consecutive linears keep the prepared input.
+            switch (step) {
+                .op => |i| if (self.program.ops[i] != .linear) {
+                    self.prep_key = null;
+                },
+                .projections, .glu => {},
+                else => self.prep_key = null,
+            }
+            switch (step) {
+                .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
+                else => try encodeFused(self, step, row0, T - row0),
+            }
+            const end = first + step.len();
+            if (trace) |t| while (next_trace < self.program.traces.len and self.program.traces[next_trace].after_op < end) : (next_trace += 1) {
+                try self.ctx.finish();
+                const v = self.program.traces[next_trace].view;
+                const w = self.words(v);
+                const floats = self.arena.floats();
+                for (0..T) |r| {
+                    const dst = t.data[(next_trace * T + r) * t.width ..][0..t.width];
+                    @memcpy(dst[0..v.width], floats[w.off + r * w.stride ..][0..v.width]);
+                }
+            };
+        }
+        try self.ctx.finish();
+        const after = self.ctx.stats();
+        self.last = .{ .dispatches = after.dispatches - before.dispatches, .submissions = after.submissions - before.submissions, .gpu_seconds = after.gpu_seconds - before.gpu_seconds };
+        self.position += T;
+        self.out_first = out_first;
+        self.out_end = T;
+    }
+
+    /// All-vocabulary logits of batch row `row` of the last forward.
+    pub fn logits(self: *const Engine, row: u32) ![]const f32 {
+        if (row < self.out_first or row >= self.out_end) return error.NoLogitsForRow;
+        const w = self.words(self.program.logits);
+        return self.arena.floats()[w.off + row * w.stride ..][0..self.program.logits.width];
+    }
+    /// GPU argmax of batch row `row`; non-finite logits are an error.
+    pub fn next(self: *const Engine, row: u32) !u32 {
+        if (row < self.out_first or row >= self.out_end) return error.NoLogitsForRow;
+        const w = self.words(self.program.next);
+        const id = self.arena.structs(u32)[w.off + row * w.stride];
+        if (id >= self.program.meta.vocab) return error.NonFiniteLogits;
+        return id;
+    }
+
+    fn quantParams(p: *gpu.Params, w: weights.Weight) void {
+        p.w = w.tensor.offset;
+        p.dtype = @backingInt(w.tensor.dtype);
+        if (w.quant) |q| {
+            p.s = q.scale_offset;
+            p.b = q.bias_offset;
+            p.sdtype = q.scale_dtype;
+            p.bdtype = q.bias_dtype;
+            p.bits = q.bits;
+            p.group = q.group_size;
+        }
+    }
+    fn quantBuffers(w: weights.Weight) [3]metal.Buffer {
+        return if (w.quant) |q| .{ w.buffer, q.scales, q.biases } else .{ w.buffer, w.buffer, w.buffer };
+    }
+
+    // ---- prefill objective (prefill search) ----
+    /// Prepare rows [row0, row0 + rows) of view `x` for the matrix-matrix
+    /// kernels (once while they stay unchanged); returns the xsum word offset.
+    fn prepare(self: *Engine, x: ir.View, row0: u32, rows: u32) !u32 {
+        const key: PrepKey = .{ .state = x.state, .col = x.col, .width = x.width, .row0 = row0, .rows = rows };
+        if (self.prep_key) |k| if (std.meta.eql(k, key)) return self.prep_xsum;
+        const v = self.words(x);
+        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position, .x = v.off, .xs = v.stride, .n = x.width, .z = self.prep_xsum };
+        try gpu.dispatch(self.ctx, "mk_q4_prep", &.{ self.arena, self.prep.? }, &p, @as(usize, rows) * (x.width / 16), 256);
+        self.prep_key = key;
+        return self.prep_xsum;
+    }
+    /// A dispatch wrote `out`: the prepared rows are stale if they overlap it.
+    fn prepWritten(self: *Engine, out: ir.View) void {
+        if (self.prep_key) |k| if (k.state == out.state and k.col < out.col + out.width and out.col < k.col + k.width) {
+            self.prep_key = null;
+        };
+    }
+
+    /// The reference schedule: exactly one dispatch per op.
+    fn encode(self: *Engine, op: ir.Op, row0: u32, rows: u32) !void {
+        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+        switch (op) {
+            .embed => |e| {
+                const w = self.bound[e.table];
+                quantParams(&p, w);
+                const t = self.words(e.tokens);
+                const o = self.words(e.out);
+                p.x = t.off;
+                p.xs = t.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = e.out.width;
+                if (e.round == .bf16) p.flags |= gpu.flag_round_bf16;
+                const qb = quantBuffers(w);
+                try gpu.dispatch(self.ctx, "mk_embed", &.{ qb[0], qb[1], qb[2], self.arena }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .rmsnorm => |n| {
+                const x = self.words(n.x);
+                const o = self.words(n.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = n.group;
+                p.heads = n.x.width / n.group;
+                p.eps = n.eps;
+                var wbuf = self.arena;
+                if (n.weight) |id| {
+                    const w = self.bound[id];
+                    p.w = w.tensor.offset;
+                    p.dtype = @backingInt(w.tensor.dtype);
+                    p.flags |= gpu.flag_has_weight;
+                    wbuf = w.buffer;
+                }
+                const tg = gpu.normThreads(n.group);
+                try gpu.dispatch(self.ctx, "mk_rmsnorm", &.{ wbuf, self.arena }, &p, @as(usize, rows) * p.heads * tg, tg);
+            },
+            .linear => |l| {
+                const w = self.bound[l.w];
+                quantParams(&p, w);
+                const x = self.words(l.x);
+                const o = self.words(l.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = l.x.width;
+                p.m = l.out.width;
+                const qb = quantBuffers(w);
+                if (rows > 1 and self.splitk != null and mlxApplies(w, p.n, p.m, rows)) {
+                    // prefill-mlx (mlx-arith tier): MLX's arithmetic, not the reference's.
+                    _ = try mlxLinear(self.ctx, qb, self.arena, self.splitk.?, &p);
+                    self.prepWritten(l.out);
+                } else if (rows > 1 and self.prep != null and q4Fast(w, p.n)) {
+                    // prefill objective (prefill search)
+                    p.z = try self.prepare(l.x, row0, rows);
+                    const simds = ((@as(usize, p.m) + self.knobs.mm_rows - 1) / self.knobs.mm_rows) * ((@as(usize, rows) + self.knobs.mm_tokens - 1) / self.knobs.mm_tokens);
+                    try gpu.dispatch(self.ctx, mmKernel("mk_mm_q4", self.knobs), &.{ qb[0], qb[1], qb[2], self.arena, self.prep.? }, &p, simds * 32, self.knobs.mm_group);
+                    self.prepWritten(l.out);
+                } else if (q4Fast(w, p.n)) {
+                    const R = if (rows == 1) self.knobs.decode_rows else self.knobs.prefill_rows;
+                    const TT = if (rows == 1) self.knobs.decode_tokens else self.knobs.prefill_tokens;
+                    const simds = ((@as(usize, p.m) + R - 1) / R) * ((@as(usize, rows) + TT - 1) / TT);
+                    try gpu.dispatch(self.ctx, tileKernel("mk_linear_q4", R, TT), &.{ qb[0], qb[1], qb[2], self.arena }, &p, simds * 32, self.knobs.linear_group);
+                } else {
+                    try gpu.dispatch(self.ctx, "mk_linear_generic", &.{ qb[0], qb[1], qb[2], self.arena }, &p, @as(usize, p.m) * rows * 32, 128);
+                }
+            },
+            .binary => |b| {
+                const a = self.words(b.a);
+                const bb = self.words(b.b);
+                const o = self.words(b.out);
+                p.x = a.off;
+                p.xs = a.stride;
+                p.y = bb.off;
+                p.ys = bb.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = b.a.width;
+                p.every = b.b_every;
+                p.kind = @backingInt(b.kind);
+                p.act_a = @backingInt(b.a_act);
+                p.act_b = @backingInt(b.b_act);
+                try gpu.dispatch(self.ctx, "mk_binary", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .store => |s| {
+                const x = self.words(s.src);
+                const d = self.program.states[s.dst];
+                p.x = x.off;
+                p.xs = x.stride;
+                p.n = s.src.width;
+                p.capacity = d.capacity(self.batch, self.context);
+                try gpu.dispatch(self.ctx, "mk_store", &.{ self.arena, self.caches[s.dst].? }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .conv => |c| {
+                const w = self.bound[c.weight];
+                const o = self.words(c.out);
+                const src = self.program.states[c.src];
+                p.w = w.tensor.offset;
+                p.dtype = @backingInt(w.tensor.dtype);
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = c.out.width;
+                p.taps = c.taps;
+                p.capacity = src.capacity(self.batch, self.context);
+                try gpu.dispatch(self.ctx, "mk_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .rope => |r| {
+                const x = self.words(r.x);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.z = self.table_offsets[r.freqs];
+                p.heads = r.heads;
+                p.dim = r.dim;
+                p.rot = r.rot;
+                if (r.fast_trig) p.flags |= gpu.flag_fast_trig;
+                try gpu.dispatch(self.ctx, "mk_rope", &.{ self.arena, self.tables }, &p, @as(usize, rows) * r.heads * (r.rot / 2), 64);
+            },
+            .attention => |a| {
+                if (try encodeDecodeAttention(self, a, null, row0, rows)) return;
+                if (try encodeMlxAttention(self, a, null, row0, rows)) return;
+                const q = self.words(a.q);
+                const o = self.words(a.out);
+                const k = self.program.states[a.keys];
+                p.x = q.off;
+                p.xs = q.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.heads = a.heads;
+                p.kv_heads = a.kv_heads;
+                p.dim = a.dim;
+                p.window = a.window;
+                p.scale = a.scale;
+                p.capacity = k.capacity(self.batch, self.context);
+                try gpu.dispatch(self.ctx, "mk_attention", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 256, 256);
+            },
+            .argmax => |m| {
+                const x = self.words(m.x);
+                const o = self.words(m.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = m.x.width;
+                if (self.partials) |part| {
+                    // decode search: two-stage argmax (decode_argmax = 1).
+                    p.every = argmax_groups;
+                    p.m = (p.n + argmax_groups - 1) / argmax_groups;
+                    try gpu.dispatch(self.ctx, "mk_dec_argmax_part", &.{ self.arena, part }, &p, @as(usize, rows) * argmax_groups * 256, 256);
+                    try gpu.dispatch(self.ctx, "mk_dec_argmax_final", &.{ self.arena, part }, &p, @as(usize, rows) * 64, 64);
+                    return;
+                }
+                try gpu.dispatch(self.ctx, "mk_argmax", &.{self.arena}, &p, @as(usize, rows) * 1024, 1024);
+            },
+        }
+    }
+};
+
+fn mat(self: *const Engine, w: weights.Weight, out: ir.View) gpu.Mat {
+    const o = self.words(out);
+    const q = w.quant.?;
+    return .{ .w = w.tensor.offset, .s = q.scale_offset, .b = q.bias_offset, .m = out.width, .y = o.off, .ys = o.stride, .sdtype = q.scale_dtype, .bdtype = q.bias_dtype };
+}
+
+fn linearTile(self: *const Engine, rows: u32) struct { r: u32, t: u32 } {
+    return if (rows == 1) .{ .r = self.knobs.decode_rows, .t = self.knobs.decode_tokens } else .{ .r = self.knobs.prefill_rows, .t = self.knobs.prefill_tokens };
+}
+
+/// Fused steps (plan.zig); each kernel reproduces the reference arithmetic.
+fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
+    const ops = self.program.ops;
+    var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+    switch (step) {
+        .op => unreachable,
+        .projections => |m| if (rows > 1 and (self.prep != null or self.splitk != null)) {
+            // prefill-mlx (knob mlx_multi): the unsplit ones in one launch, the rest alone.
+            var done: [4]bool = @splat(false);
+            if (self.knobs.mlx_multi and self.splitk != null) try encodeMlxMulti(self, ops[m.first..][0..m.count], &done, row0, rows);
+            // prefill objective (prefill search): one prep, then each matrix-matrix linear;
+            // prefill-mlx: each linear on its own, as MLX runs them.
+            for (0..m.count) |k| if (!done[k]) try self.encode(ops[m.first + k], row0, rows);
+        } else {
+            var x: gpu.ParamsX = .{ .p = p, .count = m.count };
+            const l0 = ops[m.first].linear;
+            const xin = self.words(l0.x);
+            x.p.x = xin.off;
+            x.p.xs = xin.stride;
+            x.p.n = l0.x.width;
+            x.p.group = self.bound[l0.w].quant.?.group_size;
+            const tile = linearTile(self, rows);
+            const tiles_t = (@as(usize, rows) + tile.t - 1) / tile.t;
+            var simds: usize = 0;
+            for (0..m.count) |k| {
+                const l = ops[m.first + k].linear;
+                x.mat[k] = mat(self, self.bound[l.w], l.out);
+                simds += ((@as(usize, l.out.width) + tile.r - 1) / tile.r) * tiles_t;
+            }
+            try gpu.dispatch(self.ctx, tileKernel("mk_multi_q4", tile.r, tile.t), &.{ self.bound[l0.w].buffer, self.arena }, &x, simds * 32, self.knobs.linear_group);
+        },
+        .glu => |i| {
+            const l0 = ops[i].linear;
+            const l1 = ops[i + 1].linear;
+            const b = ops[i + 2].binary;
+            if (rows > 1 and self.splitk != null and mlxApplies(self.bound[l0.w], l0.x.width, l0.out.width, rows) and
+                mlxApplies(self.bound[l1.w], l1.x.width, l1.out.width, rows))
+            {
+                // prefill-mlx: gate, up and the silu product as MLX runs them, three operations
+                // (with mlx_multi gate and up in one launch when neither is split).
+                var done: [4]bool = @splat(false);
+                if (self.knobs.mlx_multi) try encodeMlxMulti(self, ops[i..][0..2], &done, row0, rows);
+                for (0..3) |k| if (k == 2 or !done[k]) try self.encode(ops[i + k], row0, rows);
+                self.prepWritten(b.out);
+                return;
+            }
+            var x: gpu.ParamsX = .{ .p = p, .count = 2, .act_a = @backingInt(b.a_act), .act_b = @backingInt(b.b_act), .kind = @backingInt(b.kind) };
+            const xin = self.words(l0.x);
+            const o = self.words(b.out);
+            x.p.x = xin.off;
+            x.p.xs = xin.stride;
+            x.p.y = o.off;
+            x.p.ys = o.stride;
+            x.p.n = l0.x.width;
+            x.p.group = self.bound[l0.w].quant.?.group_size;
+            x.mat[0] = mat(self, self.bound[l0.w], l0.out);
+            x.mat[1] = mat(self, self.bound[l1.w], l1.out);
+            if (rows > 1 and self.prep != null) {
+                // prefill objective (prefill search)
+                x.p.z = try self.prepare(l0.x, row0, rows);
+                const k = self.knobs;
+                const wbuf = self.bound[l0.w].buffer;
+                const simds = ((@as(usize, l0.out.width) + k.mm_rows - 1) / k.mm_rows) * ((@as(usize, rows) + k.mm_tokens - 1) / k.mm_tokens);
+                try gpu.dispatch(self.ctx, mmKernel("mk_mm_glu_q4", k), &.{ wbuf, self.arena, self.prep.? }, &x, simds * 32, k.mm_group);
+                self.prepWritten(b.out);
+                return;
+            }
+            const tile = linearTile(self, rows);
+            const simds = ((@as(usize, l0.out.width) + tile.r - 1) / tile.r) * ((@as(usize, rows) + tile.t - 1) / tile.t);
+            try gpu.dispatch(self.ctx, tileKernel("mk_glu_q4", tile.r, tile.t), &.{ self.bound[l0.w].buffer, self.arena }, &x, simds * 32, self.knobs.linear_group);
+        },
+        .norms => |i| {
+            const n1 = ops[i].rmsnorm;
+            const add = ops[i + 1].binary;
+            const n2 = ops[i + 2].rmsnorm;
+            const w1 = self.bound[n1.weight.?];
+            const w2 = self.bound[n2.weight.?];
+            const y = self.words(n1.x);
+            const r = self.words(add.out);
+            const o = self.words(n2.out);
+            p.x = y.off;
+            p.xs = y.stride;
+            p.y = r.off;
+            p.ys = r.stride;
+            p.z = o.off;
+            p.zs = o.stride;
+            p.n = n1.group;
+            p.eps = n1.eps;
+            p.w = w1.tensor.offset;
+            p.dtype = @backingInt(w1.tensor.dtype);
+            p.s = w2.tensor.offset;
+            p.sdtype = @backingInt(w2.tensor.dtype);
+            // The add's operand order: r + t (kind 0) or t + r (kind 1).
+            p.kind = if (add.a.state == n1.out.state and add.a.col == n1.out.col) 1 else 0;
+            const tg = gpu.normThreads(n1.group);
+            try gpu.dispatch(self.ctx, "mk_norm_add_norm", &.{ w1.buffer, self.arena }, &p, @as(usize, rows) * tg, tg);
+        },
+        .conv => |i| {
+            const m0 = ops[i].binary;
+            const cv = ops[i + 2].conv;
+            const m1 = ops[i + 3].binary;
+            const w = self.bound[cv.weight];
+            const conv_left = m1.a.state == cv.out.state and m1.a.col == cv.out.col;
+            const other = if (conv_left) m1.b else m1.a;
+            const a = self.words(m0.a);
+            const b = self.words(m0.b);
+            const c = self.words(other);
+            const o = self.words(m1.out);
+            p.x = a.off;
+            p.xs = a.stride;
+            p.y = b.off;
+            p.ys = b.stride;
+            p.z = c.off;
+            p.zs = c.stride;
+            p.m = o.off;
+            p.every = o.stride;
+            p.n = cv.out.width;
+            p.taps = cv.taps;
+            p.w = w.tensor.offset;
+            p.dtype = @backingInt(w.tensor.dtype);
+            p.capacity = self.program.states[cv.src].capacity(self.batch, self.context);
+            p.act_a = @as(u32, @backingInt(m0.a_act)) | @as(u32, @backingInt(m0.b_act)) << 2;
+            p.act_b = @as(u32, @backingInt(m1.a_act)) | @as(u32, @backingInt(m1.b_act)) << 2;
+            p.kind = @intFromBool(conv_left);
+            if (rows > 1 and self.knobs.conv_rows) {
+                // prefill-mlx (exact): store every row's product, then convolve all rows in parallel.
+                try gpu.dispatch(self.ctx, "mk_gated_conv_store", &.{ self.caches[cv.src].?, self.arena }, &p, @as(usize, rows) * p.n, 256);
+                try gpu.dispatch(self.ctx, "mk_gated_conv_rows", &.{ self.caches[cv.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+                return;
+            }
+            try gpu.dispatch(self.ctx, "mk_gated_conv", &.{ self.caches[cv.src].?, w.buffer, self.arena }, &p, p.n, 64);
+        },
+        .gate => |i| {
+            const a = ops[i].attention;
+            const b = ops[i + 1].binary;
+            if (try encodeDecodeAttention(self, a, b, row0, rows)) return;
+            if (try encodeMlxAttention(self, a, b, row0, rows)) return;
+            const q = self.words(a.q);
+            const o = self.words(b.out);
+            const g = self.words(b.b);
+            p.x = q.off;
+            p.xs = q.stride;
+            p.y = o.off;
+            p.ys = o.stride;
+            p.z = g.off;
+            p.zs = g.stride;
+            p.act_b = @backingInt(b.b_act);
+            p.heads = a.heads;
+            p.kv_heads = a.kv_heads;
+            p.dim = a.dim;
+            p.window = a.window;
+            p.scale = a.scale;
+            p.capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+            try gpu.dispatch(self.ctx, "mk_attention_gated", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 256, 256);
+        },
+        .attn_prep => |i| try encodeAttnPrep(self, i, row0, rows),
+    }
+}
+
+// ---- decode search ----
+
+/// Split decode attention (knob decode_attention = 2, decode.metal): one row,
+/// head dim up to 256 with ceil(dim / 32) in {1, 2, 4, 8}, up to 8 query heads per KV head.
+/// Returns false (caller encodes the reference kernel) when it does not apply.
+fn encodeDecodeAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
+    if (self.knobs.decode_attention == 0 or rows != 1 or self.scores == null) return false;
+    if (a.dim == 0 or a.dim > 256 or a.heads % a.kv_heads != 0) return false;
+    const E = (a.dim + 31) / 32;
+    const G = a.heads / a.kv_heads;
+    if (!pow2upto8(E) or !pow2upto8(G)) return false;
+    const k = self.program.states[a.keys];
+    const capacity = k.capacity(self.batch, self.context);
+    const position = self.position + row0;
+    const start: u32 = if (a.window != 0 and position + 1 > a.window) position + 1 - a.window else 0;
+    const span = position - start + 1;
+    if (span > self.scores_stride or @as(usize, a.heads) * self.scores_stride > self.scores.?.floats().len) return false;
+    const q = self.words(a.q);
+    var p: gpu.Params = .{ .rows = 1, .row0 = row0, .pos = self.position };
+    p.x = q.off;
+    p.xs = q.stride;
+    p.heads = a.heads;
+    p.kv_heads = a.kv_heads;
+    p.dim = a.dim;
+    p.window = a.window;
+    p.scale = a.scale;
+    p.capacity = capacity;
+    p.every = self.scores_stride;
+    const chunks = (span + dec_chunk - 1) / dec_chunk;
+    p.m = chunks;
+    const names = comptime blk: {
+        var n: [4][4][:0]const u8 = undefined;
+        for (.{ 1, 2, 4, 8 }, 0..) |e, i| for (.{ 1, 2, 4, 8 }, 0..) |g, j| {
+            n[i][j] = std.fmt.comptimePrint("mk_dec_scores_e{d}_g{d}", .{ e, g });
+        };
+        break :blk n;
+    };
+    const scores = self.scores.?;
+    try gpu.dispatch(self.ctx, names[std.math.log2_int(u32, E)][std.math.log2_int(u32, G)], &.{ self.arena, self.caches[a.keys].?, scores }, &p, @as(usize, a.kv_heads) * chunks * 32, 256);
+    const o = if (gate) |b| self.words(b.out) else self.words(a.out);
+    p.y = o.off;
+    p.ys = o.stride;
+    if (gate) |b| {
+        const g = self.words(b.b);
+        p.z = g.off;
+        p.zs = g.stride;
+        p.act_b = @backingInt(b.b_act);
+        p.flags |= gpu.flag_dec_gated;
+    }
+    try gpu.dispatch(self.ctx, "mk_dec_chain_block", &.{ self.arena, self.caches[a.values].?, scores }, &p, @as(usize, a.heads) * E * 256, 256);
+    return true;
+}
+/// Fused attention prep (knob fuse_attn_prep, plan.matchAttnPrep): mk_dec_attn_prep.
+fn encodeAttnPrep(self: *Engine, i: u32, row0: u32, rows: u32) !void {
+    const ops = self.program.ops;
+    const n1 = ops[i].rmsnorm;
+    const n2 = ops[i + 1].rmsnorm;
+    const r1 = ops[i + 2].rope;
+    const r2 = ops[i + 3].rope;
+    const s1 = ops[i + 4].store;
+    const s2 = ops[i + 5].store;
+    const wq = self.bound[n1.weight.?];
+    const wk = self.bound[n2.weight.?];
+    const q = self.words(n1.x);
+    const k = self.words(n2.x);
+    const v = self.words(s2.src);
+    var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+    p.x = q.off;
+    p.xs = q.stride;
+    p.y = k.off;
+    p.ys = k.stride;
+    p.z = v.off;
+    p.zs = v.stride;
+    p.heads = r1.heads;
+    p.kv_heads = r2.heads;
+    p.dim = r1.dim;
+    p.rot = r1.rot;
+    p.n = self.table_offsets[r1.freqs];
+    p.eps = n1.eps;
+    p.w = wq.tensor.offset;
+    p.dtype = @backingInt(wq.tensor.dtype);
+    p.s = wk.tensor.offset;
+    p.sdtype = @backingInt(wk.tensor.dtype);
+    p.capacity = self.program.states[s1.dst].capacity(self.batch, self.context);
+    if (r1.fast_trig) p.flags |= gpu.flag_fast_trig;
+    const tg = gpu.normThreads(r1.dim);
+    const units = @as(usize, r1.heads) + 2 * @as(usize, r2.heads);
+    try gpu.dispatch(self.ctx, "mk_dec_attn_prep", &.{ wq.buffer, wk.buffer, self.arena, self.tables, self.caches[s1.dst].?, self.caches[s2.dst].? }, &p, @as(usize, rows) * units * tg, tg);
+}
+
+// ---- prefill-mlx (exact) ----
+
+/// knobs.head_trim: one past the last op that writes a persistent state (a store):
+/// what follows feeds only the logits, so rows without logits can skip it (stock
+/// MLX's chunked prefill evaluates only the caches, so its lazy graph skips the same
+/// ops). Every row it still runs keeps its own expression tree.
+pub fn trimmedHead(p: *const ir.Program) u32 {
+    var last: ?usize = null;
+    for (p.ops, 0..) |op, i| if (op == .store) {
+        last = i;
+    };
+    const t: u32 = if (last) |i| @intCast(i + 1) else 0;
+    return @min(t, p.head_start);
+}
+
+/// Replace any fused step that straddles `boundary` by its ops, one step each
+/// (the reference schedule for those ops); frees `steps`.
+fn splitAcross(gpa: std.mem.Allocator, steps: []plan.Step, boundary: u32) ![]plan.Step {
+    defer gpa.free(steps);
+    var out: std.ArrayList(plan.Step) = .empty;
+    errdefer out.deinit(gpa);
+    for (steps) |st| {
+        const f = st.first();
+        const n = st.len();
+        if (std.meta.activeTag(st) != .op and f < boundary and f + n > boundary) {
+            for (0..n) |k| try out.append(gpa, .{ .op = f + @as(u32, @intCast(k)) });
+        } else try out.append(gpa, st);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "head_trim: boundary after the last store; split steps cover every op once and straddle neither boundary" {
+    const lfm3 = @import("lfm3.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const config =
+        \\{"model_type":"lfm3","hidden_size":64,"num_hidden_layers":3,"layer_types":["conv","full_attention","conv"],
+        \\"num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"intermediate_size":96,"conv_L_cache":3,"norm_eps":1e-5,
+        \\"vocab_size":40,"eos_token_id":[7],"sliding_window":4,"max_position_embeddings":128,
+        \\"rope_parameters":{"full_attention":{"partial_rotary_factor":0.5,"rope_theta":1000000.0},"sliding_attention":{"rope_theta":10000}}}
+    ;
+    var p = try lfm3.build(std.testing.allocator, config, .{ .context = undefined, .has = struct {
+        fn f(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+    }.f }, .{});
+    defer p.deinit();
+    const t = trimmedHead(&p);
+    try std.testing.expect(t < p.head_start);
+    try std.testing.expect(p.ops[t - 1] == .store);
+    for (p.ops[t..]) |op| try std.testing.expect(op != .store);
+    var planned = p;
+    planned.head_start = t;
+    const info = try a.alloc(plan.WeightInfo, p.weights.len);
+    @memset(info, .{ .q4 = true, .buffer = 1 });
+    const steps = try splitAcross(a, try plan.build(a, &planned, .{ .projections = true, .glu = true, .norms = true, .conv = true, .gate = true }, info), p.head_start);
+    var next: u32 = 0;
+    for (steps) |st| {
+        try std.testing.expectEqual(next, st.first());
+        const end = st.first() + st.len();
+        for ([_]u32{ t, p.head_start }) |b| try std.testing.expect(!(st.first() < b and end > b));
+        next = end;
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(p.ops.len)), next);
+}
+
+// ---- prefill-mlx (mlx-arith tier) ----
+
+/// Words of the split-K partials: split * M * N <= 512 threadgroups x 32 x 32 (mlxSplitK).
+pub const mlx_splitk_words: usize = 512 * 32 * 32;
+
+/// MLX runs its steel attention (ported: mk_mlx_attention*) for float32 queries
+/// longer than 8 rows; head dim 128 is the instantiation ported here.
+pub fn mlxAttentionApplies(rows: u32, heads: u32, kv_heads: u32, dim: u32) bool {
+    return rows > 8 and dim == 128 and kv_heads != 0 and heads % kv_heads == 0;
+}
+
+/// Encode MLX's attention for p.rows query rows (p: rows, row0, pos, heads,
+/// kv_heads, dim, window, scale, capacity, x/xs, y/ys; gated: z/zs, act_b).
+pub fn mlxAttention(ctx: metal.Context, arena: metal.Buffer, keys: metal.Buffer, values: metal.Buffer, p: *const gpu.Params, gated: bool) !void {
+    const tgs = @as(usize, (p.rows + 31) / 32) * p.heads;
+    try gpu.dispatch(ctx, if (gated) "mk_mlx_attention_gated" else "mk_mlx_attention", &.{ arena, keys, values }, p, tgs * 128, 128);
+}
+
+/// knobs.mlx_attention: MLX's attention for a multi-row forward, with the
+/// sigmoid-gate epilogue when `gate` is given; false when it does not apply.
+fn encodeMlxAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
+    if (!self.knobs.mlx_attention or !mlxAttentionApplies(rows, a.heads, a.kv_heads, a.dim)) return false;
+    const q = self.words(a.q);
+    var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+    p.x = q.off;
+    p.xs = q.stride;
+    const o = if (gate) |b| self.words(b.out) else self.words(a.out);
+    p.y = o.off;
+    p.ys = o.stride;
+    if (gate) |b| {
+        const g = self.words(b.b);
+        p.z = g.off;
+        p.zs = g.stride;
+        p.act_b = @backingInt(b.b_act);
+    }
+    p.heads = a.heads;
+    p.kv_heads = a.kv_heads;
+    p.dim = a.dim;
+    p.window = a.window;
+    p.scale = a.scale;
+    p.capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+    try mlxAttention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, &p, gate != null);
+    return true;
+}
+
+/// knob mlx_multi: the linears among `lin` (all reading one view) that MLX would run
+/// unsplit, in one mk_mlx_qmm_multi launch when there are at least two of them on one
+/// weight buffer with one group and scale dtype; marks them in `done`.
+fn encodeMlxMulti(self: *Engine, lin: []const ir.Op, done: *[4]bool, row0: u32, rows: u32) !void {
+    var x: gpu.ParamsX = .{ .p = .{ .rows = rows, .row0 = row0, .pos = self.position } };
+    var pick: [4]usize = undefined;
+    var buf: ?metal.Buffer = null;
+    var tgs: usize = 0;
+    for (lin, 0..) |op, k| {
+        const l = op.linear;
+        const w = self.bound[l.w];
+        if (!mlxApplies(w, l.x.width, l.out.width, rows) or mlxSplitK(rows, l.out.width, l.x.width, w.quant.?.group_size) != 1) continue;
+        // One buffer binding: codes, scales and biases must all live in the weight's buffer.
+        if (@intFromPtr(w.quant.?.scales.handle) != @intFromPtr(w.buffer.handle) or @intFromPtr(w.quant.?.biases.handle) != @intFromPtr(w.buffer.handle)) continue;
+        const mt = mat(self, w, l.out);
+        if (x.count > 0) {
+            const l0 = lin[pick[0]].linear;
+            if (@intFromPtr(w.buffer.handle) != @intFromPtr(buf.?.handle) or w.quant.?.group_size != x.p.group or
+                mt.sdtype != x.mat[0].sdtype or l.x.state != l0.x.state or l.x.col != l0.x.col or l.x.width != l0.x.width) continue;
+        } else {
+            const xin = self.words(l.x);
+            x.p.x = xin.off;
+            x.p.xs = xin.stride;
+            x.p.n = l.x.width;
+            x.p.group = w.quant.?.group_size;
+            buf = w.buffer;
+        }
+        x.mat[x.count] = mt;
+        pick[x.count] = k;
+        x.count += 1;
+        tgs += @as(usize, (l.out.width + 31) / 32) * ((rows + 31) / 32);
+    }
+    if (x.count < 2) return;
+    const names = [3][3][:0]const u8{
+        .{ "mk_mlx_qmm_multi_f32_g32", "mk_mlx_qmm_multi_f32_g64", "mk_mlx_qmm_multi_f32_g128" },
+        .{ "mk_mlx_qmm_multi_f16_g32", "mk_mlx_qmm_multi_f16_g64", "mk_mlx_qmm_multi_f16_g128" },
+        .{ "mk_mlx_qmm_multi_bf16_g32", "mk_mlx_qmm_multi_bf16_g64", "mk_mlx_qmm_multi_bf16_g128" },
+    };
+    const g: usize = switch (x.p.group) {
+        32 => 0,
+        64 => 1,
+        else => 2,
+    };
+    try gpu.dispatch(self.ctx, names[x.mat[0].sdtype][g], &.{ buf.?, self.arena }, &x, tgs * 128, 128);
+    for (pick[0..x.count]) |k| done[k] = true;
+}
+
+/// MLX's get_qmv_batch_limit (quantized.cpp) for Ultra GPUs (architecture size
+/// 'd', any generation; this repository's machine is an M3 Ultra, applegpu_g15d).
+/// Other sizes have other rows in MLX's table and are not encoded here.
+/// Below it stock MLX runs a matrix-vector kernel (qmv_wide), which is not
+/// ported, so those batches keep the exact kernels.
+pub fn mlxVectorLimit(k: u32, n: u32) u32 {
+    if (k <= 2048 and n <= 2048) return 32;
+    if (k <= 4096 and n <= 4096) return 18;
+    return 12;
+}
+
+/// MLX qmm_splitk's number of K partitions for an [M, K] x [N, K]^T product
+/// (1: it falls back to plain qmm_t).
+pub fn mlxSplitK(m: u32, n: u32, k: u32, group: u32) u32 {
+    const tgs = ((n + 31) / 32) * ((m + 31) / 32);
+    var split: u32 = @max(1, 512 / tgs);
+    const k_align: u32 = if (group > 32) group else 32;
+    split = @min(split, k / k_align);
+    while (split > 1 and k % (split * k_align) != 0) split -= 1;
+    return @max(split, 1);
+}
+
+/// The MLX-arithmetic linear applies: 4-bit, group 32/64/128, K a multiple of
+/// 32, even offsets (as the fast reference), scales and biases of one dtype
+/// (float32, float16 or bfloat16: one kernel each), and at least MLX's vector limit of rows.
+pub fn mlxApplies(w: weights.Weight, k: u32, n: u32, rows: u32) bool {
+    const q = w.quant orelse return false;
+    return q4Fast(w, k) and (q.group_size == 32 or q.group_size == 64 or q.group_size == 128) and k % 32 == 0 and
+        q.scale_dtype == q.bias_dtype and q.scale_dtype <= 2 and rows >= mlxVectorLimit(k, n);
+}
+
+/// Encode stock MLX's quantized_matmul(transpose) for p.rows tokens: p.n = K,
+/// p.m = N, x/xs, y/ys, and the weight's w/s/b/sdtype/bdtype/group. Same grid,
+/// tiles and split as MLX; returns the split. `splitk` holds mlx_splitk_words.
+pub fn mlxLinear(ctx: metal.Context, qb: [3]metal.Buffer, arena: metal.Buffer, splitk: metal.Buffer, p: *gpu.Params) !u32 {
+    const split = mlxSplitK(p.rows, p.m, p.n, p.group);
+    const tgs = @as(usize, (p.m + 31) / 32) * ((p.rows + 31) / 32);
+    p.kind = split;
+    p.dim = p.n / split;
+    const g: usize = switch (p.group) {
+        32 => 0,
+        64 => 1,
+        128 => 2,
+        else => return error.NotPorted,
+    };
+    if (p.sdtype != p.bdtype or p.sdtype > 2) return error.NotPorted;
+    const dt: usize = p.sdtype;
+    if (split > 1) {
+        if (@as(usize, split) * p.rows * p.m > mlx_splitk_words) return error.SplitKOverflow;
+        const names = [3][3][:0]const u8{
+            .{ "mk_mlx_qmm_t_splitk_f32_g32", "mk_mlx_qmm_t_splitk_f32_g64", "mk_mlx_qmm_t_splitk_f32_g128" },
+            .{ "mk_mlx_qmm_t_splitk_f16_g32", "mk_mlx_qmm_t_splitk_f16_g64", "mk_mlx_qmm_t_splitk_f16_g128" },
+            .{ "mk_mlx_qmm_t_splitk_bf16_g32", "mk_mlx_qmm_t_splitk_bf16_g64", "mk_mlx_qmm_t_splitk_bf16_g128" },
+        };
+        try gpu.dispatch(ctx, names[dt][g], &.{ qb[0], qb[1], qb[2], arena, splitk }, p, tgs * split * 128, 128);
+        try gpu.dispatch(ctx, "mk_mlx_splitk_accum", &.{ splitk, arena }, p, @as(usize, p.rows) * p.m, 256);
+    } else {
+        const names = [3][3][:0]const u8{
+            .{ "mk_mlx_qmm_t_f32_g32", "mk_mlx_qmm_t_f32_g64", "mk_mlx_qmm_t_f32_g128" },
+            .{ "mk_mlx_qmm_t_f16_g32", "mk_mlx_qmm_t_f16_g64", "mk_mlx_qmm_t_f16_g128" },
+            .{ "mk_mlx_qmm_t_bf16_g32", "mk_mlx_qmm_t_bf16_g64", "mk_mlx_qmm_t_bf16_g128" },
+        };
+        try gpu.dispatch(ctx, names[dt][g], &.{ qb[0], qb[1], qb[2], arena, splitk }, p, tgs * 128, 128);
+    }
+    return split;
+}
+
+/// Slices per row of the two-stage argmax.
+const argmax_groups: u32 = 64;
+
+/// Positions per SIMD group in mk_dec_scores (MK_DEC_CHUNK in decode.metal).
+const dec_chunk: u32 = 8;
+fn pow2upto8(v: u32) bool {
+    return v == 1 or v == 2 or v == 4 or v == 8;
+}
+
+fn tileKernel(comptime base: []const u8, rows: u32, tokens: u32) [:0]const u8 {
+    const r: usize = switch (rows) {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        else => 3,
+    };
+    const t: usize = switch (tokens) {
+        1 => 0,
+        2 => 1,
+        else => 2,
+    };
+    const names = comptime blk: {
+        var n: [4][3][:0]const u8 = undefined;
+        for (.{ 1, 2, 4, 8 }, 0..) |rr, i| for (.{ 1, 2, 4 }, 0..) |tt, j| {
+            n[i][j] = std.fmt.comptimePrint("{s}_r{d}_t{d}", .{ base, rr, tt });
+        };
+        break :blk n;
+    };
+    return names[r][t];
+}
+
+
+/// prefill objective (prefill search): the compiled matrix-matrix variant for the knobs.
+fn mmKernel(comptime base: []const u8, k: Knobs) [:0]const u8 {
+    const names = comptime blk: {
+        var n: [Knobs.mm_tiles.len][:0]const u8 = undefined;
+        for (Knobs.mm_tiles, 0..) |t, i| n[i] = std.fmt.comptimePrint("{s}_r{d}_t{d}_{s}", .{ base, t[0], t[1], if (t[2]) "h" else "f" });
+        break :blk n;
+    };
+    for (Knobs.mm_tiles, 0..) |t, i| if (t[0] == k.mm_rows and t[1] == k.mm_tokens and t[2] == k.mm_half) return names[i];
+    unreachable; // Knobs.validate admits only compiled tiles
+}
+
+pub fn q4Fast(w: weights.Weight, cols: u32) bool {
+    const q = w.quant orelse return false;
+    // Even offsets: mk_word reads a 2-aligned code word as two halves; float32
+    // scales and biases (dtype 0) still need 4-byte alignment.
+    const sa: u64 = if (q.scale_dtype == 0) 4 else 2;
+    const ba: u64 = if (q.bias_dtype == 0) 4 else 2;
+    return q.bits == 4 and q.group_size % 16 == 0 and cols % 16 == 0 and w.tensor.offset % 2 == 0 and q.scale_offset % sa == 0 and q.bias_offset % ba == 0;
+}
+
+/// Group size from config.json's MLX "quantization" object (0 = unquantized).
+pub fn quantGroup(a: std.mem.Allocator, config_bytes: []const u8) !u32 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, config_bytes, .{});
+    if (parsed != .object) return error.InvalidConfig;
+    const q = parsed.object.get("quantization") orelse return 0;
+    if (q != .object) return error.InvalidConfig;
+    const g = q.object.get("group_size") orelse return error.InvalidConfig;
+    return switch (g) {
+        .integer => |n| std.math.cast(u32, n) orelse error.InvalidConfig,
+        else => error.InvalidConfig,
+    };
+}
+
+pub fn modelType(a: std.mem.Allocator, config_bytes: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, config_bytes, .{});
+    if (parsed != .object) return error.InvalidConfig;
+    const t = parsed.object.get("model_type") orelse return error.MissingModelType;
+    if (t != .string) return error.InvalidConfig;
+    return t.string;
+}

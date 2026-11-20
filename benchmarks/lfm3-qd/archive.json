@@ -1,0 +1,1292 @@
+{
+ "version": 1,
+ "cells": {
+  "decode|<=256|>256|per-op": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": ">256",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 178.15350846321994,
+   "rounds": [
+    178.4936115354206,
+    178.15350846321994,
+    176.09654494839694
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "prefill|<=256|<=64|per-op": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 509.8667175547995,
+   "rounds": [
+    510.2569613033975,
+    509.8667175547995,
+    509.21763452547043
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 7.265625,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "decode|<=1024|>256|per-op": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": ">256",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 120.36461074636063,
+   "rounds": [
+    120.36461074636063,
+    113.66497160784792,
+    122.34999938582507
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "prefill|<=1024|<=64|per-op": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 488.2116435596049,
+   "rounds": [
+    488.2116435596049,
+    456.03696751520806,
+    490.39162847277237
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 7.2216796875,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "decode|<=4096|>256|per-op": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": ">256",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 63.68270094332564,
+   "rounds": [
+    63.62531054481123,
+    63.68270094332564,
+    64.20579562379956
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "prefill|<=4096|<=64|per-op": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "per-op",
+   "candidate": {
+    "name": "reference",
+    "knobs": {}
+   },
+   "tokens_per_second": 433.7881118738478,
+   "rounds": [
+    433.7881118738478,
+    433.78213969352214,
+    434.06471189115945
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 7.219482421875,
+   "admission": "empirical",
+   "trial": "20261120T141604-reference",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:35:24+00:00",
+   "parent": null
+  },
+  "decode|<=256|>256|fused-mlp": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": ">256",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 190.38340687650842,
+   "rounds": [
+    194.30872771790527,
+    169.26738956567584,
+    190.38340687650842
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 323,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "prefill|<=256|<=64|fused-mlp": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 627.8326044468977,
+   "rounds": [
+    631.2757680087523,
+    627.8326044468977,
+    625.7149280993714
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 5.046875,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "decode|<=1024|>256|fused-mlp": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": ">256",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 127.75228830069874,
+   "rounds": [
+    127.75228830069874,
+    128.83640595690233,
+    127.0923067431111
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 323,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "prefill|<=1024|<=64|fused-mlp": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 598.4632818695356,
+   "rounds": [
+    598.4632818695356,
+    599.0062580245951,
+    598.1954825565008
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 5.0029296875,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "decode|<=4096|>256|fused-mlp": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": ">256",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 64.49287063962677,
+   "rounds": [
+    62.84440143718469,
+    64.54012012945581,
+    64.49287063962677
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 323,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "prefill|<=4096|<=64|fused-mlp": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "fused-mlp",
+   "candidate": {
+    "name": "fused-mlp",
+    "knobs": {
+     "fuse_glu": true,
+     "fuse_norms": true
+    }
+   },
+   "tokens_per_second": 515.9917768852243,
+   "rounds": [
+    489.3213032299616,
+    516.1455520430721,
+    515.9917768852243
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 5.000732421875,
+   "admission": "empirical",
+   "trial": "20261120T143524-fused-mlp",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T06:39:08+00:00",
+   "parent": null
+  },
+  "decode|<=256|<=256|fused-layer": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": "<=256",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 206.83776569652784,
+   "rounds": [
+    166.22934065996827,
+    206.83776569652784,
+    208.28655019378803
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "prefill|<=256|<=64|fused-layer": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 620.768588104234,
+   "rounds": [
+    619.2130186924213,
+    620.768588104234,
+    621.2627164217122
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 3.75,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "decode|<=1024|<=256|fused-layer": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=256",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 122.23788925405354,
+   "rounds": [
+    133.2891813004367,
+    121.91277331710933,
+    122.23788925405354
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "prefill|<=1024|<=64|fused-layer": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 538.2598123362593,
+   "rounds": [
+    575.9001532713634,
+    530.9952946662281,
+    538.2598123362593
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 3.7060546875,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "decode|<=4096|<=256|fused-layer": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=256",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 63.175231558796625,
+   "rounds": [
+    63.175231558796625,
+    62.31309115149463,
+    66.75147928516736
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "prefill|<=4096|<=64|fused-layer": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "fused-layer",
+   "candidate": {
+    "name": "fused-layer",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 451.7409230528265,
+   "rounds": [
+    417.25334428803546,
+    451.7409230528265,
+    495.4729425923437
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 3.703857421875,
+   "admission": "empirical",
+   "trial": "20261120T143908-fused-layer",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:03:27+00:00",
+   "parent": null
+  },
+  "decode|<=256|<=256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": "<=256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 195.9199666978709,
+   "rounds": [
+    199.0791035878214,
+    195.9199666978709,
+    184.58951546276495
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "prefill|<=256|<=64|wide-batch": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 686.0107402627361,
+   "rounds": [
+    688.3348753432401,
+    686.0107402627361,
+    685.4890546629464
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 3.75,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "decode|<=1024|<=256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 131.26791472692105,
+   "rounds": [
+    131.26791472692105,
+    132.2870939941455,
+    131.23373034513423
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "prefill|<=1024|<=64|wide-batch": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 683.3550329078435,
+   "rounds": [
+    682.3696084986751,
+    683.3550329078435,
+    684.2289895272768
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 0.9287109375,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "decode|<=4096|<=256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 64.230394425691,
+   "rounds": [
+    64.230394425691,
+    62.61883207784217,
+    65.14283329581322
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 240,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "prefill|<=4096|<=64|wide-batch": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch-fused",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4,
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true
+    }
+   },
+   "tokens_per_second": 571.7926425249759,
+   "rounds": [
+    541.269056587651,
+    571.7926425249759,
+    580.3237656882063
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 0.926513671875,
+   "admission": "empirical",
+   "trial": "20261120T151254-wide-batch-fused",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:48:49+00:00",
+   "parent": "wide-batch"
+  },
+  "decode|<=256|>256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": ">256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4
+    }
+   },
+   "tokens_per_second": 168.69940665104488,
+   "rounds": [
+    153.9547733784505,
+    170.1277020956164,
+    168.69940665104488
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T154924-wide-batch",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:57:04+00:00",
+   "parent": null
+  },
+  "decode|<=1024|>256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": ">256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4
+    }
+   },
+   "tokens_per_second": 119.38978760112522,
+   "rounds": [
+    119.63248526850983,
+    118.33690424118484,
+    119.38978760112522
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T154924-wide-batch",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:57:04+00:00",
+   "parent": null
+  },
+  "decode|<=4096|>256|wide-batch": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": ">256",
+   "family": "wide-batch",
+   "candidate": {
+    "name": "wide-batch",
+    "knobs": {
+     "batch": 256,
+     "prefill_rows": 4,
+     "prefill_tokens": 4
+    }
+   },
+   "tokens_per_second": 62.334181338184024,
+   "rounds": [
+    62.64034434407851,
+    62.09387332110793,
+    62.334181338184024
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 465,
+   "admission": "empirical",
+   "trial": "20261120T154924-wide-batch",
+   "binary_sha256": "6c354d2e83baf629874075a8189f411d0aba5df1d72307d0229568329aa9f9cb",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T07:57:04+00:00",
+   "parent": null
+  },
+  "decode|<=256|<=256|split-attn": {
+   "objective": "decode",
+   "bucket": "<=256",
+   "dispatch_bin": "<=256",
+   "family": "split-attn",
+   "candidate": {
+    "name": "split-attn",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1
+    }
+   },
+   "tokens_per_second": 239.7513328909621,
+   "rounds": [
+    239.7234939584181,
+    239.7513328909621,
+    242.85521849267954
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 197,
+   "admission": "empirical",
+   "trial": "20261120T160300-split-attn",
+   "binary_sha256": "e369dcd60aadb5123c43db96c375e1fa596891726af9d652706d3f87a817d62f",
+   "worktree": "$NANO_WORK/qd-decode",
+   "updated": "2026-11-20T08:07:17+00:00",
+   "parent": "fused-layer"
+  },
+  "decode|<=1024|<=256|split-attn": {
+   "objective": "decode",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=256",
+   "family": "split-attn",
+   "candidate": {
+    "name": "split-attn",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1
+    }
+   },
+   "tokens_per_second": 238.29026735455054,
+   "rounds": [
+    238.29026735455054,
+    238.0655684795108,
+    238.77590041764475
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 197,
+   "admission": "empirical",
+   "trial": "20261120T160300-split-attn",
+   "binary_sha256": "e369dcd60aadb5123c43db96c375e1fa596891726af9d652706d3f87a817d62f",
+   "worktree": "$NANO_WORK/qd-decode",
+   "updated": "2026-11-20T08:07:17+00:00",
+   "parent": "fused-layer"
+  },
+  "decode|<=4096|<=256|split-attn": {
+   "objective": "decode",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=256",
+   "family": "split-attn",
+   "candidate": {
+    "name": "split-attn",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1
+    }
+   },
+   "tokens_per_second": 224.16439658309662,
+   "rounds": [
+    223.31320025489592,
+    224.45311470027931,
+    224.16439658309662
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 197,
+   "admission": "empirical",
+   "trial": "20261120T160300-split-attn",
+   "binary_sha256": "e369dcd60aadb5123c43db96c375e1fa596891726af9d652706d3f87a817d62f",
+   "worktree": "$NANO_WORK/qd-decode",
+   "updated": "2026-11-20T08:07:17+00:00",
+   "parent": "fused-layer"
+  },
+  "prefill|<=256|<=64|prefill-mm": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "prefill-mm",
+   "candidate": {
+    "name": "prefill-mm-trim",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 1024,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "head_trim": true
+    }
+   },
+   "tokens_per_second": 1229.3271321607795,
+   "rounds": [
+    1230.035942194189,
+    1229.3271321607795,
+    1217.8413779919865
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 5.109375,
+   "admission": "empirical",
+   "trial": "20261120T173321-prefill-mm-trim",
+   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:37:14+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=1024|<=64|prefill-mm": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "prefill-mm",
+   "candidate": {
+    "name": "prefill-mm-trim",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 1024,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "head_trim": true
+    }
+   },
+   "tokens_per_second": 1287.0837873179266,
+   "rounds": [
+    1288.6646588932751,
+    1287.0837873179266,
+    1286.8444036552828
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 0.3193359375,
+   "admission": "empirical",
+   "trial": "20261120T173321-prefill-mm-trim",
+   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:37:14+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=4096|<=64|prefill-mm": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "prefill-mm",
+   "candidate": {
+    "name": "prefill-mm-trim",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 1024,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "head_trim": true
+    }
+   },
+   "tokens_per_second": 996.1188815069366,
+   "rounds": [
+    996.3153844141993,
+    995.6285682759443,
+    996.1188815069366
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 0.310546875,
+   "admission": "empirical",
+   "trial": "20261120T173321-prefill-mm-trim",
+   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:37:14+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=256|<=64|mlx-prefill": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "mlx-prefill",
+   "candidate": {
+    "name": "mlx-prefill",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true
+    }
+   },
+   "tokens_per_second": 2963.100163530138,
+   "rounds": [
+    2947.4071984706993,
+    2992.611975867179,
+    2963.100163530138
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 5.8125,
+   "admission": "mlx-arith",
+   "trial": "20261120T170304-mlx-prefill",
+   "binary_sha256": "1286346e74fbaa9683e9c47bda06cfffd7bade9498ded530546a93f1aaae5a33",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:05:52+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=1024|<=64|mlx-prefill": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "mlx-prefill",
+   "candidate": {
+    "name": "mlx-prefill",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true
+    }
+   },
+   "tokens_per_second": 4205.407890531793,
+   "rounds": [
+    4207.118411260808,
+    4205.407890531793,
+    4203.646993666284
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 0.2841796875,
+   "admission": "mlx-arith",
+   "trial": "20261120T170304-mlx-prefill",
+   "binary_sha256": "1286346e74fbaa9683e9c47bda06cfffd7bade9498ded530546a93f1aaae5a33",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:05:52+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=4096|<=64|mlx-prefill": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "mlx-prefill",
+   "candidate": {
+    "name": "mlx-prefill",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true
+    }
+   },
+   "tokens_per_second": 4229.709579054363,
+   "rounds": [
+    4210.881262838782,
+    4231.4661575539985,
+    4229.709579054363
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 0.14111328125,
+   "admission": "mlx-arith",
+   "trial": "20261120T170304-mlx-prefill",
+   "binary_sha256": "1286346e74fbaa9683e9c47bda06cfffd7bade9498ded530546a93f1aaae5a33",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:05:52+00:00",
+   "parent": "prefill-mm"
+  },
+  "prefill|<=256|<=64|mlx-multi": {
+   "objective": "prefill",
+   "bucket": "<=256",
+   "dispatch_bin": "<=64",
+   "family": "mlx-multi",
+   "candidate": {
+    "name": "mlx-prefill-multi",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true,
+     "mlx_multi": true
+    }
+   },
+   "tokens_per_second": 3398.2902388203493,
+   "rounds": [
+    3400.8183447734273,
+    3398.2902388203493,
+    3397.3882545035945
+   ],
+   "prompt_tokens": 64,
+   "dispatches_per_token": 5.4375,
+   "admission": "mlx-arith",
+   "trial": "20261120T172342-mlx-prefill-multi",
+   "binary_sha256": "030a45dcab0246c362a3f9e8e641fa62a2cc5357838b048eb977e649403622c2",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:26:51+00:00",
+   "parent": "mlx-prefill"
+  },
+  "prefill|<=1024|<=64|mlx-multi": {
+   "objective": "prefill",
+   "bucket": "<=1024",
+   "dispatch_bin": "<=64",
+   "family": "mlx-multi",
+   "candidate": {
+    "name": "mlx-prefill-trim",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true,
+     "mlx_multi": true,
+     "head_trim": true
+    }
+   },
+   "tokens_per_second": 4851.769898837575,
+   "rounds": [
+    4857.708053801819,
+    4851.769898837575,
+    4844.241549058306
+   ],
+   "prompt_tokens": 1024,
+   "dispatches_per_token": 0.240234375,
+   "admission": "mlx-arith",
+   "trial": "20261120T173733-mlx-prefill-trim",
+   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:39:41+00:00",
+   "parent": "mlx-prefill-multi"
+  },
+  "prefill|<=4096|<=64|mlx-multi": {
+   "objective": "prefill",
+   "bucket": "<=4096",
+   "dispatch_bin": "<=64",
+   "family": "mlx-multi",
+   "candidate": {
+    "name": "mlx-prefill-trim",
+    "knobs": {
+     "fuse_projections": true,
+     "fuse_glu": true,
+     "fuse_norms": true,
+     "fuse_conv": true,
+     "fuse_gate": true,
+     "decode_attention": 2,
+     "fuse_attn_prep": true,
+     "decode_argmax": 1,
+     "batch": 2048,
+     "prefill_mm": true,
+     "mm_rows": 2,
+     "mm_tokens": 8,
+     "mm_half": true,
+     "conv_rows": true,
+     "mlx_linear": true,
+     "mlx_attention": true,
+     "mlx_multi": true,
+     "head_trim": true
+    }
+   },
+   "tokens_per_second": 4750.478120808996,
+   "rounds": [
+    4788.167988825172,
+    4750.478120808996,
+    4745.761140369782
+   ],
+   "prompt_tokens": 4096,
+   "dispatches_per_token": 0.1171875,
+   "admission": "mlx-arith",
+   "trial": "20261120T173733-mlx-prefill-trim",
+   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
+   "worktree": "$NANO_WORK/mega",
+   "updated": "2026-11-20T09:39:41+00:00",
+   "parent": "mlx-prefill-multi"
+  }
+ },
+ "baselines": {
+  "mlx_bf16": {
+   "64": {
+    "prefill_tokens_per_second": 2487.4615341749395,
+    "decode_tokens_per_second": 160.0866176672187
+   },
+   "1024": {
+    "prefill_tokens_per_second": 5007.066641717363,
+    "decode_tokens_per_second": 144.76993173309722
+   },
+   "4096": {
+    "prefill_tokens_per_second": 5395.963039515124,
+    "decode_tokens_per_second": 178.28400417759482
+   }
+  },
+  "mlx_f32": {
+   "64": {
+    "prefill_tokens_per_second": 2575.2498016856116,
+    "decode_tokens_per_second": 189.19044504028892
+   },
+   "1024": {
+    "prefill_tokens_per_second": 4619.541069586094,
+    "decode_tokens_per_second": 148.33867923518832
+   },
+   "4096": {
+    "prefill_tokens_per_second": 4518.012279116633,
+    "decode_tokens_per_second": 157.204780306411
+   }
+  }
+ },
+ "baseline_source": {
+  "file": "$NANO_WORK/mega/benchmarks/lfm3-mlx-baseline.json",
+  "machine": {
+   "platform": "macOS-27.0-arm64-arm-64bit",
+   "machine": "arm64",
+   "cpu": "Apple M3 Ultra",
+   "memory_bytes": 274877906944
+  },
+  "versions": {
+   "python": "3.12.10",
+   "macos": "27.0",
+   "mlx": "0.32.4",
+   "mlx-vlm": "0.8.0",
+   "transformers": "5.23.0",
+   "numpy": "2.5.5"
+  },
+  "decode_protocol": "MLX: teacher-forced, one cached forward and synchronous host argmax per token (no async_eval pipelining); native: free-running greedy through the session",
+  "prefill_protocol": "stock mlx-vlm generate(): chunks of <= 2048 over the first L - 1 tokens (cache state evaluated), then the last token with logits and host argmax; native: the session's prefill_seconds"
+ }
+}
