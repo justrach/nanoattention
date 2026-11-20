@@ -81,8 +81,9 @@ comptime {
 }
 
 pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
-    // second climb: prefill in MLX arithmetic, then decode
-    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal");
+    // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
+    // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
+    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
 
 pub fn open() !metal.Context {
     const handle = fm_open(source) orelse {

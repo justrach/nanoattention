@@ -1089,3 +1089,184 @@ test "c2-prefill-mlx: mk_gated_conv_rows2 equals mk_gated_conv_rows bit for bit"
         try bitsEqual(outs[0], outs[1]);
     };
 }
+
+// ---- climb 2, exact prefill ----
+
+const exact2 = @import("exact2.zig");
+
+/// An adversarial float: signed zeros, subnormals, tiny normals, infinities, NaN, huge.
+fn c2Special(r: *std.Random.DefaultPrng) f32 {
+    const v = [_]f32{ 0.0, -0.0, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 1e30, -1e30, 1e-40, -1e-40, 3e38, -3e38 };
+    return v[r.random().uintLessThan(usize, v.len)];
+}
+
+test "exact prefill (climb 2): matrix-unit 4-bit linear (mk_x2_prep + mk_x2mm_q4) equals the one-row reference bit for bit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(2026);
+    // (m, n, group, scale dtype): ragged rows and a partial 32-segment step (n 96),
+    // LFM3's 2048 / group 64, group 16 and 128, all three scale dtypes.
+    for ([_][4]u32{ .{ 13, 96, 32, 2 }, .{ 37, 2048, 64, 2 }, .{ 40, 512, 16, 1 }, .{ 21, 1536, 128, 0 }, .{ 70, 7680, 64, 2 } }) |shape| {
+        const m = shape[0];
+        const n = shape[1];
+        const group = shape[2];
+        const sdt = shape[3];
+        const esz: usize = if (sdt == 0) 4 else 2;
+        const code_bytes = @as(usize, m) * n / 2;
+        const groups = @as(usize, m) * n / group;
+        // Codes 2 bytes off a word boundary (as LFM3's); f32 scales word-aligned.
+        const s_off: usize = if (sdt == 0) (2 + code_bytes + 3) / 4 * 4 else 2 + code_bytes;
+        const b_off = s_off + groups * esz;
+        const wbuf = try ctx.alloc((b_off + groups * esz + 3) / 4 + 1);
+        defer wbuf.deinit();
+        const bytes = std.mem.sliceAsBytes(wbuf.floats());
+        r.random().bytes(bytes[2 .. 2 + code_bytes]);
+        // All-zero half-words (all-zero code quads) on every fifth row, one row of zero codes.
+        for (0..m) |row| {
+            const rb = bytes[2 + row * n / 2 ..][0 .. n / 2];
+            if (row == 3) @memset(rb, 0);
+            if (row % 5 == 0) {
+                var i: usize = 0;
+                while (i < rb.len) : (i += 2) if (r.random().boolean()) {
+                    rb[i] = 0;
+                    rb[i + 1] = 0;
+                };
+            }
+        }
+        for (0..groups) |g| {
+            const sv: f32 = if (g % 11 == 0) 0 else 0.01 + 0.05 * r.random().float(f32);
+            const bv: f32 = switch (g % 7) {
+                0 => -0.0,
+                1 => 0.0,
+                else => -0.3 + 0.1 * r.random().float(f32),
+            };
+            for ([_]f32{ sv, bv }, [_]usize{ s_off, b_off }) |v, off| switch (sdt) {
+                0 => std.mem.writeInt(u32, bytes[off + g * 4 ..][0..4], @bitCast(v), .little),
+                1 => std.mem.writeInt(u16, bytes[off + g * 2 ..][0..2], @bitCast(@as(f16, @floatCast(v))), .little),
+                else => std.mem.writeInt(u16, bytes[off + g * 2 ..][0..2], bf16(v), .little),
+            };
+        }
+        const T = 45; // two 32-token tiles, the second partial
+        const row0 = 2;
+        const rows = T - row0;
+        const buf = try ctx.alloc(T * n + 2 * T * m);
+        defer buf.deinit();
+        const f = buf.floats();
+        const prep = try ctx.alloc(exact2.prepLayout(rows, n).words);
+        defer prep.deinit();
+        // Pass 0: no tiny inputs (every tile on the matrix units); pass 1: tiny rows in the
+        // second token tile only (it takes the scalar fallback, the first does not).
+        for (0..2) |pass| {
+            for (0..T) |t| {
+                const kind = t % 8;
+                for (f[t * n ..][0..n], 0..) |*v, c| v.* = switch (kind) {
+                    1 => ([_]f32{ 0.0, -0.0, 1.0, -1.0 })[r.random().uintLessThan(usize, 4)],
+                    2 => -@abs(r.random().floatNorm(f32)) - if (c % 3 == 0) @as(f32, 0) else 1e-3,
+                    3 => if (pass == 1 and t >= row0 + 32)
+                        (if (r.random().boolean()) @as(f32, 1) else -1) * std.math.ldexp(1 + r.random().float(f32), -100 - @as(i32, @intCast(r.random().uintLessThan(u32, 30))))
+                    else
+                        r.random().floatNorm(f32),
+                    4 => if (r.random().uintLessThan(u32, 16) == 0) c2Special(&r) else r.random().floatNorm(f32),
+                    5 => if (c % 2 == 0) 1e4 * r.random().floatNorm(f32) else -f[t * n + c - 1],
+                    6 => 1e35 * r.random().floatNorm(f32),
+                    else => r.random().floatNorm(f32),
+                };
+            }
+            const ref = T * n;
+            const got = T * n + T * m;
+            @memset(f[ref..][0 .. 2 * T * m], 0);
+            for (row0..T) |t| {
+                var p: gpu.Params = .{ .rows = 1, .row0 = @intCast(t), .xs = n, .y = @intCast(ref), .ys = m, .n = n, .m = m, .bits = 4, .group = group, .w = 2, .s = s_off, .b = b_off, .sdtype = sdt, .bdtype = sdt };
+                try gpu.dispatch(ctx, "mk_linear_q4_r1_t1", &.{ wbuf, wbuf, wbuf, buf }, &p, m * 32, 32);
+            }
+            const p: gpu.Params = .{ .rows = rows, .row0 = row0, .xs = n, .y = @intCast(got), .ys = m, .n = n, .m = m, .bits = 4, .group = group, .w = 2, .s = s_off, .b = b_off, .sdtype = sdt, .bdtype = sdt };
+            for ([_]bool{ false, true }) |half_codes| {
+                @memset(f[got..][0 .. T * m], 0);
+                var ph = p;
+                try exact2.encodeLinear(ctx, .{ wbuf, wbuf, wbuf }, buf, prep, &ph, true, half_codes);
+                try ctx.finish();
+                const words = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(f));
+                try testing.expectEqualSlices(u32, words[ref + row0 * m ..][0 .. rows * m], words[got + row0 * m ..][0 .. rows * m]);
+            }
+            // The fallback flag marks exactly the tiny rows.
+            const flags = prep.structs(u32)[exact2.prepLayout(rows, n).flags..][0..rows];
+            for (flags, row0..) |fl, t| try testing.expectEqual(@as(u32, @intFromBool(pass == 1 and t % 8 == 3 and t >= row0 + 32)), fl);
+        }
+    }
+}
+
+test "exact prefill (climb 2): batched exact attention equals mk_attention and mk_attention_gated bit for bit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(4096);
+    // (heads, kv heads, dim, window, cached positions before the batch, batch rows):
+    // LFM3's full and sliding shapes, every group size and head-dim class, a wrapping ring.
+    for ([_][6]u32{ .{ 16, 4, 128, 0, 300, 45 }, .{ 16, 4, 128, 37, 100, 45 }, .{ 16, 4, 128, 256, 0, 300 }, .{ 4, 2, 16, 5, 0, 19 }, .{ 8, 1, 64, 0, 0, 33 }, .{ 4, 4, 32, 9, 50, 20 }, .{ 2, 1, 256, 0, 10, 9 }, .{ 4, 1, 40, 0, 3, 17 } }) |shape| {
+        const heads = shape[0];
+        const kvh = shape[1];
+        const dim = shape[2];
+        const window = shape[3];
+        const pos0 = shape[4];
+        const T = shape[5];
+        const row0 = 1;
+        const rows = T - row0;
+        const capacity: u32 = if (window == 0) pos0 + T else window - 1 + T;
+        const span: u32 = if (window == 0) capacity else @min(window, capacity);
+        const K = try ctx.alloc(capacity * kvh * dim);
+        defer K.deinit();
+        const V = try ctx.alloc(capacity * kvh * dim);
+        defer V.deinit();
+        const qw = heads * dim;
+        const gate = T * qw;
+        const out = gate + T * heads;
+        const buf = try ctx.alloc(out + 4 * T * qw);
+        defer buf.deinit();
+        const f = buf.floats();
+        for ([_]u32{ 7, rows }) |chunk| {
+            const S = try ctx.alloc(chunk * heads * span);
+            defer S.deinit();
+            const Fb = try ctx.alloc(chunk * heads * span);
+            defer Fb.deinit();
+            const ML = try ctx.alloc(chunk * heads * 16);
+            defer ML.deinit();
+            // Kinds: random; adversarial values; equal keys with zero and -0 queries.
+            for (0..3) |kind| {
+                const first = (pos0 + T) -| capacity;
+                for (first..pos0 + T) |t| {
+                    const slot = t % capacity;
+                    for (K.floats()[slot * kvh * dim ..][0 .. kvh * dim], V.floats()[slot * kvh * dim ..][0 .. kvh * dim], 0..) |*k, *v, i| {
+                        k.* = 2 * r.random().floatNorm(f32);
+                        v.* = r.random().floatNorm(f32);
+                        if (kind == 1 and r.random().uintLessThan(u32, 40) == 0) k.* = c2Special(&r);
+                        if (kind == 1 and r.random().uintLessThan(u32, 40) == 0) v.* = c2Special(&r);
+                        if (kind == 2) k.* = if (i % 2 == 0) 0.5 else -0.0;
+                    }
+                }
+                for (f[0 .. T * qw + T * heads], 0..) |*v, i| {
+                    v.* = 2 * r.random().floatNorm(f32);
+                    if (kind == 1 and r.random().uintLessThan(u32, 60) == 0) v.* = c2Special(&r);
+                    if (kind == 2 and i < T * qw and (i / qw) % 3 == 0) v.* = if (i % 2 == 0) 0.0 else -0.0;
+                }
+                @memset(f[out..][0 .. 4 * T * qw], 0);
+                var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = pos0, .x = 0, .xs = qw, .ys = qw, .heads = heads, .kv_heads = kvh, .dim = dim, .window = window, .capacity = capacity, .scale = 0.088388, .z = gate, .zs = heads, .act_b = 2, .every = span };
+                p.y = out;
+                try gpu.dispatch(ctx, "mk_attention", &.{ buf, K, V }, &p, rows * heads * 256, 256);
+                p.y = out + 2 * T * qw;
+                try gpu.dispatch(ctx, "mk_attention_gated", &.{ buf, K, V }, &p, rows * heads * 256, 256);
+                p.y = out + T * qw;
+                try exact2.encodeAttention(ctx, buf, K, V, .{ S, Fb, ML }, &p, chunk);
+                p.y = out + 3 * T * qw;
+                p.flags = exact2.att_gated;
+                try exact2.encodeAttention(ctx, buf, K, V, .{ S, Fb, ML }, &p, chunk);
+                try ctx.finish();
+                const lo = out + row0 * qw;
+                try bitsEqual(f[lo..][0 .. rows * qw], f[lo + T * qw ..][0 .. rows * qw]);
+                try bitsEqual(f[lo + 2 * T * qw ..][0 .. rows * qw], f[lo + 3 * T * qw ..][0 .. rows * qw]);
+            }
+        }
+    }
+}

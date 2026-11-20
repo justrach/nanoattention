@@ -225,21 +225,21 @@ Decode, tokens a second:
 
 | Prompt tokens | `exact` | `mlx-prefill` | `nano`, plain synchronous | Stock MLX FP32, pipelined | Stock MLX BF16, pipelined | Stock MLX FP32, synchronous | Stock MLX BF16, synchronous |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | **310** | **314** | 241 | 280 | 287 | 189 | 196 |
-| 1,024 | **301** | **303** | 249 | 275 | 286 | 188 | 197 |
-| 4,096 | **277** | **280** | 235 | 265 | 275 | 181 | 193 |
+| 64 | **313** | **313** | 241 | 278 | 286 | 190 | 198 |
+| 1,024 | **303** | **303** | 245 | 274 | 275 | 189 | 197 |
+| 4,096 | **280** | **279** | 237 | 264 | 275 | 185 | 194 |
 
-A synchronous loop (run one forward, wait, read the token on the host) loses about a fifth of every token to submission and wake latency around the GPU work. Stock MLX's generate loop hides it by submitting the next step before reading the current token (`mx.async_eval`); that is the "pipelined" column, and it is the fair baseline. The presets hide it differently: the next forward is committed early and held by a one-thread GPU gate until the host has read the current token and written the next one, so the host still reads and chooses every token ([how](docs/MEGAKERNEL.md), [measurements](benchmarks/lfm3-decode-search.md)). Against stock's pipelined loop the presets are 8% / 5% / 1% ahead of BF16 and 11% / 9% / 4% ahead of FP32 at 64 / 1,024 / 4,096 tokens; at 4,096 against BF16 that is inside this machine's run-to-run drift. Synchronous against synchronous, `nano` is 22 to 27% ahead of stock BF16.
+A synchronous loop (run one forward, wait, read the token on the host) loses about a fifth of every token to submission and wake latency around the GPU work. Stock MLX's generate loop hides it by submitting the next step before reading the current token (`mx.async_eval`); that is the "pipelined" column, and it is the fair baseline. The presets hide it differently: the next forward is committed early and held by a one-thread GPU gate until the host has read the current token and written the next one, so the host still reads and chooses every token ([how](docs/MEGAKERNEL.md), [measurements](benchmarks/lfm3-decode-search.md)). Against stock's pipelined loop the presets are 10% / 10% / 2% ahead of BF16 and 13% / 11% / 6% ahead of FP32 at 64 / 1,024 / 4,096 tokens in this session; an earlier session gave 8% / 5% / 1% against BF16, so read the 4,096 margin over BF16 as level. Synchronous against synchronous, `nano` is 22 to 24% ahead of stock BF16.
 
 Prompt ingestion, tokens a second:
 
 | Prompt tokens | `exact` | `mlx-prefill` | Stock MLX FP32 | Stock MLX BF16 |
 | ---: | ---: | ---: | ---: | ---: |
-| 64 | 1,229 | **3,511** | 2,606 | 2,783 |
-| 1,024 | 1,289 | **5,503** | 4,634 | 5,383 |
-| 4,096 | 998 | **5,478** | 4,655 | 5,462 |
+| 64 | 1,268 | **3,498** | 2,627 | 2,795 |
+| 1,024 | 1,882 | **5,489** | 4,600 | 5,365 |
+| 4,096 | 1,745 | **5,477** | 4,661 | 5,461 |
 
-With MLX's own arithmetic, ingestion is ahead of stock MLX in both precisions while staying float32: by 26% at 64 tokens, and by 2% and 0.3% over stock BF16 at 1,024 and 4,096 (the last is level, within drift). Its kernels keep stock MLX's output bits and change only tile shape, staging and scheduling ([what changed](benchmarks/lfm3-prefill-search.md)). Exact ingestion is about a quarter of that.
+With MLX's own arithmetic, ingestion is ahead of stock MLX in both precisions while staying float32: by 25% at 64 tokens, and by 2% and 0.3% over stock BF16 at 1,024 and 4,096 (the last is level, within drift). Its kernels keep stock MLX's output bits and change only tile shape, staging and scheduling. Exact ingestion, bit-identical to token-at-a-time decoding, is about a third of that at the longer lengths: its 4-input chains run on the GPU's 8 x 8 matrix units and each row's attention runs in parallel ([both tiers](benchmarks/lfm3-prefill-search.md)).
 
 The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
 

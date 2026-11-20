@@ -874,7 +874,7 @@
    "dispatch_bin": "<=64",
    "family": "prefill-mm",
    "candidate": {
-    "name": "prefill-mm-trim",
+    "name": "x2-att-h",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -890,23 +890,26 @@
      "mm_tokens": 8,
      "mm_half": true,
      "conv_rows": true,
-     "head_trim": true
+     "head_trim": true,
+     "x2_linear": true,
+     "x2_attention": true,
+     "x2_half": true
     }
    },
-   "tokens_per_second": 1229.3271321607795,
+   "tokens_per_second": 1266.7748687685807,
    "rounds": [
-    1230.035942194189,
-    1229.3271321607795,
-    1217.8413779919865
+    1267.301634175033,
+    1266.7748687685807,
+    1266.6244489585283
    ],
    "prompt_tokens": 64,
-   "dispatches_per_token": 5.109375,
+   "dispatches_per_token": 6.171875,
    "admission": "empirical",
-   "trial": "20261120T173321-prefill-mm-trim",
-   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:37:14+00:00",
-   "parent": "prefill-mm"
+   "trial": "20261120T220330-x2-att-h",
+   "binary_sha256": "862323bd3844278499dd0219f66a0a622aadccf9e8a8a5b570a562ec748f523d",
+   "worktree": "$NANO_WORK/c2-prefill-exact",
+   "updated": "2026-11-20T14:06:19+00:00",
+   "parent": "x2-att"
   },
   "prefill|<=1024|<=64|prefill-mm": {
    "objective": "prefill",
@@ -914,7 +917,7 @@
    "dispatch_bin": "<=64",
    "family": "prefill-mm",
    "candidate": {
-    "name": "prefill-mm-trim",
+    "name": "x2-att",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -930,23 +933,25 @@
      "mm_tokens": 8,
      "mm_half": true,
      "conv_rows": true,
-     "head_trim": true
+     "head_trim": true,
+     "x2_linear": true,
+     "x2_attention": true
     }
    },
-   "tokens_per_second": 1287.0837873179266,
+   "tokens_per_second": 1865.756624255568,
    "rounds": [
-    1288.6646588932751,
-    1287.0837873179266,
-    1286.8444036552828
+    1867.49536811759,
+    1865.756624255568,
+    1865.7022348469002
    ],
    "prompt_tokens": 1024,
-   "dispatches_per_token": 0.3193359375,
+   "dispatches_per_token": 0.3857421875,
    "admission": "empirical",
-   "trial": "20261120T173321-prefill-mm-trim",
-   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:37:14+00:00",
-   "parent": "prefill-mm"
+   "trial": "20261120T214933-x2-att",
+   "binary_sha256": "66466ac7686066297a09927210c433504bc9d41016edabc07caff13351c58b4e",
+   "worktree": "$NANO_WORK/c2-prefill-exact",
+   "updated": "2026-11-20T13:52:02+00:00",
+   "parent": "x2-linear"
   },
   "prefill|<=4096|<=64|prefill-mm": {
    "objective": "prefill",
@@ -954,7 +959,7 @@
    "dispatch_bin": "<=64",
    "family": "prefill-mm",
    "candidate": {
-    "name": "prefill-mm-trim",
+    "name": "x2-att",
     "knobs": {
      "fuse_projections": true,
      "fuse_glu": true,
@@ -970,23 +975,25 @@
      "mm_tokens": 8,
      "mm_half": true,
      "conv_rows": true,
-     "head_trim": true
+     "head_trim": true,
+     "x2_linear": true,
+     "x2_attention": true
     }
    },
-   "tokens_per_second": 996.1188815069366,
+   "tokens_per_second": 1732.8485643174497,
    "rounds": [
-    996.3153844141993,
-    995.6285682759443,
-    996.1188815069366
+    1732.3069751386136,
+    1732.8485643174497,
+    1733.0413904816603
    ],
    "prompt_tokens": 4096,
-   "dispatches_per_token": 0.310546875,
+   "dispatches_per_token": 0.4091796875,
    "admission": "empirical",
-   "trial": "20261120T173321-prefill-mm-trim",
-   "binary_sha256": "23249eb42a630c187be6adc24627f6747b98b97b5ef0d9a582b32e4e6d28b9d6",
-   "worktree": "$NANO_WORK/mega",
-   "updated": "2026-11-20T09:37:14+00:00",
-   "parent": "prefill-mm"
+   "trial": "20261120T214933-x2-att",
+   "binary_sha256": "66466ac7686066297a09927210c433504bc9d41016edabc07caff13351c58b4e",
+   "worktree": "$NANO_WORK/c2-prefill-exact",
+   "updated": "2026-11-20T13:52:02+00:00",
+   "parent": "x2-linear"
   },
   "prefill|<=256|<=64|mlx-prefill": {
    "objective": "prefill",

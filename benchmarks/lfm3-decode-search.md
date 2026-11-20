@@ -98,11 +98,11 @@ The tables above time stock MLX with a synchronous read per token. Stock's own g
 
 | prompt | presets (gated decode): `exact` / `mlx-prefill` | `nano`, plain synchronous | stock f32 / bf16, pipelined | stock f32 / bf16, synchronous |
 | ---: | --- | ---: | --- | --- |
-| 64 | 310.0 / 314.1 | 241.5 | 280.0 / 287.1 | 189.3 / 196.0 |
-| 1,024 | 301.1 / 302.8 | 249.0 | 275.4 / 285.8 | 187.8 / 196.5 |
-| 4,096 | 276.5 / 280.1 | 235.1 | 265.3 / 274.6 | 181.2 / 193.4 |
+| 64 | 313.4 / 313.5 | 240.6 | 278.0 / 286.2 | 189.7 / 197.7 |
+| 1,024 | 303.4 / 302.6 | 244.5 | 274.1 / 275.4 | 189.3 / 196.9 |
+| 4,096 | 279.7 / 278.9 | 237.5 | 264.5 / 274.8 | 184.8 / 194.3 |
 
-So the like-for-like margins are: gated against stock's pipelined bf16 loop +8.0% / +5.4% / +0.7% (the last within drift), against pipelined f32 +10.7% / +9.4% / +4.2%; plain synchronous against synchronous bf16 +23% / +27% / +22%. Before this round `nano`'s synchronous decode (about 240) was behind stock's pipelined loop.
+So the like-for-like margins are: gated against stock's pipelined bf16 loop +9.5% / +10.2% / +1.8%, against pipelined f32 +12.7% / +10.7% / +5.8%; plain synchronous against synchronous bf16 +22% / +24% / +22%. An earlier session on the same kernels gave +8.0% / +5.4% / +0.7% against pipelined bf16 (stock's pipelined bf16 loop measured 285.8 at 1,024 there, 275.4 here), so the 4,096 margin over bf16 is within drift. Before this round `nano`'s synchronous decode (about 240) was behind stock's pipelined loop.
 
 ### Variant code status (second climb)
 

@@ -15,5 +15,8 @@
  "conv_rows": true,
  "head_trim": true,
  "d2_gate": true,
- "d2_norm_regs": true
+ "d2_norm_regs": true,
+ "x2_linear": true,
+ "x2_attention": true,
+ "x2_half": true
 }

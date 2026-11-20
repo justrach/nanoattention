@@ -77,6 +77,12 @@ pub fn main(init: std.process.Init) !void {
         while (args.next()) |v| try rest.append(a, v);
         return @import("decode2_probe.zig").run(a, rest.items);
     }
+    // climb 2, exact prefill: exact multi-row linear kernels on synthetic weights; run under the inference lock.
+    if (std.mem.eql(u8, command, "exact2-bench")) {
+        const tokens = if (args.next()) |v| try std.fmt.parseInt(u32, v, 10) else 1024;
+        const reps = if (args.next()) |v| try std.fmt.parseInt(u32, v, 10) else 10;
+        return @import("exact2.zig").run(a, tokens, reps);
+    }
     // prefill-mlx: one MLX-arithmetic operation on given inputs (tools/nano_mlx_ops.py).
     if (std.mem.eql(u8, command, "mlx-op")) {
         var rest: std.ArrayList([]const u8) = .empty;

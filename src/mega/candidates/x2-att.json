@@ -1,0 +1,28 @@
+{
+ "name": "x2-att",
+ "parent": "x2-linear",
+ "family": "prefill-mm",
+ "knobs": {
+  "fuse_projections": true,
+  "fuse_glu": true,
+  "fuse_norms": true,
+  "fuse_conv": true,
+  "fuse_gate": true,
+  "decode_attention": 2,
+  "fuse_attn_prep": true,
+  "decode_argmax": 1,
+  "batch": 1024,
+  "prefill_mm": true,
+  "mm_rows": 2,
+  "mm_tokens": 8,
+  "mm_half": true,
+  "conv_rows": true,
+  "head_trim": true,
+  "x2_linear": true,
+  "x2_attention": true
+ },
+ "hypothesis": "Exact tier. prefill-mm-trim plus two exact kernels (exact2.metal). (1) x2_linear: multi-row 4-bit linears through mk_x2mm_q4: each 4-input quad chain of the reference tree is one simdgroup 8x8x8 step (two quads per fragment pair, the other quad's slots zeroed per lane), the dot sums, scale/bias term, per-lane sums in segment order and the pair tree over the 32 lane sums are explicit element-wise steps; tokens with a nonzero prescaled input below 2^-103 take the scalar reference tree. exact2-bench at 1,024 tokens: 2.69 / 2.83 / 2.82 / 2.85 TMAC/s vs the elite kernel's 2.07 / 2.14 / 2.15 / 1.98 (2048x2048, 6144x2048, 7680x2048, 2048x7680). (2) x2_attention: mk_attention for all rows as scores (reference dot tree), softmax scalars per (row, head, SIMD class) in step order, then value recurrences and the class merge; profile at 4,096: attention 1.20 s -> ~0.31 s per prompt. Screens: 1,024 +35.7%, 4,096 +49.5% (before the chain prefetch and the quad-pair linear). Expect +40% at 1,024, +60% at 4,096, +20% at 64.",
+ "expected": {
+  "prefill": 45.0
+ }
+}

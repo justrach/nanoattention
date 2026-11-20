@@ -10,6 +10,8 @@ const weights = @import("weights");
 const metal = weights.metal;
 const Knobs = knobs_mod.Knobs;
 const io = @import("io.zig"); // decode climb 2
+// climb 2, exact prefill
+const exact2 = @import("exact2.zig");
 
 pub const Trace = struct {
     /// [traces][rows][width] float32, filled by forwardTraced.
@@ -86,6 +88,17 @@ pub const Engine = struct {
     /// The argmax word of the last gated forward, read once when it was written
     /// (a later forward may reuse the arena word); null after any other forward.
     d2_last: ?u32 = null,
+    // ---- climb 2, exact prefill ----
+    /// Prepared inputs of the matrix-unit linears (mk_x2_prep layout); null unless knobs.x2_linear.
+    x2prep: ?metal.Buffer = null,
+    /// The input rows `x2prep` holds now; cleared by any write that could change them.
+    x2_key: ?PrepKey = null,
+    /// Batched exact attention scratch (knob x2_attention): scores/es and f, rows x
+    /// heads x x2att_stride words each, and (m, l) per (row, head, class), for
+    /// x2att_rows rows at a time.
+    x2att: ?[3]metal.Buffer = null,
+    x2att_stride: u32 = 0,
+    x2att_rows: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, program: *const ir.Program, ctx: metal.Context, store: *const weights.Store, knobs: Knobs, context: u32) !Engine {
         try knobs.validate();
@@ -194,6 +207,44 @@ pub const Engine = struct {
         errdefer if (d2_gate_buf) |b| b.deinit();
         if (d2_gate_buf) |b| @memset(b.structs(u32), 0);
 
+        // climb 2, exact prefill: room for the widest q4 linear input.
+        var x2prep: ?metal.Buffer = null;
+        if (knobs.x2_linear) {
+            var max_n: u32 = 16;
+            for (program.ops) |op| switch (op) {
+                .linear => |l| if (q4Fast(bound[l.w], l.x.width)) {
+                    max_n = @max(max_n, l.x.width);
+                },
+                else => {},
+            };
+            x2prep = try ctx.alloc(exact2.prepLayout(batch, max_n).words);
+        }
+        errdefer if (x2prep) |b| b.deinit();
+        var x2att: ?[3]metal.Buffer = null;
+        var x2att_stride: u32 = 0;
+        var x2att_rows: u32 = 0;
+        if (knobs.x2_attention) {
+            var heads: u32 = 0;
+            for (program.ops) |op| switch (op) {
+                .attention => |at| {
+                    const cap = program.states[at.keys].capacity(batch, context);
+                    x2att_stride = @max(x2att_stride, if (at.window != 0) @min(at.window, cap) else cap);
+                    heads = @max(heads, at.heads);
+                },
+                else => {},
+            };
+            if (x2att_stride != 0) {
+                // At most 32 M words per score array; rows beyond that run in chunks.
+                x2att_rows = @intCast(@max(1, @min(@as(usize, batch), (32 << 20) / (@as(usize, heads) * x2att_stride))));
+                const nwords = @as(usize, x2att_rows) * heads * x2att_stride;
+                const s0 = try ctx.alloc(nwords);
+                errdefer s0.deinit();
+                const s1 = try ctx.alloc(nwords);
+                errdefer s1.deinit();
+                x2att = .{ s0, s1, try ctx.alloc(@as(usize, x2att_rows) * heads * 16) };
+            }
+        }
+        errdefer if (x2att) |bs| for (bs) |b| b.deinit();
         return .{
             .gpa = gpa,
             .program = program,
@@ -217,6 +268,10 @@ pub const Engine = struct {
             .partials = partials,
             .splitk = splitk,
             .d2_gate_buf = d2_gate_buf,
+            .x2prep = x2prep,
+            .x2att = x2att,
+            .x2att_stride = x2att_stride,
+            .x2att_rows = x2att_rows,
         };
     }
 
@@ -236,6 +291,8 @@ pub const Engine = struct {
         if (self.scores) |b| b.deinit();
         if (self.partials) |b| b.deinit();
         if (self.splitk) |b| b.deinit();
+        if (self.x2prep) |b| b.deinit();
+        if (self.x2att) |bs| for (bs) |b| b.deinit();
     }
 
     /// Logical reset: positions >= 0 are rewritten before any read, and conv
@@ -305,6 +362,7 @@ pub const Engine = struct {
         const t_begin = io.now() catch 0; // decode climb 2
         var next_trace: usize = 0;
         self.prep_key = null;
+        self.x2_key = null; // climb 2, exact prefill
         for (self.steps) |step| {
             const first = step.first();
             const head = first >= (if (trace != null) self.program.head_start else self.head_start);
@@ -317,6 +375,14 @@ pub const Engine = struct {
                 },
                 .projections, .glu => {},
                 else => self.prep_key = null,
+            }
+            // climb 2, exact prefill: the same rule for the matrix-unit prep.
+            switch (step) {
+                .op => |i| if (self.program.ops[i] != .linear) {
+                    self.x2_key = null;
+                },
+                .projections, .glu => {},
+                else => self.x2_key = null,
             }
             switch (step) {
                 .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
@@ -397,6 +463,22 @@ pub const Engine = struct {
         };
     }
 
+    // ---- climb 2, exact prefill ----
+    /// Prepare rows [row0, row0 + rows) of `x` (unless `x2prep` holds them) and run
+    /// the matrix-unit linear with operands `p`.
+    fn x2Linear(self: *Engine, x: ir.View, qb: [3]metal.Buffer, p: *gpu.Params, row0: u32, rows: u32) !void {
+        const key: PrepKey = .{ .state = x.state, .col = x.col, .width = x.width, .row0 = row0, .rows = rows };
+        const fresh = if (self.x2_key) |k| !std.meta.eql(k, key) else true;
+        try exact2.encodeLinear(self.ctx, qb, self.arena, self.x2prep.?, p, fresh, self.knobs.x2_half);
+        self.x2_key = key;
+    }
+    /// A dispatch wrote `out`: the matrix-unit prep is stale if it overlaps it.
+    fn x2Written(self: *Engine, out: ir.View) void {
+        if (self.x2_key) |k| if (k.state == out.state and k.col < out.col + out.width and out.col < k.col + k.width) {
+            self.x2_key = null;
+        };
+    }
+
     /// The reference schedule: exactly one dispatch per op.
     fn encode(self: *Engine, op: ir.Op, row0: u32, rows: u32) !void {
         var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
@@ -455,6 +537,11 @@ pub const Engine = struct {
                 } else if (rows > 1 and self.splitk != null and mlxApplies(w, p.n, p.m, rows)) {
                     // prefill-mlx (mlx-arith tier): MLX's arithmetic, not the reference's.
                     _ = try mlxLinear(self.ctx, qb, self.arena, self.splitk.?, &p);
+                    self.prepWritten(l.out);
+                } else if (rows > 1 and self.x2prep != null and q4Fast(w, p.n) and exact2.applies(p.sdtype, p.bdtype)) {
+                    // climb 2, exact prefill
+                    try self.x2Linear(l.x, qb, &p, row0, rows);
+                    self.x2Written(l.out);
                     self.prepWritten(l.out);
                 } else if (rows > 1 and self.prep != null and q4Fast(w, p.n)) {
                     // prefill objective (prefill search)
@@ -524,6 +611,7 @@ pub const Engine = struct {
             .attention => |a| {
                 if (try encodeDecodeAttention(self, a, null, row0, rows)) return;
                 if (try encodeMlxAttention(self, a, null, row0, rows)) return;
+                if (try encodeX2Attention(self, a, null, row0, rows)) return; // climb 2, exact prefill
                 const q = self.words(a.q);
                 const o = self.words(a.out);
                 const k = self.program.states[a.keys];
@@ -577,7 +665,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
     var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
     switch (step) {
         .op => unreachable,
-        .projections => |m| if (rows > 1 and (self.prep != null or self.splitk != null)) {
+        .projections => |m| if (rows > 1 and (self.prep != null or self.splitk != null or self.x2prep != null)) {
             // prefill-mlx (knob mlx_multi): the unsplit ones in one launch, the rest alone.
             var done: [4]bool = @splat(false);
             if (self.knobs.mlx_multi and self.splitk != null) try encodeMlxMulti(self, ops[m.first..][0..m.count], &done, row0, rows);
@@ -606,6 +694,13 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const l0 = ops[i].linear;
             const l1 = ops[i + 1].linear;
             const b = ops[i + 2].binary;
+            if (rows > 1 and self.x2prep != null) {
+                // climb 2, exact prefill: gate, up and the product as the reference's three operations.
+                for (0..3) |k| try self.encode(ops[i + k], row0, rows);
+                self.x2Written(b.out);
+                self.prepWritten(b.out);
+                return;
+            }
             if (rows > 1 and self.splitk != null and mlxApplies(self.bound[l0.w], l0.x.width, l0.out.width, rows) and
                 mlxApplies(self.bound[l1.w], l1.x.width, l1.out.width, rows))
             {
@@ -717,6 +812,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             const b = ops[i + 1].binary;
             if (try encodeDecodeAttention(self, a, b, row0, rows)) return;
             if (try encodeMlxAttention(self, a, b, row0, rows)) return;
+            if (try encodeX2Attention(self, a, b, row0, rows)) return; // climb 2, exact prefill
             const q = self.words(a.q);
             const o = self.words(b.out);
             const g = self.words(b.b);
@@ -791,6 +887,31 @@ fn encodeDecodeAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate:
     try gpu.dispatch(self.ctx, "mk_dec_chain_block", &.{ self.arena, self.caches[a.values].?, scores }, &p, @as(usize, a.heads) * E * 256, 256);
     return true;
 }
+// ---- climb 2, exact prefill ----
+
+/// Batched exact attention (knob x2_attention, exact2.metal): scores, softmax
+/// scalars, value chains and merge for rows > 1, head dim 97..128 and 4 query heads
+/// per KV head (the compiled variants); otherwise false (the reference runs).
+fn encodeX2Attention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
+    const bufs = self.x2att orelse return false;
+    if (rows < 2 or !exact2.attentionApplies(a.heads, a.kv_heads, a.dim)) return false;
+    const capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+    const span = if (a.window != 0) @min(a.window, capacity) else capacity;
+    if (span > self.x2att_stride or a.heads * self.x2att_stride * @as(usize, self.x2att_rows) > bufs[0].floats().len) return false;
+    const q = self.words(a.q);
+    const o = if (gate) |b| self.words(b.out) else self.words(a.out);
+    var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position, .x = q.off, .xs = q.stride, .y = o.off, .ys = o.stride, .heads = a.heads, .kv_heads = a.kv_heads, .dim = a.dim, .window = a.window, .capacity = capacity, .scale = a.scale, .every = self.x2att_stride };
+    if (gate) |b| {
+        const g = self.words(b.b);
+        p.z = g.off;
+        p.zs = g.stride;
+        p.act_b = @backingInt(b.b_act);
+        p.flags |= exact2.att_gated;
+    }
+    try exact2.encodeAttention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, bufs, &p, self.x2att_rows);
+    return true;
+}
+
 /// Fused attention prep (knob fuse_attn_prep, plan.matchAttnPrep): mk_dec_attn_prep.
 fn encodeAttnPrep(self: *Engine, i: u32, row0: u32, rows: u32) !void {
     const ops = self.program.ops;
@@ -926,6 +1047,7 @@ fn d2Encode(self: *Engine, pos: u32, gen: ?u32) !void {
     self.position = pos;
     defer self.position = saved;
     self.prep_key = null;
+    self.x2_key = null; // exact prefill's prepared inputs: single-row forwards never use them
     if (gen) |g| {
         var p: gpu.Params = .{ .every = g, .n = self.knobs.d2_gate_spins };
         try gpu.dispatch(self.ctx, "mk_d2_gate_packed", &.{self.d2_gate_buf.?}, &p, 32, 32);

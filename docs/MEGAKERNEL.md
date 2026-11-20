@@ -17,6 +17,7 @@
 | `src/mega/prefill.metal` | exact multi-row variants (matrix-matrix 4-bit linear, gated conv over rows), each behind a knob |
 | `src/mega/decode2.metal` | decode climb 2: the gated pre-encoded decode (gate and gated embedding) and a register-resident sandwich norm, each behind a knob; `mk_d2_empty` for `nano d2-probe` |
 | `src/mega/decode2_probe.zig`, `decode2_tests.zig` | `nano d2-probe` (launch, barrier, submission and wake latency, matvec bandwidth); the headless bit tests of `decode2.metal` |
+| `src/mega/exact2.metal`, `exact2.zig` | exact multi-row variants on the matrix units (4-bit linear as simdgroup 8 x 8 x 8 steps, batched attention), each behind a knob; `nano exact2-bench` |
 | `src/mega/mlx.metal` | the `mlx-arith` tier: ports of stock MLX's batched kernels (`affine_qmm_t`, split K, steel attention), bit-identical to MLX, not to the reference (`docs/MLX-PREFILL.md`) |
 | `src/mega/mlxop.zig` | `nano mlx-op`: one MLX-arithmetic operation on given inputs, for `tools/nano_mlx_ops.py` |
 | `src/mega/knobs.zig` | the run-time knobs |
@@ -113,6 +114,9 @@ A **knob** selects among compiled-in variants at run time: `nano ... --knobs FIL
 | `d2_gate` | bool | single-row forwards with logits: while token k runs, the forward for k + 1 is encoded and committed behind a one-thread GPU gate that the host opens only after it has read token k and written token k + 1 (section 4a); needs `batch` >= 2 (else ungated) |
 | `d2_gate_spins` | 1.. (default 200,000) | the gate's bound in atomic loads; a gate that gives up first costs a synchronous recomputation, never a wrong token |
 | `d2_norm_regs` | bool | single-row forwards: the fused sandwich norm keeps y, r and both weights in registers (`mk_d2_norm_add_norm`) instead of storing r and reading it back |
+| `x2_linear` | bool | multi-row 4-bit linears through `mk_x2_prep` + `mk_x2mm_q4` (exact2.metal): each quad chain of the reference tree is one simdgroup 8 x 8 x 8 step; projections and GLU run as their separate linears and the reference binary op |
+| `x2_half` | bool | with `x2_linear`: the unpacked codes staged as half in threadgroup memory (exact for masked 4-bit codes) |
+| `x2_attention` | bool | multi-row attention (head dim up to 256, 1 to 8 query heads per KV head) as scores, softmax scalars and value chains over all rows (exact2.metal) |
 
 None of these changes any row's arithmetic except the `mlx_*` knobs, which replace it by stock MLX's (section 5, "Two tiers"); QD admission (below) checks that bit for bit rather than trusting it. Fusion is a planner pass (`plan.build`) over structural patterns (op kinds, views, activations, weight formats and liveness of intermediates via `plan.deadAfter`), so it applies to any program with the pattern, not to LFM3 by name.
 
@@ -175,7 +179,7 @@ Honest estimate: the front end (`flint.zig`, about 300 lines) plus these four op
 - One sequence at a time; no multi-row padded batches.
 - Activations, caches and accumulation are float32 (KV bytes are 4 per element). No bf16 activation mode, so outputs differ from stock MLX's default bf16 run by up to 0.5 in logits, as the golden documents for MLX itself; they match MLX float32 at the float32 noise floor.
 - Every op is a separate dispatch in the reference schedule (465 per LFM3 decode token); there is no persistent single-dispatch interpreter for the megakernel. With `d2_gate` the gate is a bounded one-thread spin on a host-written word, not threadgroups waiting on each other. The bridge puts a barrier between every two dispatches; stock MLX overlaps independent kernels (its encoder is concurrent), which `mlx_multi` recovers only for products sharing an input.
-- Exact prefill (`prefill-mm-trim`) is 2.9 to 4.8 times slower than the `mlx-arith` tier (64 to 4,096 tokens): the exact tree (MLX's `qmv_fast` per row) cannot use the matrix units without reassociating its sums. The `mlx-arith` tier is float32 only; it is ahead of stock MLX float32 at every length but 9 to 12% behind stock's bf16 prefill at 1,024 and 4,096 tokens (half-width activations), which no tier here matches (`benchmarks/lfm3-prefill-search.md`).
+- Exact prefill is about a third of the `mlx-arith` tier's rate at 1,024 and 4,096 tokens: the exact tree (MLX's `qmv_fast` per row) uses the matrix units only for its 4-input quad chains (`x2_linear`), so half of every 8 x 8 x 8 step is zeros and the quad sums, scale and bias terms, per-lane sums and the pair tree over the 32 lane sums are element-wise work. The `mlx-arith` tier is float32 only; with the restructured kernels (`mlx_qmm2`, `mlx_glu2`, `mlx_attention2`) it is ahead of stock MLX float32 at every length and level with or slightly ahead of stock's bf16 prefill at 1,024 and 4,096 tokens (`benchmarks/lfm3-prefill-search.md`).
 - `mlxVectorLimit` encodes MLX's `get_qmv_batch_limit` for Ultra GPUs (architecture size `d`, every generation; this machine is `applegpu_g15d`) only; base, Pro and Max GPUs need their rows of that table before `mlx_linear` reproduces MLX's kernel choice.
 - `eval --hidden-out` synchronises the GPU after every traced layer; it is for correctness runs only and is slow fed one token at a time.
 - Greedy decoding only; no sampling, repetition penalty or speculative decoding. No rewind and no prefix cache in `nano session` (state is easy to snapshot: the persistent buffers' valid rows and the position).

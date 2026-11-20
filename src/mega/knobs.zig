@@ -110,6 +110,22 @@ pub const Knobs = struct {
     /// registers (mk_d2_norm_add_norm) where n <= 4 x its threadgroup.
     d2_norm_regs: bool = false,
 
+    // ---- climb 2, exact prefill (exact tier) ----
+    /// Multi-row affine 4-bit linears (plain; projections and GLU run as their
+    /// separate linears and the reference binary op) through mk_x2_prep and the
+    /// matrix-unit kernel mk_x2mm_q4 (exact2.metal): each 4-input quad chain of
+    /// the reference tree is one zero-padded simdgroup 8 x 8 x 8 step, the rest is
+    /// the reference's element-wise arithmetic. Bit-identical to the reference.
+    x2_linear: bool = false,
+    /// Multi-row attention (head dim 97..128, 4 query heads per KV head) as three
+    /// launches (exact2.metal): every visible score with the reference's dot tree,
+    /// the online-softmax scalars per (row, head, SIMD class) in step order, then
+    /// the value recurrences and the class merge. Bit-identical to mk_attention.
+    x2_attention: bool = false,
+    /// With x2_linear: the unpacked codes staged as half (exact for 4-bit masked
+    /// codes), halving the threadgroup traffic of the weight operand.
+    x2_half: bool = false,
+
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
 

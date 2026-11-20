@@ -1,0 +1,29 @@
+{
+ "name": "x2-att-h",
+ "parent": "x2-att",
+ "family": "prefill-mm",
+ "knobs": {
+  "fuse_projections": true,
+  "fuse_glu": true,
+  "fuse_norms": true,
+  "fuse_conv": true,
+  "fuse_gate": true,
+  "decode_attention": 2,
+  "fuse_attn_prep": true,
+  "decode_argmax": 1,
+  "batch": 1024,
+  "prefill_mm": true,
+  "mm_rows": 2,
+  "mm_tokens": 8,
+  "mm_half": true,
+  "conv_rows": true,
+  "head_trim": true,
+  "x2_linear": true,
+  "x2_attention": true,
+  "x2_half": true
+ },
+ "hypothesis": "Exact tier. x2-att with the linear's unpacked codes staged as half in threadgroup memory (x2_half; exact, the masked 4-bit codes are integers up to 15 * 4096 with 4 significant bits) and the weight fragments built from one half2 load per lane: half the threadgroup traffic of the B operand, which a knock-out profile put among the largest costs after the matrix steps. exact2-bench at 1,024 tokens: 2.71 / 2.86 / 2.86 / 2.95 / 2.25 TMAC/s vs 2.68 / 2.84 / 2.84 / 2.89 / 2.19 (2048x2048, 6144x2048, 7680x2048, 2048x7680, 512x2048). Expect +1.5% prefill at 1,024 and 4,096.",
+ "expected": {
+  "prefill": 1.5
+ }
+}

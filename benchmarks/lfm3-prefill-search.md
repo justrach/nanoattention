@@ -107,6 +107,43 @@ Profiles (`FLINT_PROFILE=1`, one warm-up and one profiled run, GPU time per run;
 - **Why 4,096 was slower than 1,024 by more than stock MLX's**: with exact attention it was (screen 4: 3,606 at 1,024 against 3,091 at 4,096) because the reference attention gives each (row, head) a threadgroup that walks every visible position serially, which grows with the prompt. With the attention port, and the sliding layers' masked blocks skipped, 4,096 is now 1.0% below 1,024 (stock f32: +0.6%, bf16: +2.3%).
 - **Exact tier**: the exact expression tree is MLX's `qmv_fast` per row (lanes own 16-input segments, prescaled inputs, one `simd_sum`), which cannot use the 8 x 8 matrix units without reassociating the sums; its matrix-matrix kernels reuse each unpacked weight for 8 tokens but still issue scalar multiply-adds, at roughly a quarter of the port's rate. And its attention is the reference's (28.6% at 4,096). This is the cost of bit identity with token-at-a-time decoding: 3.8 to 4.8 times at 1,024 to 4,096 tokens.
 
+## Second climb, exact tier: the matrix units on the exact tree
+
+Same machine, workload and admission as above. Trials: `tools/nano_qd.py trial ... --long --extra-feeds 100,255 --objectives prefill --rounds 3`, each candidate and the timed comparison run from one frozen binary, every process under the lock. Kernel screens: `nano exact2-bench 1024 10` (one locked process; synthetic weights 2 bytes off a word boundary, bf16 scales, 1,024 tokens, 10 repeats, GPU time; every output compared bit for bit with `mk_linear_q4_r2_t4`). Shapes are (outputs x inputs) 2048x2048, 6144x2048, 7680x2048, 2048x7680, 512x2048; TMAC/s counts useful multiply-adds.
+
+### Full trials (3 interleaved rounds, prefill tok/s)
+
+| trial | candidate | 64 | 1,024 | 4,096 | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 20261120T214933 (binary `66466ac7…`) | `x2-att` | 1,251.0 / 1,254.2 / 1,244.0 | 1,867.5 / 1,865.8 / 1,865.7 | 1,732.3 / 1,732.8 / 1,733.0 | **replaces-elite** in all three prefill-mm cells |
+| same session | `prefill-mm-trim` (compared) | 1,218.2 / 1,226.8 / 1,217.2 | 1,289.0 / 1,289.6 / 1,287.9 | 997.7 / 997.4 / 997.0 | +2.7% / +44.7% / +73.7% for `x2-att` |
+| 20261120T220330 (binary `862323bd…`) | `x2-att-h` | 1,267.3 / 1,266.8 / 1,266.6 | 1,883.1 / 1,887.3 / 1,886.0 | 1,749.1 / 1,748.3 / 1,748.5 | **replaces-elite** at 64 (+2.2%); loses at 1,024 (+1.0%) and 4,096 (+0.9%), inside the 1% margin |
+| same session | `x2-att` (elite) | 1,241.0 / 1,231.0 / 1,239.9 | 1,868.2 / 1,867.1 / 1,867.6 | 1,732.7 / 1,732.4 / 1,731.3 | |
+
+The round's target was 2,000 at 1,024 and 1,700 at 4,096: met at 4,096, not at 1,024 (1,866 to 1,886).
+
+### Candidates and screens
+
+| candidate or variant | hypothesis (short) | admission | measurement | verdict |
+| --- | --- | --- | --- | --- |
+| `x2_linear`, first form (`x2-linear`) | a quad chain `fma(x3,c3, fma(x2,c2, fma(x0,c0, x1*c1)))` is one 8 x 8 x 8 step with C = +0 and the other four k slots zero in both operands; everything after it is element-wise | bit-identical (7 tiny + short/window/long, feeds 1/100/255/1,024); kernel test with signed zeros, subnormals, tiny inputs, inf/NaN, cancellation | screen at 1,024: 1,642.4 / 1,643.8 vs prefill-mm-trim 1,289.4 / 1,289.0 (+27.5%) | stepping stone |
+| linear tilings (bench) | unstaged 8 x 8 blocks; staged one segment; staged with zero-padded layouts and `simdgroup_load`; software-pipelined staging | bit-identical | 1.41-1.46; 1.5-1.6 (2.0 once loops fully unroll); 2.45-2.64; 2.54 / 2.71 / 2.69 / 2.73 / 2.07 | the last was kept until quad pairs |
+| scalar, lanes own rows (bench) | the 32 virtual lanes as a sequential tree per SIMD group, inputs a broadcast load for all lanes | bit-identical | 1.2-2.2 TMAC/s | dropped |
+| compact layouts, hybrid layouts, 3 or 6 segments per stage, `dot` from the first step, tree levels in threadgroup memory (bench) | less threadgroup memory or fewer element-wise operations | bit-identical | all at or below the kept kernel (6 segments per stage: 1.7-2.4) except tree levels in threadgroup memory: mixed, about +1% overall | dropped |
+| quad pairs (bench, kept) | both operands hold two quads; per lane the token operand's other quad is zeroed, so one fragment pair feeds two steps; half the fragment loads | bit-identical | 2.69 / 2.83 / 2.82 / 2.85 / 2.19 TMAC/s (elite kernel 2.07 / 2.14 / 2.15 / 1.98 / 1.89) | in `x2-att` |
+| `x2_attention` | `mk_attention` for all rows as scores (reference dot tree), softmax scalars per (row, head, SIMD class) in step order, value recurrences with V loaded once per block, class merge | bit-identical | profile at 4,096: attention 1.20 s -> 0.31 s per prompt (chain 6.5 -> 1.9 ms a call after loading a block's 32 values before the serial steps; softmax scalars 1.03 -> 0.25 ms with four chains per SIMD group) | in `x2-att` |
+| 32-dot butterfly for the scores (profile) | one transposing xor butterfly gives the pair tree of 32 dots in 31 shuffles | bit-identical | scores 1.46 -> 4.48 ms a call | reverted |
+| `x2_half` (`x2-att-h`) | codes staged as half in threadgroup memory | bit-identical | trial above | holds the 64 cell |
+
+### What limits exact prefill now
+
+Profiles (`FLINT_PROFILE=1`, `x2-att`, GPU time per prompt): at 1,024 tokens the linears are 93% (about 2.65 TMAC/s effective), attention 4.6%; at 4,096 the linears are 2.06 s and attention about 0.25 s (scores 128 ms, value chains 100 ms, softmax scalars 22 ms).
+
+- Half of every matrix step is zeros: the reference's chain is 4 products long and the step's is 8, and an 8 x 8 output block can hold only 64 chains, so no slot assignment uses the other half. Raw throughput of the step on this machine (probe kernel): 9.5 T FMA/s accumulating in place, 8.6 with a fresh accumulator plus an add, so the useful ceiling is about 4.3 TMAC/s against the kernel's 2.85.
+- A knock-out profile of the kernel (7680x2048): without the threadgroup fragment loads 6.0 -> 4.0 ms (before quad pairs), without the scale and bias epilogue -0.6 ms; the steps with their `dot` adds alone run near 10 T FMA/s. Removing half the fragment loads (quad pairs) gave +5%; layout, stage-size and register variants gave at most a few percent, and more threadgroup memory than about 17 KB per threadgroup costs heavily (6 segments per stage).
+- The element-wise steps the exact tree requires (one add per step output, the `fma(scale, dot, xsum * bias)` term and running sum per segment, the 31 adds of the pair tree) are about 15% of the step time and are not removable.
+- At 64 tokens the matrix kernel has 32-token tiles, so a 64-row forward launches few threadgroups; the gain there is small (+2.7%).
+
 ## Removed variant code
 
 Held no cell and fed no elite (checked against `trials.jsonl` parents); the evidence is the screens above:
@@ -115,4 +152,5 @@ Held no cell and fed no elite (checked against `trials.jsonl` parents); the evid
 - `prefill_attention` (`mk_attention[_gated]_p4/p8/p16`): 996 vs 1,019 tok/s at 1,024 (neutral).
 - `inexact_mma`, `inexact_mma64` (`mk_mma[64]_q4_inexact`): the NOT ADMISSIBLE gap measurement, 1,730 tok/s at 1,024; superseded by the `mlx-arith` tier, whose kernels are MLX's own.
 - The `prefill_mm` tiles other than 2 x 8 half (screens above); `mm_rows` now defaults to 2 so the default knobs validate.
-- Second climb (`c2-prefill-mlx`): nothing removed from the tree. Every kernel it added (`mk_mlx2_qmm_*`, `mk_mlx2_multi_*`, `mk_mlx2_glu_*`, `mk_mlx2_attention[_gated]`, `mk_gated_conv_rows2`) is in the elite `mlx-prefill-c2`. The variants it lost on were prototypes compiled through `mx.fast.metal_kernel` and never entered the tree (no-staging, transposed or swizzled weight tiles, larger tiles, `simdgroup_load`; Q-in-registers or reordering alone for attention); their per-op numbers are in the table above.
+- Second climb, `mlx-arith` tier: nothing removed from the tree. Every kernel it added (`mk_mlx2_qmm_*`, `mk_mlx2_multi_*`, `mk_mlx2_glu_*`, `mk_mlx2_attention[_gated]`, `mk_gated_conv_rows2`) is in the elite `mlx-prefill-c2`. The variants it lost on were prototypes compiled through `mx.fast.metal_kernel` and never entered the tree (no-staging, transposed or swizzled weight tiles, larger tiles, `simdgroup_load`; Q-in-registers or reordering alone for attention); their per-op numbers are in the table above.
+- Second climb, exact tier: every `exact2-bench` variant other than the quad-pair kernel and its half-code form (the screens above), the 32-dot butterfly score kernel and the one-chain-per-SIMD-group softmax kernel; none was compiled into a trial binary that took a cell.
