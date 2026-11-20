@@ -223,16 +223,18 @@ Same M3 Ultra, same 4-bit checkpoint, each engine in its own process under one l
 
 | Prompt tokens | | `exact` | `mlx-prefill` | Stock MLX FP32 | Stock MLX BF16 |
 | ---: | --- | ---: | ---: | ---: | ---: |
-| 64 | decode tok/s | **240.0** | **240.8** | 164.5 | 169.1 |
-| 1,024 | decode tok/s | **234.0** | **235.9** | 162.2 | 166.3 |
-| 4,096 | decode tok/s | **223.8** | **225.3** | 162.9 | 166.6 |
-| 64 | prefill tok/s | 1,203 | **3,458** | 2,454 | 2,621 |
-| 1,024 | prefill tok/s | 1,275 | 4,787 | 4,563 | **5,308** |
-| 4,096 | prefill tok/s | 990 | 4,748 | 4,587 | **5,398** |
+| 64 | decode tok/s | **241.5** | **243.2** | 185.3 | 195.7 |
+| 1,024 | decode tok/s | **247.8** | **246.9** | 188.4 | 192.8 |
+| 4,096 | decode tok/s | **233.8** | **236.7** | 181.9 | 186.4 |
+| 64 | prefill tok/s | 1,218 | **3,523** | 2,592 | 2,798 |
+| 1,024 | prefill tok/s | 1,289 | **5,494** | 4,622 | 5,376 |
+| 4,096 | prefill tok/s | 987 | **5,452** | 4,641 | 5,422 |
 
-Decode is ahead of stock MLX at every length. Exact prompt ingestion is a quarter of stock MLX's; with MLX's own arithmetic it passes stock FP32 and stays 10 to 12% behind stock BF16 at the longer lengths, which would need a BF16 activation mode. The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
+Prompt ingestion with MLX's own arithmetic is ahead of stock MLX in both precisions while staying float32: by 26% at 64 tokens, and by 2% and 0.5% over stock BF16 at 1,024 and 4,096 (the last is inside this machine's run-to-run drift: call it level). Its kernels keep stock MLX's output bits and change only tile shape, staging and scheduling ([what changed](benchmarks/lfm3-prefill-search.md)). Exact prompt ingestion is about a quarter of that.
 
-A second climb on the `mlx-arith` tier (same output bits for every kernel, `benchmarks/lfm3-prefill-search.md`) restructured the batched matmul, fused the GLU and rescheduled attention: in one later locked session `mlx-prefill.json` read prompts at 3,514 / 5,491 / 5,483 tokens a second at 64 / 1,024 / 4,096 against stock MLX BF16's 2,800 / 5,380 / 5,461 and FP32's 2,628 / 4,639 / 4,662, still in float32.
+Decode in this table is synchronous on both sides: one forward, then the host reads the token. Stock MLX's own generate loop does better than its synchronous loop by submitting the next step before reading the current token (`mx.async_eval`); measured the same way on this model it decodes at about 265 to 273 tokens a second, which is above `nano`'s synchronous decode.
+
+The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
 
 The speed came from a quality-diversity search over exact candidates ([method](docs/QD.md), [archive](benchmarks/lfm3-qd/), [decode](benchmarks/lfm3-decode-search.md), [prefill](benchmarks/lfm3-prefill-search.md)). See also [the megakernel's design and how to add a model](docs/MEGAKERNEL.md), [the model as implemented](docs/LFM3.md), [what stock MLX does on prefill](docs/MLX-PREFILL.md), and [the first measurements](benchmarks/lfm3-megakernel.md). Limits: one sequence, greedy decoding, float32 activations, no rewind or prefix cache in `nano session` yet, and Flint itself is not ported to the megakernel.
 
