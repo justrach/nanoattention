@@ -95,6 +95,21 @@ pub const Knobs = struct {
     /// ring slot advanced per tap instead of a 64-bit modulo per tap. Exact tier.
     conv_rows2: bool = false,
 
+    // ---- decode climb 2 (c2-decode, decode objective) ----
+    /// Gated pre-encoded decode (exec.d2GatedForward): while token k runs, the
+    /// forward for position k + 1 is encoded and committed behind a GPU gate
+    /// (mk_d2_gate_packed) that the host opens only after it has read token k
+    /// back and written token k + 1; the host still reads every token before
+    /// the next forward starts. Same kernels and arithmetic (the embedding reads
+    /// its token from the gate word, mk_d2_embed_gated). Single-row forwards.
+    d2_gate: bool = false,
+    /// Gate spin bound (iterations of one atomic load). A gate that gives up
+    /// before the host opens it costs a recomputation, never a wrong token.
+    d2_gate_spins: u32 = 200000,
+    /// Single-row forwards: the fused sandwich norm with its operands held in
+    /// registers (mk_d2_norm_add_norm) where n <= 4 x its threadgroup.
+    d2_norm_regs: bool = false,
+
     /// (rows, tokens, half) of every compiled mk_mm_q4 / mk_mm_glu_q4 variant.
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
 
@@ -114,6 +129,7 @@ pub const Knobs = struct {
         if (self.mm_group == 0 or self.mm_group % 32 != 0 or self.mm_group > 1024) return error.InvalidMmGroup;
         if (self.decode_attention != 0 and self.decode_attention != 2) return error.InvalidDecodeAttention;
         if (self.decode_argmax > 1) return error.InvalidDecodeArgmax;
+
     }
 
     /// Apply `name=value` (flag form) to the knob of that name.

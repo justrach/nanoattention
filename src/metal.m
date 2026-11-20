@@ -542,3 +542,175 @@ void *fm_map(const char *path, size_t *length, size_t *mapped_length) {
     return p;
 }
 void fm_unmap(void *bytes, size_t length) { munmap(bytes, length); }
+
+// ---- decode climb 2 (c2-decode): asynchronous commits, waits and the probes'
+// dispatch policy. Additive: nothing above calls these, and fm_dispatch /
+// fm_finish behave exactly as before. Profiled or replaying contexts are refused
+// (fm_d2_dispatch falls back to fm_dispatch). Pending commits are per process:
+// one context at a time may have them; it must drain them before fm_close.
+enum { FM_D2_BARRIER = 1, FM_D2_CONCURRENT = 2, FM_D2_PENDING = 64 };
+static struct {
+    void *owner;
+    id<MTLCommandBuffer> commands[FM_D2_PENDING];
+    double committed[FM_D2_PENDING];
+    size_t count;
+} fm_d2_pending;
+static struct { void *owner; id<MTLSharedEvent> event; double signaled; } fm_d2_event;
+
+static double fm_d2_host_seconds(void) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (double)mach_absolute_time() * tb.numer / tb.denom * 1e-9;
+}
+
+// FM_D2_BARRIER: a buffer barrier before this dispatch (fm_dispatch always puts
+// one between two dispatches). FM_D2_CONCURRENT: a new encoder is concurrent, so
+// only explicit barriers order its dispatches.
+int fm_d2_dispatch(void *opaque, const char *name, void *const *buffers, size_t count,
+                   const void *params, size_t param_size, size_t threads, size_t group, int flags) {
+    FMContext *c = opaque;
+    if (c->profile || c->replay) return fm_dispatch(opaque, name, buffers, count, params, param_size, threads, group);
+    if (!c->encoder && (flags & FM_D2_CONCURRENT)) {
+        if (!c->batch_pool) c->batch_pool = [[NSAutoreleasePool alloc] init];
+        if (!c->command) c->command = [[c->queue commandBuffer] retain];
+        c->encoder = [[c->command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent] retain];
+        if (!c->encoder) { fail(@"Cannot create compute encoder"); return 0; }
+    }
+    if (!(flags & FM_D2_BARRIER)) c->has_dispatch = 0;
+    return dispatch_impl(opaque, name, buffers, count, params, param_size, threads, group);
+}
+
+// Commit the open command buffer without waiting; it joins the pending list.
+int fm_d2_commit(void *opaque) {
+    FMContext *c = opaque;
+    if (c->profile || c->replay) { fail(@"fm_d2_commit: not with profiling or replay"); return 0; }
+    if (!c->command) return 1;
+    if (fm_d2_pending.count && fm_d2_pending.owner != opaque) { fail(@"fm_d2_commit: another context has pending work"); return 0; }
+    if (fm_d2_pending.count == FM_D2_PENDING) { fail(@"fm_d2_commit: too many pending command buffers"); return 0; }
+    [c->encoder endEncoding]; [c->encoder release]; c->encoder = nil;
+    c->has_dispatch = 0;
+    ++c->submissions;
+    fm_d2_pending.committed[fm_d2_pending.count] = fm_d2_host_seconds();
+    [c->command commit];
+    fm_d2_pending.owner = opaque;
+    fm_d2_pending.commands[fm_d2_pending.count++] = c->command; // keeps the retain
+    c->command = nil;
+    [c->batch_pool drain]; c->batch_pool = nil;
+    return 1;
+}
+static int fm_d2_retire(FMContext *c, id<MTLCommandBuffer> b, int ok) {
+    if (b.status != MTLCommandBufferStatusCompleted) {
+        if (ok) fail(b.error.localizedDescription ?: @"Metal command failed");
+        ok = 0;
+    }
+    double begin = b.GPUStartTime, end = b.GPUEndTime;
+    if (end >= begin) c->gpu_seconds += end - begin;
+    [b release];
+    return ok;
+}
+static void fm_d2_pop(size_t done) {
+    memmove(fm_d2_pending.commands, fm_d2_pending.commands + done, (fm_d2_pending.count - done) * sizeof(id));
+    memmove(fm_d2_pending.committed, fm_d2_pending.committed + done, (fm_d2_pending.count - done) * sizeof(double));
+    fm_d2_pending.count -= done;
+}
+// Wait, oldest first, until at most `keep` pending commits remain; 0 if any failed.
+int fm_d2_drain(void *opaque, size_t keep) {
+    FMContext *c = opaque;
+    if (!fm_d2_pending.count || fm_d2_pending.owner != opaque) return 1;
+    int ok = 1;
+    size_t done = 0;
+    while (fm_d2_pending.count - done > keep) {
+        id<MTLCommandBuffer> b = fm_d2_pending.commands[done++];
+        [b waitUntilCompleted];
+        ok = fm_d2_retire(c, b, ok);
+    }
+    fm_d2_pop(done);
+    return ok;
+}
+size_t fm_d2_pending_count(void *opaque) { return fm_d2_pending.owner == opaque ? fm_d2_pending.count : 0; }
+
+// Spin until the word at `watch` leaves `sentinel` or pending buffer `index`
+// (0 = oldest) reaches a final status; 0 if that buffer failed.
+int fm_d2_spin(void *opaque, size_t index, const volatile uint32_t *watch, uint32_t sentinel) {
+    if (fm_d2_pending.owner != opaque || index >= fm_d2_pending.count) { fail(@"fm_d2_spin: no such pending buffer"); return 0; }
+    id<MTLCommandBuffer> b = fm_d2_pending.commands[index];
+    while (__atomic_load_n(watch, __ATOMIC_ACQUIRE) == sentinel && b.status < MTLCommandBufferStatusCompleted) {}
+    if (b.status >= MTLCommandBufferStatusCompleted && b.status != MTLCommandBufferStatusCompleted) {
+        fail(b.error.localizedDescription ?: @"Metal command failed"); return 0;
+    }
+    return 1;
+}
+// Release the leading pending buffers that have finished; 0 if any failed.
+int fm_d2_reap(void *opaque) {
+    FMContext *c = opaque;
+    if (fm_d2_pending.owner != opaque) return 1;
+    int ok = 1;
+    size_t done = 0;
+    while (done < fm_d2_pending.count && fm_d2_pending.commands[done].status >= MTLCommandBufferStatusCompleted)
+        ok = fm_d2_retire(c, fm_d2_pending.commands[done++], ok);
+    fm_d2_pop(done);
+    return ok;
+}
+
+// d2-probe: finish the open command buffer and wait (spin on its status, or
+// waitUntilCompleted); times: commit, GPU start, GPU end, return (host seconds
+// on the GPUStartTime clock).
+int fm_d2_finish(void *opaque, int spin, double *times) {
+    FMContext *c = opaque;
+    if (c->profile || c->replay || !c->command) return fm_finish(opaque);
+    [c->encoder endEncoding]; [c->encoder release]; c->encoder = nil;
+    c->has_dispatch = 0;
+    ++c->submissions;
+    id<MTLCommandBuffer> b = c->command;
+    double t0 = fm_d2_host_seconds();
+    [b commit];
+    if (spin) { while (b.status < MTLCommandBufferStatusCompleted) {} }
+    [b waitUntilCompleted];
+    double t1 = fm_d2_host_seconds();
+    if (times) { times[0] = t0; times[1] = b.GPUStartTime; times[2] = b.GPUEndTime; times[3] = t1; }
+    c->command = nil;
+    int ok = fm_d2_retire(c, b, 1);
+    [c->batch_pool drain]; c->batch_pool = nil;
+    return ok;
+}
+// d2-probe: shared-event gating. fm_d2_gate makes the open (or a new) command
+// buffer wait, before its dispatches, until the event reaches `value`;
+// fm_d2_signal sets it from the host.
+int fm_d2_gate(void *opaque, uint64_t value) {
+    FMContext *c = opaque;
+    if (c->profile || c->replay || c->encoder) { fail(@"fm_d2_gate: needs a context with no open encoder"); return 0; }
+    if (fm_d2_event.owner != opaque) {
+        [fm_d2_event.event release];
+        fm_d2_event.event = [c->device newSharedEvent];
+        fm_d2_event.owner = opaque;
+        if (!fm_d2_event.event) { fail(@"Cannot create shared event"); return 0; }
+    }
+    if (!c->batch_pool) c->batch_pool = [[NSAutoreleasePool alloc] init];
+    if (!c->command) c->command = [[c->queue commandBuffer] retain];
+    [c->command encodeWaitForEvent:fm_d2_event.event value:value];
+    return 1;
+}
+int fm_d2_signal(void *opaque, uint64_t value) {
+    if (fm_d2_event.owner != opaque) { fail(@"fm_d2_signal: no event"); return 0; }
+    fm_d2_event.signaled = fm_d2_host_seconds();
+    fm_d2_event.event.signaledValue = value;
+    return 1;
+}
+// d2-probe: wait for the oldest pending commit; times as fm_d2_finish, with the
+// commit time replaced by a later signal's.
+int fm_d2_wait_oldest(void *opaque, int spin, double *times) {
+    FMContext *c = opaque;
+    if (!fm_d2_pending.count || fm_d2_pending.owner != opaque) { fail(@"fm_d2_wait_oldest: nothing pending"); return 0; }
+    id<MTLCommandBuffer> b = fm_d2_pending.commands[0];
+    if (spin) { while (b.status < MTLCommandBufferStatusCompleted) {} }
+    [b waitUntilCompleted];
+    double t1 = fm_d2_host_seconds();
+    if (times) {
+        double t0 = fm_d2_pending.committed[0];
+        if (fm_d2_event.owner == opaque && fm_d2_event.signaled > t0) t0 = fm_d2_event.signaled;
+        times[0] = t0; times[1] = b.GPUStartTime; times[2] = b.GPUEndTime; times[3] = t1;
+    }
+    int ok = fm_d2_retire(c, b, 1);
+    fm_d2_pop(1);
+    return ok;
+}

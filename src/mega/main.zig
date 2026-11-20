@@ -67,6 +67,12 @@ pub fn main(init: std.process.Init) !void {
         const reps = if (args.next()) |v| try std.fmt.parseInt(u32, v, 10) else 50;
         return @import("microbench.zig").run(a, reps);
     }
+    // decode climb 2: dispatch, barrier and read-back costs (synthetic; run under the lock).
+    if (std.mem.eql(u8, command, "d2-probe")) {
+        var rest: std.ArrayList([]const u8) = .empty;
+        while (args.next()) |v| try rest.append(a, v);
+        return @import("decode2_probe.zig").run(a, rest.items);
+    }
     // prefill-mlx: one MLX-arithmetic operation on given inputs (tools/nano_mlx_ops.py).
     if (std.mem.eql(u8, command, "mlx-op")) {
         var rest: std.ArrayList([]const u8) = .empty;
@@ -127,6 +133,8 @@ pub fn main(init: std.process.Init) !void {
             bench_input.tokens = try loader.readFile(a, value);
         } else if (std.mem.eql(u8, flag, "--profile-decode")) {
             bench_input.profile_decode = std.mem.eql(u8, value, "1");
+        } else if (std.mem.eql(u8, flag, "--decode-detail")) {
+            bench_input.decode_detail = std.mem.eql(u8, value, "1"); // decode climb 2
         } else if (std.mem.eql(u8, flag, "--repeats")) {
             bench_input.repeats = try std.fmt.parseInt(u32, value, 10);
         } else {
@@ -318,3 +326,4 @@ test {
     _ = @import("kernel_tests.zig");
 }
 test { _ = @import("plan.zig"); }
+test { _ = @import("decode2_tests.zig"); } // decode climb 2

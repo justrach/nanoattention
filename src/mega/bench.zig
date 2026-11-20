@@ -19,6 +19,10 @@ pub const Input = struct {
     /// report, printed at exit) before the last repeat's decode, so the report
     /// covers decode forwards only. Attribution only; it perturbs timing.
     profile_decode: bool = false,
+    /// decode climb 2: print, on stderr, the last repeat's decode time per token
+    /// split into host encoding, finish-to-completion wait, command GPU time and
+    /// the rest (read-back and loop), as one JSON line.
+    decode_detail: bool = false,
 };
 
 const Workload = struct { bos: u32, code: []const u32, decode: []const u32 };
@@ -92,12 +96,22 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         var sum: u64 = try engine.next(engine.out_end - 1);
         if (input.profile_decode and rep == input.repeats) try engine.ctx.beginProfile();
         const t1 = try io.now();
+        var detail: [3]f64 = @splat(0); // decode climb 2: encode, wait, GPU seconds
         for (decode) |t| {
             try engine.forward(&.{t}, 0);
             decode_dispatches += engine.last.dispatches;
+            detail[0] += engine.last.encode_seconds;
+            detail[1] += engine.last.wait_seconds;
+            detail[2] += engine.last.gpu_seconds;
             sum +%= try engine.next(0);
         }
         const t2 = try io.now();
+        try engine.d2Settle(); // decode climb 2 (d2_gate): nothing left at the gate before the next run
+        if (input.decode_detail and rep == input.repeats and decode.len > 0) {
+            const n: f64 = @floatFromInt(decode.len);
+            const us = 1e6 / n;
+            std.debug.print("{{\"type\":\"nano_decode_detail\",\"prompt_tokens\":{d},\"wall_us\":{d:.2},\"encode_us\":{d:.2},\"wait_us\":{d:.2},\"gpu_us\":{d:.2},\"other_us\":{d:.2},\"gate_redos\":{d},\"dispatches\":{d:.1}}}\n", .{ input.prompt_tokens, (t2 - t1) * us, detail[0] * us, detail[1] * us, detail[2] * us, (t2 - t1 - detail[0] - detail[1]) * us, engine.d2_redos, @as(f64, @floatFromInt(decode_dispatches)) / n });
+        }
         if (rep == 0) {
             checksum = sum;
             continue;

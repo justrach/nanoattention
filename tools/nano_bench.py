@@ -62,7 +62,7 @@ def guarded(argv, timeout, wait=7200):
         proc = subprocess.run(full, capture_output=True, text=True)
         if proc.returncode == 0:
             return proc.stdout
-        # Retry while another agent holds the lock or the guard sees too little memory headroom.
+        # Retry while another job holds the lock or the guard sees too little memory headroom.
         if any(m in proc.stderr for m in ("BlockingIOError", "Resource temporarily unavailable", "memory headroom")):
             if time.monotonic() > deadline:
                 raise SystemExit("inference lock or memory headroom unavailable for too long")

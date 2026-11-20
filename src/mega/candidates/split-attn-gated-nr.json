@@ -1,0 +1,5 @@
+{"name": "split-attn-gated-nr", "parent": "split-attn-gated", "family": "gated-sync",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1, "d2_gate": true, "d2_norm_regs": true},
+ "hypothesis": "With the host latency hidden (split-attn-gated), a token is its GPU time, ~3,250 us at 64 tokens. The profile puts 47 mk_norm_add_norm launches a token at ~6 us each for a 2,048-word row: three passes that each wait on device memory, the second pass storing r and the third reading it back. Holding y, r and both weights in registers (same threads, words, expressions and reductions; mk_d2_norm_add_norm) should save ~1.5 us a launch: about -75 us a token, +2 to 2.5% decode at every length. Screen at 64: GPU 3,248 -> 3,170 us, wall 3,264 -> 3,185 us, two rounds.",
+ "expected": {"decode": 2.0}}

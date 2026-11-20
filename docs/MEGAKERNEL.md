@@ -15,6 +15,8 @@
 | `src/mega/fused.metal` | fused variants, each behind a knob |
 | `src/mega/decode.metal` | single-row variants (split attention, attention prep, two-stage argmax), each behind a knob |
 | `src/mega/prefill.metal` | exact multi-row variants (matrix-matrix 4-bit linear, gated conv over rows), each behind a knob |
+| `src/mega/decode2.metal` | decode climb 2: the gated pre-encoded decode (gate and gated embedding) and a register-resident sandwich norm, each behind a knob; `mk_d2_empty` for `nano d2-probe` |
+| `src/mega/decode2_probe.zig`, `decode2_tests.zig` | `nano d2-probe` (launch, barrier, submission and wake latency, matvec bandwidth); the headless bit tests of `decode2.metal` |
 | `src/mega/mlx.metal` | the `mlx-arith` tier: ports of stock MLX's batched kernels (`affine_qmm_t`, split K, steel attention), bit-identical to MLX, not to the reference (`docs/MLX-PREFILL.md`) |
 | `src/mega/mlxop.zig` | `nano mlx-op`: one MLX-arithmetic operation on given inputs, for `tools/nano_mlx_ops.py` |
 | `src/mega/knobs.zig` | the run-time knobs |
@@ -23,6 +25,7 @@
 | `src/mega/kernel_tests.zig` | headless Metal tests of every kernel against plain CPU code |
 | `src/mega/candidates/*.json` | the QD seed candidates |
 | `tools/nano_verify.py`, `nano_sessions.py`, `nano_bench.py`, `nano_qd.py` | golden checks, session checks, benchmark driver, quality-diversity trials |
+| `tools/nano_gate_check.py` | decode climb 2: every admission case at feed 1 with batch 64, so single-row forwards run gated (`d2_gate`), against the pin |
 | `tools/nano_mlx_ops.py` | the `mlx-arith` kernels against stock MLX bit for bit (`check`), MLX's and the port's per-operation times (`speed`, `time`) |
 
 ## 1. The IR
@@ -107,8 +110,19 @@ A **knob** selects among compiled-in variants at run time: `nano ... --knobs FIL
 | `mlx_glu2` | bool | (c2-prefill-mlx) with `mlx_linear` and `fuse_glu`: gate, up and the GLU product in one `mk_mlx2_glu` launch, equal bit for bit to the two products then `mk_binary` |
 | `mlx_attention2` | bool | (c2-prefill-mlx) with `mlx_attention`: `mk_mlx2_attention[_gated]`, the port's arithmetic rescheduled (heaviest query blocks first, queries in registers, two barriers per key block) |
 | `conv_rows2` | bool | (c2-prefill-mlx) with `conv_rows`: `mk_gated_conv_rows2`, the same arithmetic without a 64-bit modulo per tap |
+| `d2_gate` | bool | single-row forwards with logits: while token k runs, the forward for k + 1 is encoded and committed behind a one-thread GPU gate that the host opens only after it has read token k and written token k + 1 (section 4a); needs `batch` >= 2 (else ungated) |
+| `d2_gate_spins` | 1.. (default 200,000) | the gate's bound in atomic loads; a gate that gives up first costs a synchronous recomputation, never a wrong token |
+| `d2_norm_regs` | bool | single-row forwards: the fused sandwich norm keeps y, r and both weights in registers (`mk_d2_norm_add_norm`) instead of storing r and reading it back |
 
 None of these changes any row's arithmetic except the `mlx_*` knobs, which replace it by stock MLX's (section 5, "Two tiers"); QD admission (below) checks that bit for bit rather than trusting it. Fusion is a planner pass (`plan.build`) over structural patterns (op kinds, views, activations, weight formats and liveness of intermediates via `plan.deadAfter`), so it applies to any program with the pattern, not to LFM3 by name.
+
+### 4a. Gated pre-encoded decode (`d2_gate`)
+
+Measured with `nano bench --decode-detail 1` (split-attn, 64-token prompt): of 4,146 us a token, 59 us is host encoding, 3,281 us command-buffer GPU time, and about 800 us is neither: about 580 us from `commit` to the GPU starting the buffer and about 200 us from the GPU finishing it to `waitUntilCompleted` returning. Spinning on the status or on a completion handler does not shorten the wake; back-to-back command buffers start 0.6 us apart; a host `MTLSharedEvent` signal takes about 620 us to start a waiting buffer (`nano d2-probe`).
+
+With `d2_gate`, `exec.d2GatedForward` commits the forward for position k + 1 while token k runs, as one command buffer whose first launch is `mk_d2_gate_packed`: one thread spins (bounded) until the gate word carries the forward's generation. The host spins on token k's argmax word (written about 2 us before the GPU end time, after every other launch of the forward), returns it, and when called with token k + 1 writes `generation << 20 | token` into the gate word and encodes k + 2 behind a new gate. `mk_d2_embed_gated` is `mk_embed` with the token read from that word; every other launch is the ordinary one, so the arithmetic is the reference's. The host still reads every token before the next forward starts and chooses the next input, as in the synchronous protocol; only the command encoding and submission are done ahead.
+
+If the gate gives up before the host opens it, the embedding sees a stale generation, writes NaN, the argmax returns the non-finite sentinel and the host recomputes that token synchronously (`d2_redos`). A forward run past the last token (at a stop, or when the host settles before any other forward) writes only rows of positions not yet committed; the next forward at that position rewrites them before reading, provided every wrapping ring keeps a row beyond its horizon plus the current one (`exec.d2GateSafe`: capacity >= horizon + 2, so `batch` >= 2). `Engine.d2Settle` opens a waiting gate and drains; every non-gated forward, `logits` and `deinit` go through it or wait for the current buffer. One extra launch a token (198). `nano_qd.py trial` admits with `batch` = feed, so at feed 1 the engine runs ungated; `tools/nano_gate_check.py` re-runs every admission case at feed 1 with batch 64 (every token gated), and with `--spins 1` forces every gate to give up so the recomputation path runs too.
 
 ### Adding a variant
 
@@ -154,13 +168,13 @@ New operations, each with a reference kernel, validation, planner access entry a
 3. **Mixture** (`mixture`): `out = sum_j w[j] * y[j]` in a fixed j order, plus the shared expert through the existing add. About 60 lines.
 4. **Attention sinks**: an optional per-head sink weight on `attention`, added to the softmax denominator only (`exp(sink - m)` merged into the total). The merge order must be fixed and documented; to match the existing Flint path bit for bit it would have to follow `attention_parallel.metal`'s order. About 40 lines.
 
-Honest estimate: the front end (`flint.zig`, about 300 lines) plus these four operations is two to four agent-days to correct-against-goldens, given goldens (Flint has MLX references in this repository's tools, but no NumPy float64 model like `lfm3_reference.py`, and one would have to be written). It would be correct long before it is fast: the per-op reference would issue about 49 x 25 = 1,200+ dispatches per decode token, against the hand-fused Flint path's 489, and the expert linears need their own variants (grouping rows by expert in prefill, fusing gate/up across the 6 experts) before the megakernel could compete with `flint`. Bit identity with the existing `flint` binary is not expected: its kernels use different reduction orders (`README.md`, "Execution architecture").
+Honest estimate: the front end (`flint.zig`, about 300 lines) plus these four operations is two to four days of work to correct-against-goldens, given goldens (Flint has MLX references in this repository's tools, but no NumPy float64 model like `lfm3_reference.py`, and one would have to be written). It would be correct long before it is fast: the per-op reference would issue about 49 x 25 = 1,200+ dispatches per decode token, against the hand-fused Flint path's 489, and the expert linears need their own variants (grouping rows by expert in prefill, fusing gate/up across the 6 experts) before the megakernel could compete with `flint`. Bit identity with the existing `flint` binary is not expected: its kernels use different reduction orders (`README.md`, "Execution architecture").
 
 ## 8. Limits
 
 - One sequence at a time; no multi-row padded batches.
 - Activations, caches and accumulation are float32 (KV bytes are 4 per element). No bf16 activation mode, so outputs differ from stock MLX's default bf16 run by up to 0.5 in logits, as the golden documents for MLX itself; they match MLX float32 at the float32 noise floor.
-- Every op is a separate dispatch in the reference schedule (465 per LFM3 decode token); there is no persistent single-dispatch interpreter for the megakernel. The bridge puts a barrier between every two dispatches; stock MLX overlaps independent kernels (its encoder is concurrent), which `mlx_multi` recovers only for products sharing an input.
+- Every op is a separate dispatch in the reference schedule (465 per LFM3 decode token); there is no persistent single-dispatch interpreter for the megakernel. With `d2_gate` the gate is a bounded one-thread spin on a host-written word, not threadgroups waiting on each other. The bridge puts a barrier between every two dispatches; stock MLX overlaps independent kernels (its encoder is concurrent), which `mlx_multi` recovers only for products sharing an input.
 - Exact prefill (`prefill-mm-trim`) is 2.9 to 4.8 times slower than the `mlx-arith` tier (64 to 4,096 tokens): the exact tree (MLX's `qmv_fast` per row) cannot use the matrix units without reassociating its sums. The `mlx-arith` tier is float32 only; it is ahead of stock MLX float32 at every length but 9 to 12% behind stock's bf16 prefill at 1,024 and 4,096 tokens (half-width activations), which no tier here matches (`benchmarks/lfm3-prefill-search.md`).
 - `mlxVectorLimit` encodes MLX's `get_qmv_batch_limit` for Ultra GPUs (architecture size `d`, every generation; this machine is `applegpu_g15d`) only; base, Pro and Max GPUs need their rows of that table before `mlx_linear` reproduces MLX's kernel choice.
 - `eval --hidden-out` synchronises the GPU after every traced layer; it is for correctness runs only and is slow fed one token at a time.

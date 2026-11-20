@@ -29,9 +29,13 @@ from lfm3_reference import Checkpoint, NumpyLFM3  # noqa: E402
 CONTEXT = 48
 
 
+KNOBS = []  # --knobs FILE: extra session arguments; the batch sizes below still override its batch
+CROSS_BATCH_GATE = [None]  # --cross-batch-gate G: batch sizes agree within G instead of bit for bit
+
+
 def session(binary, directory, requests, batch, context=CONTEXT, check=True):
     payload = "\n".join(json.dumps(r) for r in requests)  # no final newline: EOF must flush it
-    proc = subprocess.run([str(binary), "session", str(directory), "--context", str(context), "--knob", "batch=%d" % batch],
+    proc = subprocess.run([str(binary), "session", str(directory), "--context", str(context)] + KNOBS + ["--knob", "batch=%d" % batch],
                           input=payload, text=True, capture_output=True, timeout=300)
     if check and proc.returncode != 0:
         raise SystemExit("session failed: " + proc.stderr[-3000:])
@@ -188,13 +192,24 @@ def check_real(binary, directory, workdir, context):
     last = results[1][-1]
     assert last["tokens"] == short_greedy and last["eos"] and short_greedy[-1] == 124900, last["tokens"]
     assert last["cache_after"] == len(short) + len(short_greedy) and last["decode_forward_tokens"] == len(short_greedy)
+    worst = 0.0
     for batch in (64, 256):
         for a, b in zip(results[1], results[batch]):
             assert a["tokens"] == b["tokens"] and a["eos"] == b["eos"]
             for key in ("prefill_logits", "final_logits"):
-                assert np.array_equal(np.asarray(a[key], np.float32).view(np.uint32), np.asarray(b[key], np.float32).view(np.uint32)), (batch, key)
-    print("PASS real checkpoint: 5 turns (300-token prefill crossing the 256 window, reset, EOS stop on 124900 = short golden), fresh replay bitwise, batch 1/64/256 bitwise;"
-          " generated %s" % [r["tokens"] for r in results[1]], flush=True)
+                x, y = np.asarray(a[key], np.float32), np.asarray(b[key], np.float32)
+                if CROSS_BATCH_GATE[0] is None:
+                    assert np.array_equal(x.view(np.uint32), y.view(np.uint32)), (batch, key)
+                else:
+                    # MLX-arithmetic prefill is batched arithmetic: a batch of 1 takes the exact
+                    # kernels, larger batches stock MLX's, so the tier's property is the gate.
+                    assert x.shape == y.shape and np.isfinite(x).all() and np.isfinite(y).all(), (batch, key)
+                    worst = max(worst, float(np.abs(x - y).max()))
+                    assert worst <= CROSS_BATCH_GATE[0], (batch, key, worst)
+                    assert int(x.argmax()) == int(y.argmax()), (batch, key, "top-1")
+    agree = "bitwise" if CROSS_BATCH_GATE[0] is None else "within %.3g (largest %.3g), same tokens and top-1" % (CROSS_BATCH_GATE[0], worst)
+    print("PASS real checkpoint: 5 turns (300-token prefill crossing the 256 window, reset, EOS stop on 124900 = short golden), fresh replay bitwise, batch 1/64/256 %s;"
+          " generated %s" % (agree, [r["tokens"] for r in results[1]]), flush=True)
 
 
 def main():
@@ -203,7 +218,14 @@ def main():
     p.add_argument("--tiny", type=pathlib.Path)
     p.add_argument("--checkpoint", type=pathlib.Path, help="also check the real checkpoint (untimed)")
     p.add_argument("--cases", default="f32,q4_g32,q8_g16,q4_g32_conv7")
+    p.add_argument("--knobs", type=pathlib.Path, help="run every session with this knobs file (a preset); the fresh "
+                   "replays stay on the reference executor, so the session is checked against it bit for bit")
+    p.add_argument("--cross-batch-gate", type=float, help="real checkpoint, for a preset in the mlx-arith tier: batch "
+                   "sizes must agree within this (the window golden's gate) with equal tokens and top-1, not bit for bit")
     args = p.parse_args()
+    if args.knobs:
+        KNOBS[:] = ["--knobs", str(args.knobs.resolve())]
+    CROSS_BATCH_GATE[0] = args.cross_batch_gate
     target = pathlib.Path("target")
     target.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="nano-sessions-", dir=target) as tmp:

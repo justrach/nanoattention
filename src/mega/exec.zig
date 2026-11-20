@@ -9,6 +9,7 @@ const plan = @import("plan.zig");
 const weights = @import("weights");
 const metal = weights.metal;
 const Knobs = knobs_mod.Knobs;
+const io = @import("io.zig"); // decode climb 2
 
 pub const Trace = struct {
     /// [traces][rows][width] float32, filled by forwardTraced.
@@ -19,7 +20,14 @@ pub const Trace = struct {
 /// prefill objective (prefill search): which input rows `Engine.prep` holds.
 pub const PrepKey = struct { state: u32, col: u32, width: u32, row0: u32, rows: u32 };
 
-pub const Stats = struct { dispatches: u64 = 0, submissions: u64 = 0, gpu_seconds: f64 = 0 };
+pub const Stats = struct {
+    dispatches: u64 = 0,
+    submissions: u64 = 0,
+    gpu_seconds: f64 = 0,
+    // decode climb 2: host seconds spent encoding, and from finish() to completion.
+    encode_seconds: f64 = 0,
+    wait_seconds: f64 = 0,
+};
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -64,6 +72,20 @@ pub const Engine = struct {
     // ---- prefill-mlx ----
     /// Split-K partial sums of the MLX-arithmetic linears; null unless knobs.mlx_linear.
     splitk: ?metal.Buffer = null,
+    // ---- decode climb 2 ----
+    /// Knob d2_gate: gate words (0: gen << 20 | token, 1: stale-generation flag,
+    /// 2: gate spins), the next generation, and the position whose forward is
+    /// committed and waiting at the gate (with its generation).
+    d2_gate_buf: ?metal.Buffer = null,
+    d2_gen: u32 = 0,
+    d2_ahead: ?u32 = null,
+    d2_ahead_gen: u32 = 0,
+    d2_ahead_dispatches: u64 = 0,
+    /// Gated forwards recomputed synchronously because the gate gave up first.
+    d2_redos: u64 = 0,
+    /// The argmax word of the last gated forward, read once when it was written
+    /// (a later forward may reuse the arena word); null after any other forward.
+    d2_last: ?u32 = null,
 
     pub fn init(gpa: std.mem.Allocator, program: *const ir.Program, ctx: metal.Context, store: *const weights.Store, knobs: Knobs, context: u32) !Engine {
         try knobs.validate();
@@ -167,6 +189,11 @@ pub const Engine = struct {
         errdefer if (partials) |b| b.deinit();
         const splitk: ?metal.Buffer = if (knobs.mlx_linear) try ctx.alloc(mlx_splitk_words) else null;
         errdefer if (splitk) |b| b.deinit();
+        // decode climb 2 (knob d2_gate): the packed token word needs vocab <= 2^20.
+        const d2_gate_buf: ?metal.Buffer = if (knobs.d2_gate and program.meta.vocab <= 1 << 20 and d2GateSafe(program, batch, context)) try ctx.alloc(16) else null;
+        errdefer if (d2_gate_buf) |b| b.deinit();
+        if (d2_gate_buf) |b| @memset(b.structs(u32), 0);
+
         return .{
             .gpa = gpa,
             .program = program,
@@ -189,10 +216,14 @@ pub const Engine = struct {
             .scores_stride = scores_stride,
             .partials = partials,
             .splitk = splitk,
+            .d2_gate_buf = d2_gate_buf,
         };
     }
 
     pub fn deinit(self: *Engine) void {
+        self.d2Settle() catch {}; // decode climb 2: no committed work may outlive the buffers
+        if (self.d2_redos != 0) std.debug.print("nano: d2_gate recomputed {d} token(s) whose gate gave up first\n", .{self.d2_redos});
+        if (self.d2_gate_buf) |b| b.deinit();
         self.arena.deinit();
         self.tables.deinit();
         for (self.caches) |c| if (c) |b| b.deinit();
@@ -214,6 +245,19 @@ pub const Engine = struct {
         self.failed = false;
         self.out_first = 0;
         self.out_end = 0;
+    }
+
+    /// decode climb 2 (knob d2_gate): open a gate still waiting (its forward runs on
+    /// the last token and writes only state at a position not yet committed, which
+    /// the next forward there rewrites before reading), then wait for every
+    /// committed buffer.
+    pub fn d2Settle(self: *Engine) !void {
+        if (self.d2_gate_buf) |g| if (self.d2_ahead != null) {
+            const gw = g.structs(u32);
+            @atomicStore(u32, &gw[0], self.d2_ahead_gen << 20 | (gw[0] & 0xfffff), .release);
+            self.d2_ahead = null;
+        };
+        if (gpu.pending(self.ctx) != 0) try gpu.drain(self.ctx, 0);
     }
 
     fn words(self: *const Engine, v: ir.View) struct { off: u32, stride: u32 } {
@@ -247,10 +291,18 @@ pub const Engine = struct {
         for (tokens) |t| if (t >= self.program.meta.vocab) return error.InvalidToken;
         if (trace) |t| if (t.data.len < self.program.traces.len * @as(usize, T) * t.width) return error.TraceTooSmall;
         errdefer self.failed = true;
+        // decode climb 2 (knob d2_gate): single-row forwards with logits go gated;
+        // anything else first settles a forward waiting at the gate.
+        if (self.d2_gate_buf != null) {
+            if (T == 1 and out_first == 0 and trace == null) return d2GatedForward(self, tokens[0]);
+            try self.d2Settle();
+            self.d2_last = null;
+        }
         const tok = self.words(self.program.tokens);
         const words_ = self.arena.structs(u32);
         for (tokens, 0..) |t, i| words_[tok.off + i * tok.stride] = t;
         const before = self.ctx.stats();
+        const t_begin = io.now() catch 0; // decode climb 2
         var next_trace: usize = 0;
         self.prep_key = null;
         for (self.steps) |step| {
@@ -282,9 +334,11 @@ pub const Engine = struct {
                 }
             };
         }
+        const t_encoded = io.now() catch 0; // decode climb 2
         try self.ctx.finish();
+        const t_done = io.now() catch 0; // decode climb 2
         const after = self.ctx.stats();
-        self.last = .{ .dispatches = after.dispatches - before.dispatches, .submissions = after.submissions - before.submissions, .gpu_seconds = after.gpu_seconds - before.gpu_seconds };
+        self.last = .{ .dispatches = after.dispatches - before.dispatches, .submissions = after.submissions - before.submissions, .gpu_seconds = after.gpu_seconds - before.gpu_seconds, .encode_seconds = t_encoded - t_begin, .wait_seconds = t_done - t_encoded };
         self.position += T;
         self.out_first = out_first;
         self.out_end = T;
@@ -293,6 +347,9 @@ pub const Engine = struct {
     /// All-vocabulary logits of batch row `row` of the last forward.
     pub fn logits(self: *const Engine, row: u32) ![]const f32 {
         if (row < self.out_first or row >= self.out_end) return error.NoLogitsForRow;
+        // decode climb 2 (d2_gate): the last forward's buffer must have completed
+        // (all but the one waiting at the gate).
+        if (gpu.pending(self.ctx) > @intFromBool(self.d2_ahead != null)) try gpu.drain(self.ctx, @intFromBool(self.d2_ahead != null));
         const w = self.words(self.program.logits);
         return self.arena.floats()[w.off + row * w.stride ..][0..self.program.logits.width];
     }
@@ -300,7 +357,7 @@ pub const Engine = struct {
     pub fn next(self: *const Engine, row: u32) !u32 {
         if (row < self.out_first or row >= self.out_end) return error.NoLogitsForRow;
         const w = self.words(self.program.next);
-        const id = self.arena.structs(u32)[w.off + row * w.stride];
+        const id = self.d2_last orelse self.arena.structs(u32)[w.off + row * w.stride]; // decode climb 2 (d2_gate)
         if (id >= self.program.meta.vocab) return error.NonFiniteLogits;
         return id;
     }
@@ -614,7 +671,9 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             // The add's operand order: r + t (kind 0) or t + r (kind 1).
             p.kind = if (add.a.state == n1.out.state and add.a.col == n1.out.col) 1 else 0;
             const tg = gpu.normThreads(n1.group);
-            try gpu.dispatch(self.ctx, "mk_norm_add_norm", &.{ w1.buffer, self.arena }, &p, @as(usize, rows) * tg, tg);
+            // decode climb 2 (knob d2_norm_regs): operands in registers, single-row forwards.
+            const regs = self.knobs.d2_norm_regs and rows == 1 and n1.group <= 4 * tg;
+            try gpu.dispatch(self.ctx, if (regs) "mk_d2_norm_add_norm" else "mk_norm_add_norm", &.{ w1.buffer, self.arena }, &p, @as(usize, rows) * tg, tg);
         },
         .conv => |i| {
             const m0 = ops[i].binary;
@@ -768,6 +827,132 @@ fn encodeAttnPrep(self: *Engine, i: u32, row0: u32, rows: u32) !void {
     const tg = gpu.normThreads(r1.dim);
     const units = @as(usize, r1.heads) + 2 * @as(usize, r2.heads);
     try gpu.dispatch(self.ctx, "mk_dec_attn_prep", &.{ wq.buffer, wk.buffer, self.arena, self.tables, self.caches[s1.dst].?, self.caches[s2.dst].? }, &p, @as(usize, rows) * units * tg, tg);
+}
+
+// ---- decode climb 2 ----
+
+/// Knob d2_gate. Forward one token at self.position: if its forward is already
+/// committed and waiting at the gate, write the token with its generation and
+/// open the gate; otherwise encode and commit it now. Then encode and commit the
+/// next position's forward behind a new gate, spin until this token's argmax
+/// word is written (the argmax is the forward's last launch, so every launch has
+/// run), and return. Buffer failures surface at the next reap or settle. A
+/// non-finite result whose embedding saw a stale generation (the gate gave up
+/// before the host opened it) is recomputed synchronously.
+fn d2GatedForward(self: *Engine, token: u32) !void {
+    const gate = self.d2_gate_buf.?;
+    const gw = gate.structs(u32);
+    const nx = self.words(self.program.next);
+    const watch: *volatile u32 = @ptrCast(&self.arena.structs(u32)[nx.off]);
+    const sentinel: u32 = 0xfffffffe;
+    const pos = self.position;
+    const before = self.ctx.stats();
+    const t_begin = io.now() catch 0;
+    // Launches of the forward that computes this token (encoded now or by the previous call).
+    var own_dispatches: u64 = self.d2_ahead_dispatches;
+    if (self.d2_ahead != null and self.d2_ahead.? != pos) try self.d2Settle();
+    watch.* = sentinel;
+    if (self.d2_ahead) |_| {
+        @atomicStore(u32, &gw[0], self.d2_ahead_gen << 20 | token, .release);
+        self.d2_ahead = null;
+    } else {
+        const tok = self.words(self.program.tokens);
+        self.arena.structs(u32)[tok.off] = token;
+        const s0 = self.ctx.stats();
+        try d2Encode(self, pos, null);
+        try gpu.commitAsync(self.ctx);
+        own_dispatches = self.ctx.stats().dispatches - s0.dispatches;
+    }
+    const t_encoded = io.now() catch 0;
+    // The next position's forward, behind a gate.
+    const ahead = pos + 1 < self.context;
+    if (ahead) {
+        const s0 = self.ctx.stats();
+        self.d2_gen = (self.d2_gen + 1) & 0xfff;
+        try d2Encode(self, pos + 1, self.d2_gen);
+        try gpu.commitAsync(self.ctx);
+        self.d2_ahead = pos + 1;
+        self.d2_ahead_gen = self.d2_gen;
+        self.d2_ahead_dispatches = self.ctx.stats().dispatches - s0.dispatches;
+    }
+    // This token's buffer is the newest one not waiting at the gate.
+    const n = gpu.pending(self.ctx);
+    try gpu.spin(self.ctx, n - 1 - @intFromBool(ahead), watch, sentinel);
+    const t_done = io.now() catch 0;
+    try gpu.reap(self.ctx);
+    var result = watch.*;
+    if (result >= sentinel) {
+        // Non-finite logits, or no argmax written after the sentinel (the forward
+        // ran before the host opened its gate): wait for the buffer, then decide.
+        try gpu.drain(self.ctx, @intFromBool(ahead));
+        if (@atomicLoad(u32, &gw[1], .acquire) != 0) {
+            @atomicStore(u32, &gw[1], 0, .release);
+            try self.d2Settle();
+            self.d2_redos += 1;
+            watch.* = sentinel;
+            const tok = self.words(self.program.tokens);
+            self.arena.structs(u32)[tok.off] = token;
+            try d2Encode(self, pos, null);
+            try self.ctx.finish();
+        }
+        result = watch.*;
+        if (result == sentinel) return error.GateProtocol;
+    }
+    self.d2_last = result;
+    const after = self.ctx.stats();
+    self.last = .{ .dispatches = own_dispatches, .submissions = 1, .gpu_seconds = after.gpu_seconds - before.gpu_seconds, .encode_seconds = t_encoded - t_begin, .wait_seconds = t_done - t_encoded };
+    self.position = pos + 1;
+    self.out_first = 0;
+    self.out_end = 1;
+}
+
+/// Knob d2_gate is used only when a forward run past the last read token (the one
+/// waiting at the gate, run on a stale or repeated token) cannot clobber a ring
+/// row that a recomputation of that token still reads: every ring that wraps
+/// keeps at least one row beyond its horizon plus the current row (capacity >=
+/// horizon + 2, i.e. batch >= 2). Otherwise the engine decodes ungated.
+fn d2GateSafe(p: *const ir.Program, batch: u32, context: u32) bool {
+    for (p.states) |st| if (st.kind == .ring) {
+        const cap = st.capacity(batch, context);
+        if (cap < context and cap < st.horizon + 2) return false;
+    };
+    return true;
+}
+
+/// Encode the whole program for one row at position `pos`; `gen` set: a gate
+/// first, and the embedding reads the gate word (mk_d2_embed_gated).
+fn d2Encode(self: *Engine, pos: u32, gen: ?u32) !void {
+    const saved = self.position;
+    self.position = pos;
+    defer self.position = saved;
+    self.prep_key = null;
+    if (gen) |g| {
+        var p: gpu.Params = .{ .every = g, .n = self.knobs.d2_gate_spins };
+        try gpu.dispatch(self.ctx, "mk_d2_gate_packed", &.{self.d2_gate_buf.?}, &p, 32, 32);
+    }
+    for (self.steps) |step| {
+        switch (step) {
+            .op => |i| {
+                const op = self.program.ops[i];
+                if (gen != null and op == .embed) try d2EncodeEmbed(self, op.embed, gen.?) else try self.encode(op, 0, 1);
+            },
+            else => try encodeFused(self, step, 0, 1),
+        }
+    }
+}
+
+fn d2EncodeEmbed(self: *Engine, e: @FieldType(ir.Op, "embed"), gen: u32) !void {
+    var p: gpu.Params = .{ .rows = 1, .row0 = 0, .pos = self.position };
+    const w = self.bound[e.table];
+    Engine.quantParams(&p, w);
+    const o = self.words(e.out);
+    p.y = o.off;
+    p.ys = o.stride;
+    p.n = e.out.width;
+    p.every = gen;
+    if (e.round == .bf16) p.flags |= gpu.flag_round_bf16;
+    const qb = Engine.quantBuffers(w);
+    try gpu.dispatch(self.ctx, "mk_d2_embed_gated", &.{ qb[0], qb[1], qb[2], self.arena, self.d2_gate_buf.? }, &p, p.n, 256);
 }
 
 // ---- prefill-mlx (exact) ----

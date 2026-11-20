@@ -46,3 +46,64 @@ On the cleaned merged binary, in the same locked runs: `split-attn` 239.7 / 239.
 ## Variant code status
 
 Removed, with their measurements above: `decode_attention = 1` (per-step chain), the x-resident and unrolled single-row matvecs, an unwired in_proj + conv kernel. `decode_rows 4` and the 8-row and 1-row tiles of the reference linear remain knob values of one templated kernel (see `benchmarks/lfm3-megakernel.md`).
+
+## Second climb (decode, exact tier)
+
+Same protocol, same archive (`$NANO_WORK/qd/lfm3`), candidates from `split-attn`. Instrumentation added first: `nano bench ... --decode-detail 1` (stderr: per decode token, host encoding, `finish` to completion, command-buffer GPU time, launches, gate recomputations) and `nano d2-probe [--checkpoint DIR]` (`src/mega/decode2_probe.zig`).
+
+### Where a synchronous token goes
+
+`split-attn`, 64-token prompt, 256 teacher-forced tokens, one locked run (numbers vary by 10 to 20% between sessions with the machine's load):
+
+| | us a token |
+| --- | ---: |
+| wall | 4,146 |
+| host encoding (197 launches) | 59 |
+| command-buffer GPU time | 3,281 |
+| commit to GPU start | ~580 |
+| GPU end to `waitUntilCompleted` returning | ~200 |
+
+At 4,096 tokens: wall 4,232, GPU 3,675. So about 0.8 ms a token, a fifth, is neither encoding nor GPU work. `d2-probe`: an empty launch behind a barrier costs ~2.0 to 2.3 us of GPU time (1.6 without the barrier in a serial encoder, 0.22 in a concurrent one without barriers); encoding is ~0.17 us a launch; back-to-back asynchronous command buffers start 0.6 us apart; a host `MTLSharedEvent` signal takes ~620 us to start a waiting buffer. The argmax word is visible to the host about 2 us before `GPUEndTime`.
+
+Tried and dropped, each measured at 64 tokens: spinning on the command buffer's status or on a completed-handler flag instead of `waitUntilCompleted` (no change, end to return still ~180 to 200 us); binding a Metal-allocated copy of the checkpoint instead of the mapping (no change in submission latency or matvec bandwidth; a word-aligned copy matvecs at the same speed as the 2-mod-4 mapping); committing the first steps of a token early (+2%, inside the noise).
+
+### Candidates
+
+| candidate | hypothesis (short) | admission | result |
+| --- | --- | --- | --- |
+| **`split-attn-gated`** (trial 20261120T202607, family `gated-sync`) | hide the ~0.8 ms of submission and wake latency: the next token's forward is committed while this one runs, held by a one-thread GPU gate the host opens after reading this token and writing the next (`d2_gate`, docs/MEGAKERNEL.md 4a): +20% at 64, +12% at 4,096 | bit-identical, 7 tiny x feeds 1/7/64, `short`/`window`/`long` x 1/64; plus `tools/nano_gate_check.py --long` (feed 1 with batch 64: every token gated; with and without `--spins 1`) | **306.96 / 292.08 / 273.05**, 198 launches a token, against `split-attn` 241.46 / 247.41 / 238.04 in the same trial; three new cells |
+| `gated-spins1` (test only) | every gate gives up at once, so stale generations and recomputation run on every case | rejected (eval failed on `tiny/bf16` feed 1): with `batch` 1 a ring had no spare row, and the forward run on a stale token clobbered the oldest row the recomputation reads | fixed by `exec.d2GateSafe` (gating needs ring capacity >= horizon + 2); afterwards `tools/nano_gate_check.py --long --spins 1` (feed 1, batch 64, so every token is gated) is bit-identical on every case, 10 to 13 recomputations per tiny case, and the 64-token bench checksum is unchanged with 13 recomputations |
+| **`split-attn-gated-nr`** (trial 20261120T203852) | the 47 sandwich-norm launches a token (~6 us each, three passes each waiting on device memory, r stored and read back) keep y, r and both weights in registers (`d2_norm_regs`, `mk_d2_norm_add_norm`): -75 us a token, +2 to 2.5% | bit-identical as above; kernel test against `mk_norm_add_norm` on signed zeros, subnormals, infinities, NaN, cancellation, ragged widths | 314.02 / **302.89** / **278.47**: replaces at 1,024 (vs 296.82) and 4,096 (vs 273.74); loses at 64 (vs 306.39, margin 7.74) |
+| `d2_norm_fuse` (screen) | fold each sandwich norm into the next matvec's launch: every threadgroup recomputes both norms in threadgroup memory, the last one to finish writes r and out (-47 launches a token) | bit-identical on the tiny checkpoints | **failed**: 64 tokens 241.5 -> 203.0 (GPU 3,294 -> 4,286 us a token); ~960 threadgroups each redo a serial two-reduction chain before streaming weights. Removed |
+| `d2_conv_regs` (screen) | the decode gated conv with every load up front and the current tap from a register | bit-identical (kernel test) | **failed**: GPU +40 us a token at 64 under gating. Removed |
+| `linear_group 64` (screen) | 64-thread threadgroups for the decode matvecs (probe: -1 to -7% on the mid shapes) | not admitted | +0.5 to 1%, inside the noise; not pursued |
+
+Matvec bandwidth (`d2-probe`, real checkpoint bytes, many distinct regions so the system cache does not help, 2 rows a SIMD group, 128 threads): head 128,000 x 2,048 662 GB/s; 7,680 x 2,048 430; 6,144 x 2,048 385 (410 with 64 threads); 2,048 x 7,680 369; 2,048 x 2,048 257 (launch-bound). 4 rows a SIMD group is slower on every shape but 6,144 x 2,048.
+
+### Re-timed against stock MLX (second climb)
+
+Final binary, `tools/nano_bench.py versus` (one locked process per engine, length and round; per process one warm-up run, then 3 repeats, median; 256 teacher-forced decode tokens with the token read back every token), 3 interleaved rounds, decode tokens a second:
+
+| prompt | `split-attn` | `split-attn-gated` | `split-attn-gated-nr` | stock MLX f32 | stock MLX bf16 |
+| ---: | --- | --- | --- | --- | --- |
+| 64 | 242.6 / 248.0 / 248.3 -> **248.0** | 303.6 / 303.2 / 305.9 -> **303.6** | 308.1 / 309.7 / 304.7 -> **308.1** | 185.8 / 189.0 / 187.2 -> 187.2 | 196.9 / 194.9 / 192.5 -> 194.9 |
+| 1,024 | 244.3 / 237.3 / 246.6 -> **244.3** | 291.2 / 295.6 / 295.5 -> **295.5** | 287.1 / 303.2 / 302.0 -> **302.0** | 187.7 / 185.3 / 190.1 -> 187.7 | 193.9 / 195.7 / 195.5 -> 195.5 |
+| 4,096 | 239.5 / 238.5 / 239.6 -> **239.5** | 273.8 / 274.1 / 274.6 -> **274.1** | 279.1 / 279.2 / 279.7 -> **279.2** | 185.9 / 157.0 / 184.1 -> 184.1 | 166.9 / 193.8 / 194.4 -> 193.8 |
+
+The gated candidates run the reference's arithmetic with the token read back every token; they differ from `split-attn` only in when the next forward's commands are encoded and committed (docs/MEGAKERNEL.md 4a). Stock MLX's loop here is also synchronous (`.item()` every token, no `async_eval`).
+
+### Against stock MLX's pipelined loop
+
+The tables above time stock MLX with a synchronous read per token. Stock's own generate loop does not work that way: it builds the next step from the lazy argmax and submits it with `mx.async_eval` before reading the current token, which hides the same latency the gate hides. `tools/lfm3_benchmark.py` measures that loop as engines `mlx_f32_async` and `mlx_bf16_async` (free-running greedy, argmax only, the same number of forwards). One locked session on the merged tree (`tools/nano_bench.py versus`, three interleaved rounds, medians, decode tokens a second):
+
+| prompt | presets (gated decode): `exact` / `mlx-prefill` | `nano`, plain synchronous | stock f32 / bf16, pipelined | stock f32 / bf16, synchronous |
+| ---: | --- | ---: | --- | --- |
+| 64 | 310.0 / 314.1 | 241.5 | 280.0 / 287.1 | 189.3 / 196.0 |
+| 1,024 | 301.1 / 302.8 | 249.0 | 275.4 / 285.8 | 187.8 / 196.5 |
+| 4,096 | 276.5 / 280.1 | 235.1 | 265.3 / 274.6 | 181.2 / 193.4 |
+
+So the like-for-like margins are: gated against stock's pipelined bf16 loop +8.0% / +5.4% / +0.7% (the last within drift), against pipelined f32 +10.7% / +9.4% / +4.2%; plain synchronous against synchronous bf16 +23% / +27% / +22%. Before this round `nano`'s synchronous decode (about 240) was behind stock's pipelined loop.
+
+### Variant code status (second climb)
+
+Kept: `d2_gate`, `d2_gate_spins` (`mk_d2_gate_packed`, `mk_d2_embed_gated`), `d2_norm_regs` (`mk_d2_norm_add_norm`), `mk_d2_empty` (probe), the bridge's `fm_d2_*` block (`src/metal.m`). Removed with their measurements above: `d2_wait`, `d2_copy_weights`, `d2_split`, the read-modify-write gate, `d2_norm_fuse` (`mk_d2n_*`), `d2_conv_regs`. Not attempted: the pipelined regime (GPU-to-GPU token feed); the gated decode already removes the host latency inside the synchronous protocol, and a pipelined comparison needs a free-running greedy bench mode and an `async_eval` baseline that do not exist yet.

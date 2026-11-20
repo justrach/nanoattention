@@ -81,8 +81,8 @@ comptime {
 }
 
 pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
-    // c2-prefill-mlx (prefill, mlx-arith tier)
-    "\n" ++ @embedFile("mlx2.metal");
+    // second climb: prefill in MLX arithmetic, then decode
+    "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal");
 
 pub fn open() !metal.Context {
     const handle = fm_open(source) orelse {
@@ -109,4 +109,69 @@ pub fn dispatch(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal
 pub fn normThreads(n: u32) u32 {
     const t = (n + 3) / 4;
     return @min(1024, (t + 31) / 32 * 32);
+}
+
+// ---- decode climb 2 (c2-decode) ----
+// Asynchronous commits and waits (src/metal.m, fm_d2_*): the gated decode
+// (exec.d2GatedForward) and the measurements of `nano d2-probe`.
+extern fn fm_d2_dispatch(*anyopaque, [*:0]const u8, [*]const *anyopaque, usize, *const anyopaque, usize, usize, usize, c_int) c_int;
+extern fn fm_d2_commit(*anyopaque) c_int;
+extern fn fm_d2_drain(*anyopaque, usize) c_int;
+extern fn fm_d2_pending_count(*anyopaque) usize;
+extern fn fm_d2_finish(*anyopaque, c_int, ?*[4]f64) c_int;
+extern fn fm_d2_gate(*anyopaque, u64) c_int;
+extern fn fm_d2_signal(*anyopaque, u64) c_int;
+extern fn fm_d2_wait_oldest(*anyopaque, c_int, ?*[4]f64) c_int;
+extern fn fm_d2_spin(*anyopaque, usize, *const volatile u32, u32) c_int;
+extern fn fm_d2_reap(*anyopaque) c_int;
+fn d2check(ok: c_int) !void {
+    if (ok == 0) {
+        std.debug.print("Metal: {s}\n", .{std.mem.span(fm_error())});
+        return error.MetalFailure;
+    }
+}
+pub const d2_barrier: c_int = 1;
+pub const d2_concurrent: c_int = 2;
+/// d2-probe: dispatch with an explicit policy (d2_barrier: a buffer barrier
+/// before it; d2_concurrent: a new encoder is concurrent) instead of fm_dispatch's
+/// barrier between every two dispatches of a serial encoder.
+pub fn dispatchFlags(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal.Buffer, p: *const Params, threads: usize, group: usize, flags: c_int) !void {
+    var handles: [8]*anyopaque = undefined;
+    for (buffers, 0..) |buf, i| handles[i] = buf.handle;
+    try d2check(fm_d2_dispatch(ctx.handle, kernel, &handles, buffers.len, p, @sizeOf(Params), threads, group, flags));
+}
+/// Commit the open command buffer without waiting.
+pub fn commitAsync(ctx: metal.Context) !void {
+    try d2check(fm_d2_commit(ctx.handle));
+}
+/// Wait until at most `keep` asynchronous commits are still pending.
+pub fn drain(ctx: metal.Context, keep: usize) !void {
+    try d2check(fm_d2_drain(ctx.handle, keep));
+}
+pub fn pending(ctx: metal.Context) usize {
+    return fm_d2_pending_count(ctx.handle);
+}
+/// Finish and wait (spin: on the status instead of waitUntilCompleted).
+/// times: commit, GPU start, GPU end, return (host seconds).
+pub fn finishWait(ctx: metal.Context, spin_wait: bool, times: ?*[4]f64) !void {
+    try d2check(fm_d2_finish(ctx.handle, @intFromBool(spin_wait), times));
+}
+/// d2-probe: the open (or a new) command buffer waits for a shared event to reach `value`.
+pub fn gate(ctx: metal.Context, value: u64) !void {
+    try d2check(fm_d2_gate(ctx.handle, value));
+}
+pub fn signal(ctx: metal.Context, value: u64) !void {
+    try d2check(fm_d2_signal(ctx.handle, value));
+}
+/// Wait for the oldest asynchronous commit; times as finishWait (the commit or a later signal first).
+pub fn waitOldest(ctx: metal.Context, spin_wait: bool, times: ?*[4]f64) !void {
+    try d2check(fm_d2_wait_oldest(ctx.handle, @intFromBool(spin_wait), times));
+}
+/// Spin until `watch` leaves `sentinel` or pending buffer `index` (0 = oldest) finishes.
+pub fn spin(ctx: metal.Context, index: usize, watch: *const volatile u32, sentinel: u32) !void {
+    try d2check(fm_d2_spin(ctx.handle, index, watch, sentinel));
+}
+/// Release the leading finished pending buffers; fails if any of them failed.
+pub fn reap(ctx: metal.Context) !void {
+    try d2check(fm_d2_reap(ctx.handle));
 }

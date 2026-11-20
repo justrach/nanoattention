@@ -1,0 +1,5 @@
+{"name": "split-attn-gated", "parent": "split-attn", "family": "gated-sync",
+ "knobs": {"fuse_projections": true, "fuse_glu": true, "fuse_norms": true, "fuse_conv": true, "fuse_gate": true,
+           "decode_attention": 2, "fuse_attn_prep": true, "decode_argmax": 1, "d2_gate": true},
+ "hypothesis": "Profile (split-attn, 64-token prompt, --decode-detail): 4,146 us a token = 59 us host encoding + 3,281 us command GPU time + ~580 us from commit to GPU start + ~200 us from GPU end to the host waking; neither spinning on the status nor a completion handler shortens the wake, and back-to-back command buffers start 0.6 us apart. So commit token k+1's forward while token k runs, held by a one-thread GPU gate (mk_d2_gate_packed) that the host opens only after reading token k back and writing token k+1 (packed with a generation into the word the embedding reads, mk_d2_embed_gated); the host spins on the argmax word, which is visible ~2 us before GPUEndTime. Same kernels and arithmetic; the host still reads every token before the next forward starts. Expect decode +20% at 64 (to ~300) and +12% at 4,096 (~270); one extra launch a token.",
+ "expected": {"decode": 18.0}}

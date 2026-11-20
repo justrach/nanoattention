@@ -13,5 +13,7 @@
  "mm_tokens": 8,
  "mm_half": true,
  "conv_rows": true,
- "head_trim": true
+ "head_trim": true,
+ "d2_gate": true,
+ "d2_norm_regs": true
 }

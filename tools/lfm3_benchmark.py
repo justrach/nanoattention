@@ -14,11 +14,15 @@ template; a performance workload, not a quality test), then 256 decode tokens.
            (DEFAULT_PREFILL_STEP_SIZE) over the first L - 1 tokens, evaluating only the cache
            state, then the last prompt token with logits and a host argmax.
   decode:  256 teacher-forced tokens (benchmark.py's CONTINUATION ids), one cached forward
-           and a synchronous host argmax (`.item()`) per token, like benchmark.py. Stock
-           generate() overlaps steps with async_eval; that pipelining is not measured here.
+           and a synchronous host argmax (`.item()`) per token, like benchmark.py.
+  decode, pipelined (engines mlx_bf16_async, mlx_f32_async): stock generate()'s loop.
+           Free-running greedy: each step's input is the previous step's lazy argmax, and
+           the next step is submitted with mx.async_eval before the current token is read
+           on the host, so the host's read-back latency overlaps the next forward. Same
+           number of forwards; argmax only (stock also computes log-probabilities).
 
 Engines: mlx_bf16 (the checkpoint's own dtype, stock default) and mlx_f32
-(model.set_dtype(float32)). --native BINARY instead times `BINARY session CHECKPOINT` over
+(model.set_dtype(float32)); each also as NAME_async (pipelined decode, above). --native BINARY instead times `BINARY session CHECKPOINT` over
 its JSONL protocol: per run {"reset": true, "tokens": prompt, "max_tokens": 256}, rates from
 the response's prefill_seconds and decode_seconds / decode_forward_tokens. The session
 protocol cannot teacher-force, so native decode is free-running greedy (one forward per
@@ -65,7 +69,7 @@ def workload(tok, lengths, decode_tokens):
     return prompts, decode
 
 
-def mlx_engine(checkpoint, dtype, prompts, decode, repeats):
+def mlx_engine(checkpoint, dtype, prompts, decode, repeats, pipelined=False):
     import mlx.core as mx
     from mlx_vlm.utils import load_model
 
@@ -75,7 +79,12 @@ def mlx_engine(checkpoint, dtype, prompts, decode, repeats):
     model.set_dtype(getattr(mx, dtype))
     mx.eval(model.parameters())
     lm = model.language_model
-    engine = "mlx_" + {"bfloat16": "bf16", "float32": "f32"}[dtype]
+    engine = "mlx_" + {"bfloat16": "bf16", "float32": "f32"}[dtype] + ("_async" if pipelined else "")
+
+    def step(y):
+        return mx.argmax(lm(y.reshape(1, 1), cache=cache_ref[0]).logits[0, -1])
+
+    cache_ref = [None]
 
     def run(prompt, count):
         cache = lm.make_cache()
@@ -91,9 +100,20 @@ def mlx_engine(checkpoint, dtype, prompts, decode, repeats):
         first = int(mx.argmax(logits[0, -1]).item())
         prefilled = time.perf_counter()
         checksum = first
-        for token in decode[:count]:
-            logits = lm(mx.array([[token]], dtype=mx.int32), cache=cache).logits
-            checksum += int(mx.argmax(logits[0, -1]).item())
+        if pipelined:
+            cache_ref[0] = cache
+            upcoming = step(mx.array(first, dtype=mx.int32))
+            mx.async_eval(upcoming)
+            for i in range(count):
+                current = upcoming
+                if i + 1 < count:
+                    upcoming = step(current)
+                    mx.async_eval(upcoming)
+                checksum += int(current.item())
+        else:
+            for token in decode[:count]:
+                logits = lm(mx.array([[token]], dtype=mx.int32), cache=cache).logits
+                checksum += int(mx.argmax(logits[0, -1]).item())
         finished = time.perf_counter()
         return {"prefill_seconds": prefilled - start, "decode_seconds": finished - prefilled,
                 "decode_tokens": count, "checksum": checksum}
@@ -198,7 +218,7 @@ def main():
     parser.add_argument("--lengths", default="64,1024,4096")
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--engines", default="mlx_bf16,mlx_f32", help="any of mlx_bf16, mlx_f32, native")
+    parser.add_argument("--engines", default="mlx_bf16,mlx_f32", help="any of mlx_bf16, mlx_f32, mlx_bf16_async, mlx_f32_async, native")
     parser.add_argument("--native", type=pathlib.Path, help="native binary with a `session` command")
     parser.add_argument("--session-arg", action="append", default=[], help="extra `session` argument (repeatable)")
     parser.add_argument("--output", type=pathlib.Path)
@@ -218,15 +238,18 @@ def main():
         rows += native_engine(args.native.resolve(), checkpoint, args.session_arg, prompts, len(decode), args.repeats)
     for engine in engines:
         if engine.startswith("mlx_"):
-            rows += mlx_engine(checkpoint, {"mlx_bf16": "bfloat16", "mlx_f32": "float32"}[engine],
-                               prompts, decode, args.repeats)
+            base = engine[:-len("_async")] if engine.endswith("_async") else engine
+            rows += mlx_engine(checkpoint, {"mlx_bf16": "bfloat16", "mlx_f32": "float32"}[base],
+                               prompts, decode, args.repeats, pipelined=engine.endswith("_async"))
     notes = {
         "prompt_protocol": "BOS + benchmark.py CONTINUATION token ids repeated and cut to exactly L tokens; no chat template",
         "prefill_protocol": "stock mlx-vlm generate(): chunks of <= %d over the first L - 1 tokens (cache state "
                             "evaluated), then the last token with logits and host argmax; native: the session's "
                             "prefill_seconds" % STOCK_PREFILL_STEP,
-        "decode_protocol": "MLX: teacher-forced, one cached forward and synchronous host argmax per token "
-                           "(no async_eval pipelining); native: free-running greedy through the session",
+        "decode_protocol": "MLX: teacher-forced, one cached forward and synchronous host argmax per token; "
+                           "MLX *_async: free-running greedy, the next step submitted with async_eval before "
+                           "the current token is read (stock generate()'s loop); native: free-running greedy "
+                           "through the session",
         "excluded": "model load, dtype conversion, cache creation, warm-up",
     }
     report = summarize(rows, prompts, decode, args.repeats, notes)

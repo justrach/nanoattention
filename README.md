@@ -216,23 +216,30 @@ Every performance choice is a run-time knob. With no knobs, `nano` runs the plai
 ./zig-out/bin/nano session /path/to/lfm3-1.7b-mlx-4bit --context 4608 --knobs src/mega/presets/mlx-prefill.json
 ```
 
-- `exact.json`: every kernel bit-identical to the reference executor, for decode and for batched prompt ingestion.
+- `exact.json`: every kernel bit-identical to the reference executor, for decode and for batched prompt ingestion. Decode is latency-hidden (below); the tokens and logits are the reference's.
 - `mlx-prefill.json`: decode as above; prompt ingestion through ports of stock MLX's batched quantized matmul and attention. Each ported kernel is bit-identical to the stock MLX operation on the same inputs (`tools/nano_mlx_ops.py check`), so batched ingestion is no longer bit-identical to token-at-a-time decoding, exactly as in MLX.
 
-Same M3 Ultra, same 4-bit checkpoint, each engine in its own process under one lock, interleaved, three rounds, medians; 256 decode tokens after an actual prompt of that length:
+Same M3 Ultra, same 4-bit checkpoint, each engine in its own process under one lock, interleaved, three rounds, medians; 256 decode tokens after an actual prompt of that length.
 
-| Prompt tokens | | `exact` | `mlx-prefill` | Stock MLX FP32 | Stock MLX BF16 |
-| ---: | --- | ---: | ---: | ---: | ---: |
-| 64 | decode tok/s | **241.5** | **243.2** | 185.3 | 195.7 |
-| 1,024 | decode tok/s | **247.8** | **246.9** | 188.4 | 192.8 |
-| 4,096 | decode tok/s | **233.8** | **236.7** | 181.9 | 186.4 |
-| 64 | prefill tok/s | 1,218 | **3,523** | 2,592 | 2,798 |
-| 1,024 | prefill tok/s | 1,289 | **5,494** | 4,622 | 5,376 |
-| 4,096 | prefill tok/s | 987 | **5,452** | 4,641 | 5,422 |
+Decode, tokens a second:
 
-Prompt ingestion with MLX's own arithmetic is ahead of stock MLX in both precisions while staying float32: by 26% at 64 tokens, and by 2% and 0.5% over stock BF16 at 1,024 and 4,096 (the last is inside this machine's run-to-run drift: call it level). Its kernels keep stock MLX's output bits and change only tile shape, staging and scheduling ([what changed](benchmarks/lfm3-prefill-search.md)). Exact prompt ingestion is about a quarter of that.
+| Prompt tokens | `exact` | `mlx-prefill` | `nano`, plain synchronous | Stock MLX FP32, pipelined | Stock MLX BF16, pipelined | Stock MLX FP32, synchronous | Stock MLX BF16, synchronous |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | **310** | **314** | 241 | 280 | 287 | 189 | 196 |
+| 1,024 | **301** | **303** | 249 | 275 | 286 | 188 | 197 |
+| 4,096 | **277** | **280** | 235 | 265 | 275 | 181 | 193 |
 
-Decode in this table is synchronous on both sides: one forward, then the host reads the token. Stock MLX's own generate loop does better than its synchronous loop by submitting the next step before reading the current token (`mx.async_eval`); measured the same way on this model it decodes at about 265 to 273 tokens a second, which is above `nano`'s synchronous decode.
+A synchronous loop (run one forward, wait, read the token on the host) loses about a fifth of every token to submission and wake latency around the GPU work. Stock MLX's generate loop hides it by submitting the next step before reading the current token (`mx.async_eval`); that is the "pipelined" column, and it is the fair baseline. The presets hide it differently: the next forward is committed early and held by a one-thread GPU gate until the host has read the current token and written the next one, so the host still reads and chooses every token ([how](docs/MEGAKERNEL.md), [measurements](benchmarks/lfm3-decode-search.md)). Against stock's pipelined loop the presets are 8% / 5% / 1% ahead of BF16 and 11% / 9% / 4% ahead of FP32 at 64 / 1,024 / 4,096 tokens; at 4,096 against BF16 that is inside this machine's run-to-run drift. Synchronous against synchronous, `nano` is 22 to 27% ahead of stock BF16.
+
+Prompt ingestion, tokens a second:
+
+| Prompt tokens | `exact` | `mlx-prefill` | Stock MLX FP32 | Stock MLX BF16 |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 1,229 | **3,511** | 2,606 | 2,783 |
+| 1,024 | 1,289 | **5,503** | 4,634 | 5,383 |
+| 4,096 | 998 | **5,478** | 4,655 | 5,462 |
+
+With MLX's own arithmetic, ingestion is ahead of stock MLX in both precisions while staying float32: by 26% at 64 tokens, and by 2% and 0.3% over stock BF16 at 1,024 and 4,096 (the last is level, within drift). Its kernels keep stock MLX's output bits and change only tile shape, staging and scheduling ([what changed](benchmarks/lfm3-prefill-search.md)). Exact ingestion is about a quarter of that.
 
 The machine was shared with other workloads; these are one session's medians, not a controlled benchmark. Against goldens produced by stock MLX in float32, the engine's logits are within float32 rounding on 23-, 700- and 4,096-token prompts with identical greedy tokens.
 
