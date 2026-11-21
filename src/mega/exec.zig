@@ -13,6 +13,18 @@ const io = @import("io.zig"); // decode climb 2
 // climb 2, exact prefill
 const exact2 = @import("exact2.zig");
 
+pub fn bindWeight(store: *const weights.Store, spec: ir.Weight) !weights.Weight {
+    if (spec.raw_dtype) |dtype| {
+        const raw_dtype: weights.st.DType = switch (dtype) {
+            .u8 => .u8,
+            .f8_e4m3 => .f8_e4m3,
+            .f32 => .f32,
+        };
+        return store.getRaw(spec.name, spec.shape, raw_dtype);
+    }
+    return store.get(spec.name, spec.shape);
+}
+
 pub const Trace = struct {
     /// [traces][rows][width] float32, filled by forwardTraced.
     data: []f32,
@@ -49,6 +61,9 @@ pub const Engine = struct {
     bound: []weights.Weight,
     /// Launch schedule from the fusion knobs; one step per op for the reference.
     steps: []plan.Step,
+    independent_launches: ?[]bool = null,
+    /// Kept only across adjacent expert operations, with no intervening writes.
+    expert_routes: ?struct { off: u32, stride: u32, row0: u32, rows: u32, experts: u32, top_k: u32 } = null,
     /// Ops at index >= head_start run only on rows with logits: the program's
     /// head_start, or earlier with knobs.head_trim (traced forwards use the program's).
     head_start: u32,
@@ -99,6 +114,11 @@ pub const Engine = struct {
     x2att: ?[3]metal.Buffer = null,
     x2att_stride: u32 = 0,
     x2att_rows: u32 = 0,
+    expert_tiles: ?[2]metal.Buffer = null,
+    relative_parts: ?metal.Buffer = null,
+    const max_relative_parts: u32 = 64;
+    const min_relative_split: u32 = 64;
+    const relative_row_tile: u32 = 16;
 
     pub fn init(gpa: std.mem.Allocator, program: *const ir.Program, ctx: metal.Context, store: *const weights.Store, knobs: Knobs, context: u32) !Engine {
         try knobs.validate();
@@ -146,7 +166,7 @@ pub const Engine = struct {
         for (program.tables, 0..) |t, i| @memcpy(tables.floats()[table_offsets[i]..][0..t.len], t);
         const bound = try gpa.alloc(weights.Weight, program.weights.len);
         errdefer gpa.free(bound);
-        for (program.weights, 0..) |w, i| bound[i] = try store.get(w.name, w.shape);
+        for (program.weights, 0..) |w, i| bound[i] = try bindWeight(store, w);
         const info = try gpa.alloc(plan.WeightInfo, bound.len);
         defer gpa.free(info);
         for (bound, info) |w, *f| {
@@ -155,6 +175,7 @@ pub const Engine = struct {
                 .q4 = w.tensor.shape.len == 2 and q4Fast(w, @intCast(w.tensor.shape[1])),
                 .buffer = if (same) @intFromPtr(w.buffer.handle) else 0,
                 .group = if (w.quant) |q| q.group_size else 0,
+                .dense = w.quant == null and w.tensor.dtype.isFloat(),
             };
         }
         // prefill-mlx (knob head_trim): rows without logits stop after the last op that
@@ -165,6 +186,8 @@ pub const Engine = struct {
         var steps = try plan.build(gpa, &planned, knobs.fusion(), info);
         errdefer gpa.free(steps);
         if (head_start != program.head_start) steps = try splitAcross(gpa, steps, program.head_start);
+        const independent_launches = if (knobs.concurrent_scratch) try plan.independentLaunches(gpa, steps, program, info) else null;
+        errdefer if (independent_launches) |v| gpa.free(v);
         // prefill objective (prefill search): room for the widest q4 linear input.
         var prep: ?metal.Buffer = null;
         var prep_xsum: u32 = 0;
@@ -245,6 +268,38 @@ pub const Engine = struct {
             }
         }
         errdefer if (x2att) |bs| for (bs) |b| b.deinit();
+        var expert_tiles: ?[2]metal.Buffer = null;
+        if (knobs.expert_prefill and batch >= 8) {
+            const tile_rows = @min(batch, expertTileRows(knobs));
+            var lists: usize = 0;
+            var values: usize = 0;
+            for (program.ops) |op| switch (op) {
+                .expert_gate_up => |e| lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1)),
+                .expert_down => |e| {
+                    lists = @max(lists, @as(usize, e.experts) * (tile_rows * e.top_k + 1));
+                    values = @max(values, @as(usize, e.top_k) * e.out.width * tile_rows);
+                },
+                else => {},
+            };
+            if (lists > 0) {
+                const index = try ctx.alloc(lists);
+                errdefer index.deinit();
+                expert_tiles = .{ index, try ctx.alloc(@max(values, 1)) };
+            }
+        }
+        errdefer if (expert_tiles) |bs| for (bs) |b| b.deinit();
+        var relative_parts: ?metal.Buffer = null;
+        if (knobs.relative_split and context >= min_relative_split) {
+            var part_words: usize = 0;
+            for (program.ops) |op| switch (op) {
+                .relative_attention => |a| {
+                    const nrows = if (knobs.relative_split_prefill) @min(batch, relative_row_tile) else 1;
+                    part_words = @max(part_words, @as(usize, a.heads) * (a.dim + 2) * max_relative_parts * nrows);
+                },
+                else => {},
+            };
+            if (part_words != 0) relative_parts = try ctx.alloc(part_words);
+        }
         return .{
             .gpa = gpa,
             .program = program,
@@ -260,6 +315,7 @@ pub const Engine = struct {
             .table_offsets = table_offsets,
             .bound = bound,
             .steps = steps,
+            .independent_launches = independent_launches,
             .head_start = head_start,
             .prep = prep,
             .prep_xsum = prep_xsum,
@@ -272,6 +328,8 @@ pub const Engine = struct {
             .x2att = x2att,
             .x2att_stride = x2att_stride,
             .x2att_rows = x2att_rows,
+            .expert_tiles = expert_tiles,
+            .relative_parts = relative_parts,
         };
     }
 
@@ -287,12 +345,15 @@ pub const Engine = struct {
         self.gpa.free(self.table_offsets);
         self.gpa.free(self.bound);
         self.gpa.free(self.steps);
+        if (self.independent_launches) |v| self.gpa.free(v);
         if (self.prep) |b| b.deinit();
         if (self.scores) |b| b.deinit();
         if (self.partials) |b| b.deinit();
         if (self.splitk) |b| b.deinit();
         if (self.x2prep) |b| b.deinit();
         if (self.x2att) |bs| for (bs) |b| b.deinit();
+        if (self.expert_tiles) |bs| for (bs) |b| b.deinit();
+        if (self.relative_parts) |b| b.deinit();
     }
 
     /// Logical reset: positions >= 0 are rewritten before any read, and conv
@@ -363,7 +424,8 @@ pub const Engine = struct {
         var next_trace: usize = 0;
         self.prep_key = null;
         self.x2_key = null; // climb 2, exact prefill
-        for (self.steps) |step| {
+        self.expert_routes = null;
+        for (self.steps, 0..) |step, step_i| {
             const first = step.first();
             const head = first >= (if (trace != null) self.program.head_start else self.head_start);
             if (head and out_first == T) break;
@@ -384,9 +446,18 @@ pub const Engine = struct {
                 .projections, .glu => {},
                 else => self.x2_key = null,
             }
-            switch (step) {
-                .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
-                else => try encodeFused(self, step, row0, T - row0),
+            {
+                if (trace == null) if (self.independent_launches) |v| {
+                    if (step_i == 0 or v[step_i]) self.ctx.nano_dispatch_flags = gpu.d2_concurrent;
+                };
+                defer self.ctx.nano_dispatch_flags = null;
+                switch (step) {
+                    .op => |i| try self.encode(self.program.ops[i], row0, T - row0),
+                    else => {
+                        self.expert_routes = null;
+                        try encodeFused(self, step, row0, T - row0);
+                    },
+                }
             }
             const end = first + step.len();
             if (trace) |t| while (next_trace < self.program.traces.len and self.program.traces[next_trace].after_op < end) : (next_trace += 1) {
@@ -479,9 +550,91 @@ pub const Engine = struct {
         };
     }
 
+    fn expertTileRows(knobs: knobs_mod.Knobs) u32 {
+        return if (knobs.expert_mlx_scale) 512 else 128;
+    }
+
+    fn expertProjection(self: *Engine, kernel: [:0]const u8, bank: ir.PackedProjection, x: ir.View, routes: ir.View, out: ir.View, p: *gpu.ExpertParams, count: usize, input_bf16: bool) !void {
+        const prev_routes = self.expert_routes;
+        self.expert_routes = null;
+        const v = self.words(x);
+        const r = self.words(routes);
+        const o = self.words(out);
+        const w = self.bound[bank.payload];
+        const scales = self.bound[bank.scales];
+        p.x = v.off;
+        p.xs = v.stride;
+        p.routes = r.off;
+        p.rs = r.stride;
+        p.y = o.off;
+        p.ys = o.stride;
+        p.w = w.tensor.offset;
+        p.s = scales.tensor.offset;
+        var amax = w.buffer;
+        var denominator = w.buffer;
+        if (bank.amax) |id| {
+            const a = self.bound[id];
+            const d = self.bound[bank.denominator.?]; // validated by IR
+            p.nvfp4 = 1;
+            p.amax = a.tensor.offset;
+            p.denominator = d.tensor.offset;
+            amax = a.buffer;
+            denominator = d.buffer;
+        }
+        const buffers = &.{ self.arena, w.buffer, scales.buffer, amax, denominator };
+        const down = std.mem.eql(u8, kernel, "mk_expert_down");
+        const projection_rows = p.n * @as(u32, if (down) 1 else 2);
+        if (self.expert_tiles != null and p.rows >= 8 and p.rows <= expertTileRows(self.knobs) and p.k % 32 == 0 and projection_rows % 32 == 0) {
+            const tile = self.expert_tiles.?;
+            const block = self.knobs.expert_mlx_scale and input_bf16 and p.k % 64 == 0 and p.x % 4 == 0 and p.xs % 4 == 0 and (p.nvfp4 == 0 or p.w % 4 == 0);
+            const key: @TypeOf(self.expert_routes.?) = .{ .off = r.off, .stride = r.stride, .row0 = p.row0, .rows = p.rows, .experts = p.experts, .top_k = p.top_k };
+            const reusable = if (prev_routes) |prev| std.meta.eql(prev, key) else false;
+            if (!reusable) {
+                if (block)
+                    try gpu.dispatch(self.ctx, "mk_expert_row_lists_simd", &.{ self.arena, tile[0] }, p, @as(usize, p.experts) * 32, 128)
+                else
+                    try gpu.dispatch(self.ctx, "mk_expert_row_lists", &.{ self.arena, tile[0] }, p, p.experts, 32);
+            }
+            // Both list builders produce the same row-major route order. IR
+            // validation forbids an expert operation's output aliasing routes.
+            self.expert_routes = key;
+            const wide = self.knobs.expert_wide_k and p.k % 128 == 0;
+            const bf16_storage = self.knobs.expert_bf16_tiles and input_bf16 and p.nvfp4 != 0 and p.k % 128 == 0;
+            const name: [:0]const u8 = if (block)
+                (if (p.nvfp4 != 0)
+                    (if (down) "mk_expert_block_down_nv" else "mk_expert_block_up_nv")
+                else
+                    (if (down) "mk_expert_block_down_mx" else "mk_expert_block_up_mx"))
+            else if (bf16_storage)
+                (if (down) "mk_expert_down_bf16" else "mk_expert_gate_up_bf16")
+            else if (wide)
+                (if (down) "mk_expert_down_wide" else "mk_expert_gate_up_wide")
+            else
+                (if (down) "mk_expert_down_mm" else "mk_expert_gate_up_mm");
+            const threads: usize = 128;
+            const parts: usize = if (block and p.rows >= 128) 4 else if (block and p.rows >= 64) 2 else 1;
+            try gpu.dispatch(self.ctx, name, &.{ self.arena, w.buffer, scales.buffer, amax, denominator, tile[0], tile[1] }, p, @as(usize, p.experts) * (projection_rows / 32) * threads * parts, threads);
+            if (down) try gpu.dispatch(self.ctx, "mk_expert_combine_mm", &.{ self.arena, tile[1] }, p, @as(usize, p.rows) * p.n, 256);
+        } else if (self.knobs.expert_simd and self.knobs.expert_wide_dot and p.top_k <= 8 and projection_rows % 4 == 0 and
+            (if (p.nvfp4 != 0) p.k % 16 == 0 and p.w % 4 == 0 else p.k % 32 == 0))
+        {
+            const name: [:0]const u8 = if (down) "mk_expert_down_dot8" else "mk_expert_gate_up_dot8";
+            const groups = @as(usize, p.rows) * (if (down) (count / 4) * 8 else count / 2);
+            try gpu.dispatch(self.ctx, name, buffers, p, groups * 32, 256);
+        } else if (self.knobs.expert_simd and p.top_k <= 8) {
+            const name: [:0]const u8 = if (down) "mk_expert_down_simd" else if (self.knobs.expert_gate_pair and p.nvfp4 != 0) "mk_expert_gate_up_pair" else "mk_expert_gate_up_simd";
+            try gpu.dispatch(self.ctx, name, buffers, p, @as(usize, p.rows) * count * (if (down) @as(usize, 256) else 32), 256);
+        } else try gpu.dispatch(self.ctx, kernel, buffers, p, @as(usize, p.rows) * count, 256);
+    }
+
     /// The reference schedule: exactly one dispatch per op.
     fn encode(self: *Engine, op: ir.Op, row0: u32, rows: u32) !void {
-        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
+        return self.encodeRound(op, row0, rows, false);
+    }
+
+    fn encodeRound(self: *Engine, op: ir.Op, row0: u32, rows: u32, round_out: bool) !void {
+        if (op != .expert_gate_up and op != .expert_down) self.expert_routes = null;
+        var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position, .flags = if (round_out) gpu.flag_round_out else 0 };
         switch (op) {
             .embed => |e| {
                 const w = self.bound[e.table];
@@ -507,6 +660,7 @@ pub const Engine = struct {
                 p.n = n.group;
                 p.heads = n.x.width / n.group;
                 p.eps = n.eps;
+                if (n.round_normalized == .bf16) p.flags |= gpu.flag_round_bf16;
                 var wbuf = self.arena;
                 if (n.weight) |id| {
                     const w = self.bound[id];
@@ -554,6 +708,28 @@ pub const Engine = struct {
                     const TT = if (rows == 1) self.knobs.decode_tokens else self.knobs.prefill_tokens;
                     const simds = ((@as(usize, p.m) + R - 1) / R) * ((@as(usize, rows) + TT - 1) / TT);
                     try gpu.dispatch(self.ctx, tileKernel("mk_linear_q4", R, TT), &.{ qb[0], qb[1], qb[2], self.arena }, &p, simds * 32, self.knobs.linear_group);
+                } else if (self.knobs.bf16_prefill_matrix and rows >= 16 and l.input_bf16 and
+                    w.tensor.dtype == .bf16 and w.quant == null and p.m >= 512 and p.m % 64 == 0 and p.n >= 512 and p.n % 32 == 0 and
+                    w.tensor.offset % 8 == 0 and p.x % 4 == 0 and p.xs % 4 == 0)
+                {
+                    const tile: u32 = if (rows >= 128) 32 else 16;
+                    const groups = @as(usize, p.m / 64) * ((rows + tile - 1) / tile);
+                    const name: [:0]const u8 = if (tile == 32) "mk_bf16_prefill_matrix32" else "mk_bf16_prefill_matrix16";
+                    try gpu.dispatch(self.ctx, name, &.{ w.buffer, self.arena }, &p, groups * 128, 128);
+                } else if (self.knobs.bf16_linear_tile and w.tensor.dtype == .bf16 and w.quant == null and p.m % 4 == 0 and p.n % 32 == 0) {
+                    const tile = self.knobs.bf16_prefill_tile;
+                    const full_tile = tile != 0 and rows % tile == 0;
+                    const tiles = if (full_tile) rows / tile else if (rows == 1) rows else (rows + 3) / 4;
+                    const vector = p.n % 128 == 0 and p.x % 4 == 0 and p.xs % 4 == 0 and w.tensor.offset % 8 == 0;
+                    const k: [:0]const u8 = if (rows == 1)
+                        (if (self.knobs.bf16_decode_vec and vector) "mk_bf16_linear_4x1_vec" else "mk_bf16_linear_4x1")
+                    else if (full_tile) switch (tile) {
+                        8 => if (self.knobs.bf16_prefill_matrix and vector and rows >= 128) "mk_bf16_linear_4x8_full_vec" else "mk_bf16_linear_4x8_full",
+                        16 => "mk_bf16_linear_4x16_full",
+                        32 => "mk_bf16_linear_4x32_full",
+                        else => unreachable,
+                    } else "mk_bf16_linear_4x4";
+                    try gpu.dispatch(self.ctx, k, &.{ w.buffer, self.arena }, &p, @as(usize, p.m / 4) * tiles * 32, 128);
                 } else {
                     try gpu.dispatch(self.ctx, "mk_linear_generic", &.{ qb[0], qb[1], qb[2], self.arena }, &p, @as(usize, p.m) * rows * 32, 128);
                 }
@@ -574,6 +750,112 @@ pub const Engine = struct {
                 p.act_a = @backingInt(b.a_act);
                 p.act_b = @backingInt(b.b_act);
                 try gpu.dispatch(self.ctx, "mk_binary", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .row_transform => |t| {
+                const x = self.words(t.x);
+                const y = self.words(t.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = y.off;
+                p.ys = y.stride;
+                p.n = t.out.width;
+                p.flags = @backingInt(t.round);
+                switch (t.transform) {
+                    .copy => {},
+                    .softcap => |cap| {
+                        p.kind = 1;
+                        p.scale = cap;
+                    },
+                    .log_position_scale => |s| {
+                        p.kind = 2;
+                        p.m = s.floor;
+                        p.scale = s.alpha;
+                    },
+                }
+                try gpu.dispatch(self.ctx, "mk_row_transform", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .grouped_project => |g| {
+                const x = self.words(g.x);
+                const y = self.words(g.out);
+                const w = self.bound[g.weight];
+                if (w.quant != null or !w.tensor.dtype.isFloat()) return error.InvalidGroupedProjection;
+                p.w = w.tensor.offset;
+                p.dtype = @backingInt(w.tensor.dtype);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.y = y.off;
+                p.ys = y.stride;
+                p.n = g.out.width;
+                p.m = g.out.width / g.groups;
+                p.dim = g.x.width / g.groups;
+                p.flags = @backingInt(g.round);
+                // Only distances at or below the last query position can be read.
+                p.taps = if (g.causal_prefix) @min(p.m, self.position + row0 + rows) else p.m;
+                if (self.knobs.bf16_prefill_tile != 0 and rows % 4 == 0 and p.dim == 16 and w.tensor.dtype == .bf16 and p.w % 2 == 0)
+                    try gpu.dispatch(self.ctx, "mk_grouped_project_bf16x4", &.{ self.arena, w.buffer }, &p, @as(usize, rows / 4) * g.groups * p.taps, 256)
+                else
+                    try gpu.dispatch(self.ctx, "mk_grouped_project", &.{ self.arena, w.buffer }, &p, @as(usize, rows) * g.groups * p.taps, 256);
+            },
+            .concat => |c| {
+                const a = self.words(c.a);
+                const b = self.words(c.b);
+                const o = self.words(c.out);
+                p.x = a.off;
+                p.xs = a.stride;
+                p.y = b.off;
+                p.ys = b.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = c.a.width;
+                p.m = c.b.width;
+                try gpu.dispatch(self.ctx, "mk_concat", &.{self.arena}, &p, @as(usize, rows) * (p.n + p.m), 256);
+            },
+            .activate => |a| {
+                const x = self.words(a.x);
+                const o = self.words(a.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = a.x.width;
+                p.act_a = @backingInt(a.kind);
+                try gpu.dispatch(self.ctx, "mk_activate", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .softcapped_swiglu => |s| {
+                const gate = self.words(s.gate);
+                const up = self.words(s.up);
+                const o = self.words(s.out);
+                p.x = gate.off;
+                p.xs = gate.stride;
+                p.y = up.off;
+                p.ys = up.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = s.gate.width;
+                p.eps = s.gate_cap;
+                p.scale = s.up_cap;
+                p.flags = if (s.round == .bf16) gpu.flag_round_bf16 else 0;
+                try gpu.dispatch(self.ctx, "mk_inkling_softcapped_swiglu", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+            },
+            .depth_attention => |d| {
+                const bank = self.words(d.bank);
+                const partial = self.words(d.partial);
+                const o = self.words(d.out);
+                const query = self.bound[d.query];
+                if (query.quant != null or !query.tensor.dtype.isFloat()) return error.InvalidDepthAttentionQuery;
+                p.x = bank.off;
+                p.xs = bank.stride;
+                p.y = partial.off;
+                p.ys = partial.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = d.partial.width;
+                p.m = d.bank.width / d.partial.width;
+                p.heads = p.m + 1;
+                p.w = query.tensor.offset + @as(usize, d.query_index) * d.partial.width * query.tensor.dtype.byteSize();
+                p.dtype = @backingInt(query.tensor.dtype);
+                p.scale = d.scale;
+                try gpu.dispatch(self.ctx, "mk_depth_attention", &.{ self.arena, query.buffer }, &p, @as(usize, rows) * 256, 256);
             },
             .store => |s| {
                 const x = self.words(s.src);
@@ -596,6 +878,63 @@ pub const Engine = struct {
                 p.taps = c.taps;
                 p.capacity = src.capacity(self.batch, self.context);
                 try gpu.dispatch(self.ctx, "mk_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .inkling_short_conv => |c| {
+                const w = self.bound[c.weight];
+                const residual = self.words(c.residual);
+                const o = self.words(c.out);
+                const src = self.program.states[c.src];
+                p.w = w.tensor.offset;
+                p.dtype = @backingInt(w.tensor.dtype);
+                p.x = residual.off;
+                p.xs = residual.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = c.out.width;
+                p.taps = c.taps;
+                p.capacity = src.capacity(self.batch, self.context);
+                p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.taps + 1)));
+                p.flags = if (c.round == .bf16) 1 else 0;
+                try gpu.dispatch(self.ctx, "mk_inkling_short_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .inkling_dynamic_conv => |c| {
+                const w = self.bound[c.static_weight];
+                const dynamic = self.words(c.dynamic);
+                const residual = self.words(c.residual);
+                const o = self.words(c.out);
+                const src = self.program.states[c.src];
+                p.w = w.tensor.offset;
+                p.dtype = @backingInt(w.tensor.dtype);
+                p.x = dynamic.off;
+                p.xs = dynamic.stride;
+                p.y = residual.off;
+                p.ys = residual.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = c.out.width;
+                p.heads = c.heads;
+                p.taps = c.taps;
+                p.capacity = src.capacity(self.batch, self.context);
+                p.scale = 1.0 / @sqrt(@as(f32, @floatFromInt(2 * c.taps + 1)));
+                p.flags = if (c.round == .bf16) 1 else 0;
+                try gpu.dispatch(self.ctx, "mk_inkling_dynamic_conv", &.{ self.caches[c.src].?, w.buffer, self.arena }, &p, @as(usize, rows) * p.n, 256);
+            },
+            .inkling_message_merge => |m| {
+                const hidden = self.words(m.hidden);
+                const message = self.words(m.message);
+                const gates = self.words(m.gates);
+                const o = self.words(m.out);
+                p.x = hidden.off;
+                p.xs = hidden.stride;
+                p.y = message.off;
+                p.ys = message.stride;
+                p.z = gates.off;
+                p.zs = gates.stride;
+                p.w = o.off;
+                p.every = o.stride;
+                p.n = m.out.width;
+                p.flags = if (m.round == .bf16) 1 else 0;
+                try gpu.dispatch(self.ctx, "mk_inkling_message_merge", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
             },
             .rope => |r| {
                 const x = self.words(r.x);
@@ -626,6 +965,98 @@ pub const Engine = struct {
                 p.scale = a.scale;
                 p.capacity = k.capacity(self.batch, self.context);
                 try gpu.dispatch(self.ctx, "mk_attention", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 256, 256);
+            },
+            .relative_attention => |a| {
+                const q = self.words(a.q);
+                const bias = self.words(a.bias);
+                const sink = self.words(a.sink);
+                const o = self.words(a.out);
+                const k = self.program.states[a.keys];
+                p.x = q.off;
+                p.xs = q.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.z = bias.off;
+                p.zs = bias.stride;
+                p.s = sink.off;
+                p.every = sink.stride;
+                p.heads = a.heads;
+                p.kv_heads = a.kv_heads;
+                p.dim = a.dim;
+                p.m = a.relative_extent;
+                p.window = a.window;
+                p.scale = a.scale;
+                p.capacity = k.capacity(self.batch, self.context);
+                const end = self.position + row0 + rows;
+                const visible = if (p.window == 0) end else @min(end, p.window);
+                if (self.knobs.relative_tile_prefill and rows >= 8 and a.dim == 128) {
+                    try gpu.dispatch(self.ctx, "mk_relative_attention_prefill", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, (rows + 31) / 32) * a.heads * 128, 128);
+                    return;
+                }
+                if (self.relative_parts) |parts| {
+                    const split_decode = rows == 1 and visible >= min_relative_split;
+                    const split_prefill = rows > 1 and self.knobs.relative_split_prefill and visible >= 256;
+                    if (split_decode or split_prefill) {
+                        p.taps = @min(max_relative_parts, @max(4, (visible + 31) / 32));
+                        var off: u32 = 0;
+                        while (off < rows) : (off += p.rows) {
+                            p.row0 = row0 + off;
+                            p.rows = @min(relative_row_tile, rows - off);
+                            const heads = @as(usize, a.heads) * p.rows;
+                            const wide = self.knobs.relative_split_4 and split_decode and a.dim == 128 and visible <= p.taps * 32;
+                            const group: usize = if (wide) 128 else 32;
+                            try gpu.dispatch(self.ctx, if (wide) "mk_relative_split_keys4" else "mk_relative_split_keys", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].?, parts }, &p, heads * p.taps * group, group);
+                            try gpu.dispatch(self.ctx, "mk_relative_split_merge", &.{ self.arena, parts }, &p, heads * 32, 32);
+                        }
+                        return;
+                    }
+                }
+                try gpu.dispatch(self.ctx, "mk_relative_attention", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 32, 32);
+            },
+            .l2_clip => |c| {
+                const x = self.words(c.x);
+                const o = self.words(c.out);
+                p.x = x.off;
+                p.xs = x.stride;
+                p.z = o.off;
+                p.zs = o.stride;
+                p.n = c.group;
+                p.heads = c.x.width / c.group;
+                p.eps = c.threshold;
+                var scale_buf = self.arena;
+                if (c.scale) |id| {
+                    const w = self.bound[id];
+                    if (w.quant != null or !w.tensor.dtype.isFloat()) return error.InvalidL2ClipScale;
+                    p.w = w.tensor.offset;
+                    p.dtype = @backingInt(w.tensor.dtype);
+                    p.flags |= gpu.flag_has_weight;
+                    scale_buf = w.buffer;
+                }
+                try gpu.dispatch(self.ctx, "mk_l2_clip", &.{ self.arena, scale_buf }, &p, @as(usize, rows) * p.heads * 256, 256);
+            },
+            .route_topk => |r| {
+                const logit_view = self.words(r.logits);
+                const o = self.words(r.out);
+                const correction = self.bound[r.correction];
+                if (correction.quant != null or correction.tensor.dtype != .f32) return error.InvalidRouterCorrection;
+                p.x = logit_view.off;
+                p.xs = logit_view.stride;
+                p.y = o.off;
+                p.ys = o.stride;
+                p.n = r.experts;
+                p.m = r.top_k;
+                p.s = correction.tensor.offset;
+                p.eps = r.eps;
+                p.scale = r.scale;
+                try gpu.dispatch(self.ctx, "mk_route_topk", &.{ self.arena, correction.buffer }, &p, @as(usize, rows) * 32, 256);
+            },
+            .expert_gate_up => |e| {
+                var ep: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .k = e.x.width, .n = e.out.width / e.top_k, .experts = e.experts, .top_k = e.top_k, .gate_cap = e.gate_cap, .up_cap = e.up_cap, .round_bf16 = @intFromBool(e.round == .bf16) };
+                try self.expertProjection("mk_expert_gate_up", e.bank, e.x, e.routes, e.out, &ep, e.out.width, e.input_bf16);
+            },
+            .expert_down => |e| {
+                var ep: gpu.ExpertParams = .{ .rows = rows, .row0 = row0, .k = e.x.width / e.top_k, .n = e.out.width, .experts = e.experts, .top_k = e.top_k, .round_bf16 = @intFromBool(e.round == .bf16) };
+                try self.expertProjection("mk_expert_down", e.bank, e.x, e.routes, e.out, &ep, e.out.width, e.input_bf16);
             },
             .argmax => |m| {
                 const x = self.words(m.x);
@@ -665,6 +1096,7 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
     var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
     switch (step) {
         .op => unreachable,
+        .bf16_cast => |i| try self.encodeRound(ops[i], row0, rows, true),
         .projections => |m| if (rows > 1 and (self.prep != null or self.splitk != null or self.x2prep != null)) {
             // prefill-mlx (knob mlx_multi): the unsplit ones in one launch, the rest alone.
             var done: [4]bool = @splat(false);
@@ -1440,7 +1872,6 @@ fn tileKernel(comptime base: []const u8, rows: u32, tokens: u32) [:0]const u8 {
     };
     return names[r][t];
 }
-
 
 /// prefill objective (prefill search): the compiled matrix-matrix variant for the knobs.
 fn mmKernel(comptime base: []const u8, k: Knobs) [:0]const u8 {

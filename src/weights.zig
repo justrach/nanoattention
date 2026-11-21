@@ -54,7 +54,7 @@ pub const Weight = struct {
             .f32 => @bitCast(std.mem.readInt(u32, p[i * 4 ..][0..4], .little)),
             .f16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, p[i * 2 ..][0..2], .little)))),
             .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, p[i * 2 ..][0..2], .little)) << 16),
-            .u8, .u32 => unreachable,
+            .u8, .u32, .f8_e4m3 => unreachable,
         };
     }
     pub fn expert(self: Weight, index: usize) Weight {
@@ -165,11 +165,22 @@ pub const Store = struct {
         }
         return result;
     }
+    /// Bind a tensor as already-packed storage, with no affine-quant interpretation.
+    pub fn getRaw(self: *const Store, name: []const u8, shape: []const usize, dtype: st.DType) !Weight {
+        const w = (try self.find(name)) orelse {
+            std.debug.print("Missing checkpoint tensor: {s}\n", .{name});
+            return error.MissingWeight;
+        };
+        if (w.tensor.dtype != dtype) return error.WeightDTypeMismatch;
+        if (!std.mem.eql(usize, shape, w.tensor.shape)) return error.WeightShapeMismatch;
+        return w;
+    }
     pub fn get(self: *const Store, name: []const u8, shape: []const usize) !Weight {
         var w = (try self.find(name)) orelse {
             std.debug.print("Missing checkpoint tensor: {s}\n", .{name});
             return error.MissingWeight;
         };
+        if (w.tensor.dtype == .f8_e4m3) return error.PackedFormatRequiresSpecializedBinding;
         if (floating(w)) {
             if (!std.mem.eql(usize, shape, w.tensor.shape)) return error.WeightShapeMismatch;
             return w;

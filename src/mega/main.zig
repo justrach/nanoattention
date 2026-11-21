@@ -20,7 +20,7 @@ const usage =
     \\  nano session CHECKPOINT [--context N]
     \\  nano mlx-op linear --m M --k K --n N --group G --weights W --x X --out Y  (src/mega/mlxop.zig)
     \\  nano bench CHECKPOINT --prompt-tokens N [--decode-tokens 256] [--repeats 3] [--bench-tokens F]
-    \\        [--profile-decode 1]  (per-kernel GPU times of the last repeat's decode, on stderr)
+    \\        [--decode-mode teacher-forced|greedy] [--profile-decode 1]
     \\Common: --context N (default 4096), --knobs FILE.json, --knob name=value (repeatable,
     \\        applied after --knobs),
     \\        --sliding-visible N, --embed-round none|bf16.
@@ -139,6 +139,8 @@ pub fn main(init: std.process.Init) !void {
             bench_input.prompt_tokens = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--decode-tokens")) {
             bench_input.decode_tokens = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--decode-mode")) {
+            bench_input.greedy = if (std.mem.eql(u8, value, "greedy")) true else if (std.mem.eql(u8, value, "teacher-forced")) false else return error.InvalidBenchmarkDecodeMode;
         } else if (std.mem.eql(u8, flag, "--bench-tokens")) {
             bench_input.tokens = try loader.readFile(a, value);
         } else if (std.mem.eql(u8, flag, "--profile-decode")) {
@@ -216,7 +218,7 @@ fn inspect(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []const u8, 
     try io.print(a, "  states: tokens={d} scratch={d} sequence={d} ring={d} position={d}\n", .{ kinds[0], kinds[1], kinds[2], kinds[3], kinds[4] });
     var bound: usize = 0;
     for (program.weights) |w| {
-        _ = try store.get(w.name, w.shape);
+        _ = try exec.bindWeight(&store, w);
         bound += 1;
     }
     try io.print(a, "  bound {d}/{d} weights from {d} mapped bytes\n", .{ bound, program.weights.len, store.bytes });
@@ -331,6 +333,8 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
 test {
     _ = @import("ir.zig");
     _ = @import("lfm3.zig");
+    _ = @import("inkling2_loop.zig");
+    _ = @import("packed.zig");
     _ = @import("knobs.zig");
     _ = @import("session.zig");
     _ = @import("kernel_tests.zig");

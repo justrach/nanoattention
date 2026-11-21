@@ -1,4 +1,4 @@
-//! Teacher-forced benchmark (docs/QD.md quality stage): an actual prompt of N tokens
+//! Benchmark (docs/QD.md quality stage): an actual prompt of N tokens
 //! is prefilled in batches, then D decode tokens are forwarded one at a time
 //! with the GPU argmax read back after each. One untimed warm-up run, then R
 //! timed repeats from a reset state; medians reported. Loading is excluded.
@@ -11,6 +11,8 @@ pub const Input = struct {
     prompt_tokens: u32 = 64,
     decode_tokens: u32 = 256,
     repeats: u32 = 3,
+    /// Feed each argmax back as the next input, for a fixed number of steps.
+    greedy: bool = false,
     /// Optional workload file {"bos": id, "code": [...], "decode": [...]}: the
     /// prompt is bos then code repeated and cut to prompt_tokens (the stock-MLX
     /// baseline's workload, tools/nano_bench.py tokens); decode is teacher-forced.
@@ -77,6 +79,8 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
     var prefill_dispatches: u64 = 0;
     var decode_dispatches: u64 = 0;
     var prefill_forwards: u64 = 0;
+    const predictions = try a.alloc(u32, decode.len + 1);
+    const warmup_predictions = try a.alloc(u32, predictions.len);
     var checksum: u64 = 0;
     for (0..input.repeats + 1) |rep| {
         engine.reset();
@@ -93,17 +97,19 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
             prefill_forwards += 1;
             i += n;
         }
-        var sum: u64 = try engine.next(engine.out_end - 1);
+        predictions[0] = try engine.next(engine.out_end - 1);
+        var sum: u64 = predictions[0];
         if (input.profile_decode and rep == input.repeats) try engine.ctx.beginProfile();
         const t1 = try io.now();
         var detail: [3]f64 = @splat(0); // decode climb 2: encode, wait, GPU seconds
-        for (decode) |t| {
-            try engine.forward(&.{t}, 0);
+        for (decode, predictions[1..], 0..) |t, *prediction, step| {
+            try engine.forward(&.{if (input.greedy) predictions[step] else t}, 0);
             decode_dispatches += engine.last.dispatches;
             detail[0] += engine.last.encode_seconds;
             detail[1] += engine.last.wait_seconds;
             detail[2] += engine.last.gpu_seconds;
-            sum +%= try engine.next(0);
+            prediction.* = try engine.next(0);
+            sum +%= prediction.*;
         }
         const t2 = try io.now();
         try engine.d2Settle(); // decode climb 2 (d2_gate): nothing left at the gate before the next run
@@ -114,9 +120,10 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         }
         if (rep == 0) {
             checksum = sum;
+            @memcpy(warmup_predictions, predictions);
             continue;
         }
-        if (sum != checksum) return error.NondeterministicBenchmark;
+        if (!std.mem.eql(u32, predictions, warmup_predictions)) return error.NondeterministicBenchmark;
         prefill_s[rep - 1] = t1 - t0;
         decode_s[rep - 1] = t2 - t1;
     }
@@ -132,7 +139,8 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         .decode_tokens = input.decode_tokens,
         .repeats = input.repeats,
         .warmup_runs = 1,
-        .workload = if (input.tokens != null) "bos + code repeated (bench tokens file); teacher-forced decode" else "seeded LCG token stream",
+        .workload = if (input.tokens != null) if (input.greedy) "bos + code repeated (bench tokens file)" else "bos + code repeated (bench tokens file); teacher-forced decode" else "seeded LCG token stream",
+        .decode_mode = if (input.greedy) "greedy" else "teacher-forced",
         .batch = engine.batch,
         .knobs = knobs,
         .prefill_seconds = prefill_s,
@@ -143,6 +151,7 @@ pub fn run(engine: *exec.Engine, a: std.mem.Allocator, input: Input, knobs: Knob
         .dispatches_per_prefill_forward = @as(f64, @floatFromInt(prefill_dispatches)) / @as(f64, @floatFromInt(prefill_forwards)),
         .dispatches_per_decode_token = if (input.decode_tokens == 0) 0 else @as(f64, @floatFromInt(decode_dispatches)) / @as(f64, @floatFromInt(input.decode_tokens)),
         .prediction_checksum = checksum,
+        .predictions = predictions,
     };
     try io.out(try std.json.Stringify.valueAlloc(a, result, .{}));
     try io.out("\n");

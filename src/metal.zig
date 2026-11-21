@@ -105,6 +105,8 @@ pub const Buffer = struct {
 
 pub const Context = struct {
     handle: *anyopaque,
+    /// Optional dispatch policy consumed only by nano's GPU wrapper.
+    nano_dispatch_flags: ?c_int = null,
 
     pub fn init() !Context {
         return initMatched(false);

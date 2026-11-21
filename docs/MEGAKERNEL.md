@@ -1,6 +1,6 @@
 # The megakernel: a model-agnostic execution core
 
-`nano` runs a model described as a **program**: a weight table, a state table and a flat list of generic operations with explicit shapes. A per-architecture **front end** turns `config.json` into that program. Nothing below the front end (planner, executor, kernels, sessions, benchmark) knows which model it runs, so a new architecture built from the existing operations needs no new Metal code. The first and only front end today is LiquidAI's LFM3-1.7B (`src/mega/lfm3.zig`, specification in `docs/LFM3.md`).
+`nano` runs a model described as a **program**: a weight table, a state table and a flat list of generic operations with explicit shapes. A per-architecture **front end** turns `config.json` into that program. Nothing below the front end (planner, executor, kernels, sessions, benchmark) knows which model it runs, so a new architecture built from the existing operations needs no new Metal code. The verified LFM3-1.7B front end lives in `src/mega/lfm3.zig` (specification in `docs/LFM3.md`). Inkling 2 Mini also has an experimental native token-ID path; see its [verification status](#inkling-2-mini-experimental).
 
 "Megakernel" names the design goal (one generic execution core for every model), not a single monolithic GPU kernel: the reference executor issues one dispatch per operation into one command buffer per forward.
 
@@ -139,7 +139,7 @@ If the gate gives up before the host opens it, the embedding sees a stale genera
 
 **Two tiers.** The exact tier admits a candidate only if its logits are bit-identical to the pinned reference executor's (decode and batched ingestion). The `mlx-arith` tier (`docs/QD.md`) admits prefill candidates whose kernels are bit-identical ports of stock MLX's batched kernels (checked against MLX by `tools/nano_mlx_ops.py check`) and which meet the goldens' float32 gate end to end with identical greedy tokens; they live in their own cells (families `mlx-*`). Decode is exact in both. Exact stays the default; `docs/MLX-PREFILL.md` describes what stock MLX does and what the ports match.
 
-`nano bench CHECKPOINT --prompt-tokens N --decode-tokens 256 --repeats 3 [--bench-tokens F]` reports, as one JSON line, prefill and decode tokens a second (one untimed warm-up run, then the repeats from a reset state; medians; loading excluded; decode is teacher-forced with the GPU argmax read back every token), the per-repeat seconds, forwards, dispatches per prefill forward and per decode token, and a prediction checksum that must be equal across repeats. `tools/nano_bench.py tokens` writes the stock-MLX baseline's exact workload (BOS + `tools/benchmark.py`'s code continuation, and its 256 decode ids) and checks it against `benchmarks/lfm3-mlx-baseline.json`; `nano_bench.py run` runs one guarded process per length.
+`nano bench CHECKPOINT --prompt-tokens N --decode-tokens 256 --repeats 3 [--bench-tokens F]` reports, as one JSON line, prefill and decode tokens a second (one untimed warm-up run, then the repeats from a reset state; medians; loading excluded; decode is teacher-forced with the GPU argmax read back every token), the per-repeat seconds, forwards, dispatches per prefill forward and per decode token, and a prediction checksum that must be equal across repeats. Add `--decode-mode greedy` to feed each argmax back as the next input; it runs a fixed step count without stopping at EOS. `tools/nano_bench.py tokens` writes the stock-MLX baseline's exact workload (BOS + `tools/benchmark.py`'s code continuation, and its 256 decode ids) and checks it against `benchmarks/lfm3-mlx-baseline.json`; `nano_bench.py run` runs one guarded process per length.
 
 `tools/nano_qd.py` maintains the archive in `$NANO_WORK/qd/lfm3/` (a copy of the LFM3 search's archive is in `benchmarks/lfm3-qd/`):
 
@@ -186,3 +186,111 @@ Honest estimate: the front end (`flint.zig`, about 300 lines) plus these four op
 - The 4-bit fast linear needs `group % 16 == 0`, `in % 16 == 0` and even byte offsets (4-byte for float32 scales or biases); anything else takes `mk_linear_generic` (correct, but about 40 times slower on LFM3). LFM3's safetensors data section starts at byte 75,002, so every tensor sits 2 bytes off a word boundary; `mk_word` reads such a code word as two halves (the same word, so the same arithmetic). An earlier version required 4-byte alignment and silently ran every real-model linear through the generic kernel at 7.9 decode tokens a second. Use `FLINT_PROFILE=1` (the shared bridge's per-dispatch profiler) to see which kernels a program actually runs. Fused projections and GLU additionally need all matrices in one buffer with one group size, else the planner leaves them unfused.
 - Contexts beyond 4,096 tokens are not covered by any golden.
 - Bit identity of a variant with the reference is established empirically (admission), not proved: the library is compiled with `MTLMathModeSafe` (no reassociation), but whether the Metal compiler contracts a multiply-add into an FMA can differ between a fused kernel and its reference sequence. A Lean certificate covers the expression tree, not the compiler.
+
+
+## Inkling 2 Mini (experimental)
+
+`src/mega/inkling2_loop.zig` lowers the released `inkling2_loop` text graph into
+48 visits over 24 physical layers. Each visit has separate KV and convolution
+state; repeated core visits share weights. The executor reads the original
+NVFP4/MXFP8 expert weights in place. `nano` has no MLX dependency; MLX is the
+independent reference used by `tools/nano_inkling_verify.py`.
+
+Verified with the original `thinkingmachines/Inkling-2-Mini` checkpoint at
+`ed40e7da625f594fc9c4990f5f66be24873c22d7`: `nano inspect` bound all 822 text
+weights, and `eval`, `generate`, and `session` ran with token IDs. For the
+four-token fixture below, native feeds 1 and 4 yielded byte-identical logits
+and traces, and a continued session matched a fresh replay. The synthetic
+fixture also checks batching and replay across a sliding-window boundary.
+
+**MLX parity is not established.** With `mlx==0.32.4` and `mlx-lm` at
+`0c4c99192230f1943dd468d297f0b8a64ae7b7c2` from `jundot/mlx-lm`, the four
+prompt argmax IDs matched, but the third generated token differed and the
+maximum logit difference was 0.429, outside the fixed `atol=0.125`,
+`rtol=0.005` gate. The reference comparison should therefore return nonzero.
+
+```sh
+printf '[1,1234,42,1003]\n' > tokens.json
+python3 tools/guarded_run.py --lock "$NANO_LOCK" --timeout 240 -- \
+  zig-out/bin/nano eval "$CHECKPOINT" --context 32 --tokens-file tokens.json \
+  --feed 1 --positions all --logits-out native.f32 --hidden-out native-hidden.f32 \
+  --greedy 16 > native.json
+python3 tools/guarded_run.py --lock "$NANO_LOCK" --timeout 180 -- \
+  "$MLX_PYTHON" tools/nano_inkling_verify.py reference "$CHECKPOINT" \
+  --tokens-file tokens.json --feed 1 --logits-out mlx.f32 \
+  --hidden-out mlx-hidden.f32 --greedy 16 > mlx.json
+python3 tools/nano_inkling_verify.py --reference-summary mlx.json \
+  --candidate-summary native.json --reference-logits mlx.f32 \
+  --candidate-logits native.f32 --reference-hidden mlx-hidden.f32 \
+  --candidate-hidden native-hidden.f32 --atol 0.125 --rtol 0.005
+```
+
+Use the shared inference lock for both processes. This is the unfused text
+reference path. No Inkling chat template, vision, DSpark, or full 1M-context
+verification is included. Existing Lean certificates do not cover the Inkling
+kernels.
+
+### Throughput experiment
+
+`tools/nano_inkling_bench.py` runs separate processes under the shared
+inference lock, rotating their order across rounds. It uses the same
+checkpoint, seeded token IDs and batch size; weights are loaded and a warmup
+run happens before timing. Decode uses 24 teacher-forced tokens and MLX
+queues the next step before reading back the previous argmax. The benchmark
+records each prediction, not just their sum. Step 0 is the prompt's last row.
+
+| Prompt tokens | Batch | Native prefill / decode | Pinned MLX prefill / decode | Matching predictions |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 64 | 547.0 / 37.9 | 509.4 / 31.0 | 24/25 |
+| 1,024 | 128 | 723.9 / 33.4 | 700.5 / 29.8 | 24/25 |
+
+These are medians of five interleaved rounds in tokens/s on an M3 Ultra.
+Native prefill was 7.4% / 3.3% faster and decode was 22.3% / 12.3% faster at
+64 / 1,024 tokens. Median combined prefill and 24-step forced-decode times
+were 0.750 s vs 0.900 s at 64, and 2.132 s vs 2.265 s at 1,024. One
+prediction differed in each workload in every round: step 18 for the short
+prompt and step 7 for the long prompt. On the four-token fixture, the optimized
+path matched all four prompt argmax IDs with either feed size. With feed 1 it
+matched all 16 greedy IDs but failed the unchanged logit tolerance (maximum
+absolute difference 0.625). With feed 4 it diverged at generated token 14.
+These are performance measurements, not a parity claim.
+
+The same five-round benchmark with `--decode-mode greedy` feeds each argmax
+back into the model. MLX keeps the next input on the GPU. Both engines generated
+all 25 identical token IDs in every round (the first from prefill, plus 24
+decode steps). These are seeded prompts and fixed-length runs, not a general
+claim of output or logit parity.
+
+| Prompt tokens | Batch | Native decode (tokens/s) | Pinned MLX decode (tokens/s) | Native speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 64 | 38.0 | 28.9 | 32% |
+| 1,024 | 128 | 33.2 | 28.6 | 16% |
+
+On identical first-layer inputs, the sampled expert preactivations matched
+MLX exactly, as did down projection with the same gate-up inputs and routing
+weights. The fused gate activation differed in 42 of 36,864 BF16 values;
+using precise `tanh` matched MLX on those isolated inputs, but the full model
+still failed the logits gate. On the four-token fixture, replaying MLX's
+router on the native inputs matched the ordered expert IDs at all 48 layer
+visits for both feed sizes. The first batched attention layer already differed
+before routing. Matching MLX's single-row projection reduction order reduced
+the feed-1 count of out-of-tolerance logits from 51,175 to 100, but increased
+hidden-state differences and changed the generated sequence. Enabling tiled
+attention for short batches recovered the feed-4 greedy sequence but increased
+logit error. These experimental changes are not in the throughput path.
+
+The optional path splits expert tiles across workgroups, selects a smaller tile
+for partial tails, and shares SIMD route lists. It also uses vector packed-weight
+decode, BF16 matrix tiles that read weights directly into SIMD fragments, BF16
+vector tiles, and tiled relative attention.
+It uses the original packed weights and leaves the reference defaults unchanged.
+
+```sh
+python3 tools/nano_inkling_bench.py zig-out/bin/nano "$CHECKPOINT" \
+  --mlx-python "$MLX_PYTHON" --lock "$NANO_LOCK" --prompt 1024 --batch 128 --decode 24 --rounds 5 \
+  --knob expert_simd=true --knob expert_wide_dot=true --knob expert_gate_pair=true \
+  --knob expert_prefill=true --knob expert_wide_k=true --knob expert_bf16_tiles=true \
+  --knob expert_mlx_scale=true --knob bf16_linear_tile=true --knob bf16_prefill_tile=8 \
+  --knob bf16_prefill_matrix=true --knob bf16_decode_vec=true --knob fuse_bf16_cast=true --knob concurrent_scratch=true \
+  --knob relative_split=true --knob relative_split_4=true --knob relative_tile_prefill=true
+```

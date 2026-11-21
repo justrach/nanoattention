@@ -21,6 +21,7 @@ struct MK {
 constant uint MK_ROUND_BF16 = 1u;
 constant uint MK_HAS_WEIGHT = 2u;
 constant uint MK_FAST_TRIG = 4u;
+constant uint MK_ROUND_OUT = 16u;
 
 inline float mk_load(device const uchar *base, ulong offset, uint dtype, ulong i) {
     if (dtype == 0) return ((device const float *)(base + offset))[i];
@@ -42,6 +43,7 @@ inline float mk_sigmoid(float x) {
 inline float mk_act(float x, uint act) {
     if (act == 1) return x * mk_sigmoid(x);
     if (act == 2) return mk_sigmoid(x);
+    if (act == 3) return tanh(x);
     return x;
 }
 // Packed code word i of a weight at byte `offset`. Safetensors data can start
@@ -118,7 +120,9 @@ kernel void mk_rmsnorm(device const uchar *w [[buffer(0)]], device float *arena 
     for (uint base = lid * 4; base < p.n; base += tg * 4)
         for (uint j = 0; j < 4; ++j) if (base + j < p.n) {
             float v = x[base + j] * inv;
-            y[base + j] = (p.flags & MK_HAS_WEIGHT) ? mk_load(w, p.w, p.dtype, base + j) * v : v;
+            if (p.flags & MK_ROUND_BF16) v = mk_bf16(v);
+            float result = (p.flags & MK_HAS_WEIGHT) ? mk_load(w, p.w, p.dtype, base + j) * v : v;
+            y[base + j] = (p.flags & MK_ROUND_OUT) ? mk_bf16(result) : result;
         }
 }
 
@@ -216,7 +220,7 @@ kernel void mk_linear_generic(device const uchar *w [[buffer(0)]], device const 
         acc += wv * x[col];
     }
     acc = simd_sum(acc);
-    if (lane == 0) arena[p.y + (p.row0 + t) * p.ys + row] = acc;
+    if (lane == 0) arena[p.y + (p.row0 + t) * p.ys + row] = (p.flags & MK_ROUND_OUT) ? mk_bf16(acc) : acc;
 }
 
 // ---- elementwise ------------------------------------------------------------
@@ -228,7 +232,28 @@ kernel void mk_binary(device float *arena [[buffer(0)]], constant MK &p [[buffer
     uint row = p.row0 + r;
     float a = mk_act(arena[p.x + row * p.xs + c], p.act_a);
     float b = mk_act(arena[p.y + row * p.ys + c / p.every], p.act_b);
-    arena[p.z + row * p.zs + c] = p.kind == 0 ? a + b : a * b;
+    float result = p.kind == 0 ? a + b : (p.kind == 1 ? a * b : a - b);
+    arena[p.z + row * p.zs + c] = (p.flags & MK_ROUND_OUT) ? mk_bf16(result) : result;
+}
+
+kernel void mk_concat(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
+                      uint i [[thread_position_in_grid]]) {
+    uint width = p.n + p.m;
+    uint r = i / width, c = i % width;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    float value = c < p.n
+        ? arena[p.x + row * p.xs + c]
+        : arena[p.y + row * p.ys + c - p.n];
+    arena[p.z + row * p.zs + c] = value;
+}
+
+kernel void mk_activate(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
+                        uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    arena[p.z + row * p.zs + c] = mk_act(arena[p.x + row * p.xs + c], p.act_a);
 }
 
 // ---- state writes -----------------------------------------------------------

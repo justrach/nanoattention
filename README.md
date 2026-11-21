@@ -209,6 +209,8 @@ including initial-prefill latency, incomplete responses, and verification limits
 
 `zig build` also produces **`nano`**, a second executable built on a model-agnostic core (`src/mega/`). A model is described as a program of generic operations over declared state (activations, append-only and ring KV, short conv windows); a per-architecture front end emits the program from `config.json`, and nothing below the front end knows which model it runs. The first model on it is [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) (24 layers: 13 gated short convolutions, 6 full-attention and 5 sliding-attention), from its official 4-bit MLX export. `nano` has `inspect`, `generate`, `eval`, `bench` and `session`; `nano session` speaks the same JSONL protocol as `flint session`.
 
+**Experimental: Inkling 2 Mini.** The native Metal text path can inspect and run the original mixed-precision checkpoint with token IDs. MLX parity has not passed; see the [verified workflow and limits](docs/MEGAKERNEL.md#inkling-2-mini-experimental).
+
 Every performance choice is a run-time knob. With no knobs, the engine commands (`session`, `eval`, `bench`) run the plain reference executor (one dispatch per operation), which is what everything else is checked against. Two presets select the tuned paths; `nano run` and `nano chat` ([below](#nano-as-a-command-line-tool)) use the first by default:
 
 ```sh

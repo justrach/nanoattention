@@ -48,6 +48,30 @@ pub const Params = extern struct {
     pad_f0: f32 = 0,
     pad_f1: f32 = 0,
 };
+/// Mirror of MKExpert for a single packed expert projection.
+pub const ExpertParams = extern struct {
+    w: u64 = 0,
+    s: u64 = 0,
+    amax: u64 = 0,
+    denominator: u64 = 0,
+    rows: u32 = 0,
+    row0: u32 = 0,
+    x: u32 = 0,
+    xs: u32 = 0,
+    routes: u32 = 0,
+    rs: u32 = 0,
+    y: u32 = 0,
+    ys: u32 = 0,
+    k: u32 = 0,
+    n: u32 = 0,
+    experts: u32 = 0,
+    top_k: u32 = 0,
+    nvfp4: u32 = 0,
+    round_bf16: u32 = 0,
+    gate_cap: f32 = 0,
+    up_cap: f32 = 0,
+};
+
 /// One matrix of a multi-matrix launch (MKMat in fused.metal).
 pub const Mat = extern struct {
     w: u64 = 0,
@@ -74,13 +98,15 @@ pub const flag_has_weight: u32 = 2;
 pub const flag_fast_trig: u32 = 4;
 /// decode search: mk_dec_chain_block applies the attention gate epilogue.
 pub const flag_dec_gated: u32 = 8;
+pub const flag_round_out: u32 = 16;
 
 comptime {
+    if (@sizeOf(ExpertParams) != 96) @compileError("ExpertParams must match MKExpert in inkling_ops.metal");
     if (@sizeOf(Params) != 160) @compileError("Params must match MK in kernels.metal");
     if (@sizeOf(Mat) != 48 or @sizeOf(ParamsX) != 160 + 4 * 48 + 16) @compileError("ParamsX must match MKX in fused.metal");
 }
 
-pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
+pub const source = @embedFile("kernels.metal") ++ "\n" ++ @embedFile("inkling_ops.metal") ++ "\n" ++ @embedFile("fused.metal") ++ "\n" ++ @embedFile("decode.metal") ++ "\n" ++ @embedFile("prefill.metal") ++ "\n" ++ @embedFile("mlx.metal") ++
     // second climb: prefill in MLX arithmetic, decode, then exact prefill on the matrix units
     // (exact2.metal uses mk_mlx_sb, so it stays after mlx.metal)
     "\n" ++ @embedFile("mlx2.metal") ++ "\n" ++ @embedFile("decode2.metal") ++ "\n" ++ @embedFile("exact2.metal");
@@ -95,11 +121,15 @@ pub fn open() !metal.Context {
 
 pub fn dispatch(ctx: metal.Context, kernel: [:0]const u8, buffers: []const metal.Buffer, p: anytype, threads: usize, group: usize) !void {
     const T = @typeInfo(@TypeOf(p)).pointer.child;
-    comptime if (T != Params and T != ParamsX) @compileError("unknown parameter block");
+    comptime if (T != Params and T != ParamsX and T != ExpertParams) @compileError("unknown parameter block");
     if (buffers.len > 8 or threads == 0 or group == 0) return error.InvalidDispatch;
     var handles: [8]*anyopaque = undefined;
     for (buffers, 0..) |buf, i| handles[i] = buf.handle;
-    if (fm_dispatch(ctx.handle, kernel, &handles, buffers.len, p, @sizeOf(T), threads, group) == 0) {
+    const ok = if (ctx.nano_dispatch_flags) |flags|
+        fm_d2_dispatch(ctx.handle, kernel, &handles, buffers.len, p, @sizeOf(T), threads, group, flags)
+    else
+        fm_dispatch(ctx.handle, kernel, &handles, buffers.len, p, @sizeOf(T), threads, group);
+    if (ok == 0) {
         std.debug.print("Metal: {s}\n", .{std.mem.span(fm_error())});
         return error.MetalFailure;
     }

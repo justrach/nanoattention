@@ -20,9 +20,10 @@ pub const Fusion = struct {
     // ---- decode search ----
     /// rmsnorm(q), rmsnorm(k) per head in place, rope(q), rope(k), store(k), store(v): one launch.
     attn_prep: bool = false,
+    bf16_cast: bool = false,
 
     pub fn any(self: Fusion) bool {
-        return self.projections or self.glu or self.norms or self.conv or self.gate or self.attn_prep;
+        return self.projections or self.glu or self.norms or self.conv or self.gate or self.attn_prep or self.bf16_cast;
     }
 };
 
@@ -34,10 +35,11 @@ pub const Step = union(enum) {
     conv: u32,
     gate: u32,
     attn_prep: u32,
+    bf16_cast: u32,
 
     pub fn first(self: Step) u32 {
         return switch (self) {
-            .op, .glu, .norms, .conv, .gate, .attn_prep => |i| i,
+            .op, .glu, .norms, .conv, .gate, .attn_prep, .bf16_cast => |i| i,
             .projections => |m| m.first,
         };
     }
@@ -47,7 +49,7 @@ pub const Step = union(enum) {
             .projections => |m| m.count,
             .glu, .norms => 3,
             .conv => 4,
-            .gate => 2,
+            .gate, .bf16_cast => 2,
             .attn_prep => 6,
         };
     }
@@ -61,6 +63,7 @@ pub const WeightInfo = struct {
     buffer: usize,
     /// Affine group size (0 for dense weights).
     group: u32 = 0,
+    dense: bool = false,
 };
 
 fn overlaps(a: ir.View, b: ir.View) bool {
@@ -92,8 +95,50 @@ fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
             reads[1] = b.b;
             writes.* = b.out;
         },
+        .row_transform => |t| {
+            reads[0] = t.x;
+            writes.* = t.out;
+        },
+        .grouped_project => |p| {
+            reads[0] = p.x;
+            writes.* = p.out;
+        },
+        .concat => |c| {
+            reads[0] = c.a;
+            reads[1] = c.b;
+            writes.* = c.out;
+        },
+        .activate => |a| {
+            reads[0] = a.x;
+            writes.* = a.out;
+        },
+        .softcapped_swiglu => |s| {
+            reads[0] = s.gate;
+            reads[1] = s.up;
+            writes.* = s.out;
+        },
+        .depth_attention => |d| {
+            reads[0] = d.bank;
+            reads[1] = d.partial;
+            writes.* = d.out;
+        },
         .store => |s| reads[0] = s.src,
         .conv => |c| writes.* = c.out,
+        .inkling_short_conv => |c| {
+            reads[0] = c.residual;
+            writes.* = c.out;
+        },
+        .inkling_dynamic_conv => |c| {
+            reads[0] = c.dynamic;
+            reads[1] = c.residual;
+            writes.* = c.out;
+        },
+        .inkling_message_merge => |m| {
+            reads[0] = m.hidden;
+            reads[1] = m.message;
+            reads[2] = m.gates;
+            writes.* = m.out;
+        },
         .rope => |r| {
             reads[0] = r.x;
             writes.* = r.x;
@@ -102,11 +147,104 @@ fn access(op: ir.Op, reads: *[3]?ir.View, writes: *?ir.View) void {
             reads[0] = a.q;
             writes.* = a.out;
         },
+        .relative_attention => |a| {
+            reads[0] = a.q;
+            reads[1] = a.bias;
+            reads[2] = a.sink;
+            writes.* = a.out;
+        },
+        .l2_clip => |c| {
+            reads[0] = c.x;
+            writes.* = c.out;
+        },
+        .route_topk => |r| {
+            reads[0] = r.logits;
+            writes.* = r.out;
+        },
+        .expert_gate_up => |e| {
+            reads[0] = e.x;
+            reads[1] = e.routes;
+            writes.* = e.out;
+        },
+        .expert_down => |e| {
+            reads[0] = e.x;
+            reads[1] = e.routes;
+            writes.* = e.out;
+        },
         .argmax => |m| {
             reads[0] = m.x;
             writes.* = m.out;
         },
     }
+}
+
+const LaunchAccess = struct {
+    reads: [3]?ir.View,
+    write: ir.View,
+
+    fn overlapsWrites(a: LaunchAccess, b: LaunchAccess) bool {
+        if (overlaps(a.write, b.write)) return true;
+        for (a.reads) |read| if (read) |v| if (overlaps(v, b.write)) return true;
+        for (b.reads) |read| if (read) |v| if (overlaps(v, a.write)) return true;
+        return false;
+    }
+};
+
+fn launchAccess(step: Step, p: *const ir.Program, info: []const WeightInfo) ?LaunchAccess {
+    // An absorbed BF16 cast writes back to the producer's output in the
+    // same dispatch. Other fused steps and multi-launch ops are opaque.
+    const op = switch (step) {
+        .op, .bf16_cast => |i| p.ops[i],
+        else => return null,
+    };
+    switch (op) {
+        .linear => |l| if (!info[l.w].dense) return null,
+        .embed, .rmsnorm, .binary, .row_transform, .grouped_project, .concat, .activate,
+        .softcapped_swiglu, .depth_attention, .inkling_message_merge, .l2_clip, .route_topk,
+        .store, .conv, .inkling_short_conv, .inkling_dynamic_conv => {},
+        else => return null,
+    }
+    var reads: [3]?ir.View = undefined;
+    var write: ?ir.View = null;
+    access(op, &reads, &write);
+    // Persistent caches occupy distinct buffers. Conservatively mark a
+    // whole cache as read or written, even when only one position is used.
+    switch (op) {
+        .store => |o| write = .{ .state = o.dst, .width = p.states[o.dst].width },
+        .conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
+        .inkling_short_conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
+        .inkling_dynamic_conv => |o| reads[2] = .{ .state = o.src, .width = p.states[o.src].width },
+        else => {},
+    }
+    return .{ .reads = reads, .write = write orelse return null };
+}
+
+/// Only omit a barrier when every dispatch since the last one is a known
+/// single-launch operation with no RAW, WAW, or WAR hazard.
+pub fn independentLaunches(gpa: std.mem.Allocator, steps: []const Step, p: *const ir.Program, info: []const WeightInfo) ![]bool {
+    const independent = try gpa.alloc(bool, steps.len);
+    var active: [16]LaunchAccess = undefined;
+    var count: usize = 0;
+    for (steps, independent) |step, *can_overlap| {
+        can_overlap.* = false;
+        const now = launchAccess(step, p, info) orelse {
+            count = 0;
+            continue;
+        };
+        if (count != 0 and count < active.len) {
+            can_overlap.* = true;
+            for (active[0..count]) |prev| {
+                if (now.overlapsWrites(prev)) {
+                    can_overlap.* = false;
+                    break;
+                }
+            }
+        }
+        if (!can_overlap.*) count = 0;
+        active[count] = now;
+        count += 1;
+    }
+    return independent;
 }
 
 /// True when the value op `writer` stores in `v` is read by no op after
@@ -149,6 +287,7 @@ fn matchNorms(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
         else => return false,
     };
     if (n1.weight == null or n2.weight == null) return false;
+    if (n1.round_normalized != .none or n2.round_normalized != .none) return false;
     if (info[n1.weight.?].buffer == 0 or info[n1.weight.?].buffer != info[n2.weight.?].buffer) return false;
     if (n1.group != n1.x.width or n2.group != n2.x.width or n1.group != n2.group or n1.eps != n2.eps) return false;
     if (add.kind != .add or add.a_act != .identity or add.b_act != .identity or add.b_every != 1) return false;
@@ -269,6 +408,7 @@ fn matchAttnPrep(p: *const ir.Program, i: u32) bool {
         else => return false,
     };
     if (n1.weight == null or n2.weight == null or !sameView(n1.x, n1.out) or !sameView(n2.x, n2.out)) return false;
+    if (n1.round_normalized != .none or n2.round_normalized != .none) return false;
     if (n1.eps != n2.eps or n1.group != r1.dim or n2.group != r1.dim) return false;
     if (!sameView(r1.x, n1.x) or !sameView(r2.x, n2.x) or r2.dim != r1.dim or r2.rot != r1.rot or r2.freqs != r1.freqs or r2.fast_trig != r1.fast_trig) return false;
     if (r1.rot > r1.dim or r1.x.width != r1.heads * r1.dim or r2.x.width != r2.heads * r2.dim) return false;
@@ -280,11 +420,30 @@ fn matchAttnPrep(p: *const ir.Program, i: u32) bool {
 }
 
 /// The schedule for a fusion selection. Steps cover every op exactly once, in order.
+fn matchBf16Cast(p: *const ir.Program, info: []const WeightInfo, i: u32) bool {
+    if (!sameSide(p, i, 2)) return false;
+    const out = switch (p.ops[i]) {
+        .rmsnorm => |n| n.out,
+        .linear => |l| if (info[l.w].dense) l.out else return false,
+        .binary => |b| b.out,
+        .l2_clip => |c| c.out,
+        else => return false,
+    };
+    const cast = switch (p.ops[i + 1]) {
+        .row_transform => |t| t,
+        else => return false,
+    };
+    if (cast.transform != .copy or cast.round != .bf16 or !sameView(out, cast.x) or !sameView(out, cast.out)) return false;
+    for (p.traces) |trace| if (trace.after_op == i) return false;
+    return true;
+}
+
 pub fn build(a: std.mem.Allocator, p: *const ir.Program, fusion: Fusion, info: []const WeightInfo) ![]Step {
     var steps: std.ArrayList(Step) = .empty;
     var i: u32 = 0;
     while (i < p.ops.len) {
         const step: Step = blk: {
+            if (fusion.bf16_cast and matchBf16Cast(p, info, i)) break :blk .{ .bf16_cast = i };
             if (fusion.norms and matchNorms(p, info, i)) break :blk .{ .norms = i };
             if (fusion.glu and matchGlu(p, info, i)) break :blk .{ .glu = i };
             if (fusion.conv and matchConv(p, i)) break :blk .{ .conv = i };

@@ -11,17 +11,18 @@ pub const DType = enum(u32) {
     bf16 = 2,
     u8 = 3,
     u32 = 4,
+    f8_e4m3 = 5,
 
     pub fn isFloat(self: DType) bool {
         return switch (self) {
             .f32, .f16, .bf16 => true,
-            .u8, .u32 => false,
+            .u8, .u32, .f8_e4m3 => false,
         };
     }
 
     pub fn byteSize(self: DType) usize {
         return switch (self) {
-            .u8 => 1,
+            .u8, .f8_e4m3 => 1,
             .f16, .bf16 => 2,
             .f32, .u32 => 4,
         };
@@ -106,7 +107,7 @@ fn parseTensor(allocator: std.mem.Allocator, value: std.json.Value, data_start: 
     const shape_value = value.object.get("shape") orelse return error.InvalidTensor;
     const offsets_value = value.object.get("data_offsets") orelse return error.InvalidTensor;
     if (dtype_value != .string) return error.InvalidTensor;
-    const dtype: DType = if (std.mem.eql(u8, dtype_value.string, "F32")) .f32 else if (std.mem.eql(u8, dtype_value.string, "F16")) .f16 else if (std.mem.eql(u8, dtype_value.string, "BF16")) .bf16 else if (std.mem.eql(u8, dtype_value.string, "U8")) .u8 else if (std.mem.eql(u8, dtype_value.string, "U32")) .u32 else return error.UnsupportedDType;
+    const dtype: DType = if (std.mem.eql(u8, dtype_value.string, "F32")) .f32 else if (std.mem.eql(u8, dtype_value.string, "F16")) .f16 else if (std.mem.eql(u8, dtype_value.string, "BF16")) .bf16 else if (std.mem.eql(u8, dtype_value.string, "U8")) .u8 else if (std.mem.eql(u8, dtype_value.string, "U32")) .u32 else if (std.mem.eql(u8, dtype_value.string, "F8_E4M3")) .f8_e4m3 else return error.UnsupportedDType;
     if (shape_value != .array or offsets_value != .array or offsets_value.array.items.len != 2)
         return error.InvalidTensor;
     const shape = try allocator.alloc(usize, shape_value.array.items.len);
@@ -166,11 +167,27 @@ test "dtype ABI and packed integer storage remain distinct from floats" {
     try std.testing.expectEqual(@as(u32, 2), @backingInt(DType.bf16));
     try std.testing.expectEqual(@as(u32, 3), @backingInt(DType.u8));
     try std.testing.expectEqual(@as(u32, 4), @backingInt(DType.u32));
+    try std.testing.expectEqual(@as(u32, 5), @backingInt(DType.f8_e4m3));
     try std.testing.expect(DType.f32.isFloat());
     try std.testing.expect(DType.f16.isFloat());
     try std.testing.expect(DType.bf16.isFloat());
     try std.testing.expect(!DType.u8.isFloat());
     try std.testing.expect(!DType.u32.isFloat());
+    try std.testing.expect(!DType.f8_e4m3.isFloat());
+    try std.testing.expectEqual(@as(usize, 1), DType.f8_e4m3.byteSize());
+}
+
+test "F8_E4M3 metadata uses one byte elements without scalar float semantics" {
+    const json =
+        \\{"scales":{"dtype":"F8_E4M3","shape":[3],"data_offsets":[0,3]}}
+    ;
+    const bytes = try fixture(std.testing.allocator, json, 3);
+    defer std.testing.allocator.free(bytes);
+    var header = try Header.parse(std.testing.allocator, bytes);
+    defer header.deinit();
+    const scales = header.get("scales").?;
+    try std.testing.expectEqual(DType.f8_e4m3, scales.dtype);
+    try std.testing.expectEqual(@as(usize, 3), scales.len);
 }
 
 test "packed U8 and U32 tensors use exact one and four byte elements" {

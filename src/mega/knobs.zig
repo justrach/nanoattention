@@ -6,6 +6,40 @@ const std = @import("std");
 pub const Knobs = struct {
     /// Maximum token rows per forward (prefill chunk). Decode uses 1.
     batch: u32 = 64,
+    /// Opt-in packed expert reduction in SIMD lanes (different summation order).
+    expert_simd: bool = false,
+    /// Share routed input loads across the packed gate and up projections.
+    expert_gate_pair: bool = false,
+    /// Reuse a packed input lane tile across four outputs (NVFP4 or MXFP8).
+    expert_wide_dot: bool = false,
+    /// Opt-in expert-major batched matmul (different summation order).
+    expert_prefill: bool = false,
+    /// Stage NVFP4 inputs and decoded blocks in BF16 (requires expert_prefill).
+    expert_bf16_tiles: bool = false,
+    /// Tile both packed formats, rounding dequantized weights to BF16 as in batched MLX.
+    expert_mlx_scale: bool = false,
+    /// Wider packed-expert K tile for prefill. Requires expert_prefill.
+    expert_wide_k: bool = false,
+    /// Parallel softmax over relative-bias decode partitions.
+    relative_split: bool = false,
+    /// Four simultaneous score dots per decode partition; requires relative_split.
+    relative_split_4: bool = false,
+    /// Split long relative-bias attention in prefill (requires relative_split).
+    relative_split_prefill: bool = false,
+    /// FP16 matrix fragments in batched relative attention (different arithmetic).
+    relative_tile_prefill: bool = false,
+    /// Reuse BF16 weights and input lanes across a small dense tile.
+    bf16_linear_tile: bool = false,
+    /// Matrix tiles for large BF16 projections with BF16-valued inputs.
+    bf16_prefill_matrix: bool = false,
+    /// Fully unrolled BF16 prefill tile; zero selects the original tail-safe kernel.
+    bf16_prefill_tile: u32 = 0,
+    /// Vector loads for the BF16 decode tile (different summation order).
+    bf16_decode_vec: bool = false,
+    /// Fold an in-place BF16 cast into its producer without changing arithmetic.
+    fuse_bf16_cast: bool = false,
+    /// Allow adjacent independent scratch kernels to overlap.
+    concurrent_scratch: bool = false,
     /// Affine 4-bit linear: output rows and token rows per SIMD group,
     /// separately for single-row (decode) and multi-row (prefill) forwards.
     decode_rows: u32 = 2,
@@ -130,10 +164,11 @@ pub const Knobs = struct {
     pub const mm_tiles = [_]struct { u32, u32, bool }{.{ 2, 8, true }};
 
     pub fn fusion(self: Knobs) @import("plan.zig").Fusion {
-        return .{ .projections = self.fuse_projections, .glu = self.fuse_glu, .norms = self.fuse_norms, .conv = self.fuse_conv, .gate = self.fuse_gate, .attn_prep = self.fuse_attn_prep };
+        return .{ .projections = self.fuse_projections, .glu = self.fuse_glu, .norms = self.fuse_norms, .conv = self.fuse_conv, .gate = self.fuse_gate, .attn_prep = self.fuse_attn_prep, .bf16_cast = self.fuse_bf16_cast };
     }
 
     pub fn validate(self: Knobs) !void {
+        if (self.bf16_prefill_tile != 0 and self.bf16_prefill_tile != 8 and self.bf16_prefill_tile != 16 and self.bf16_prefill_tile != 32) return error.InvalidBf16PrefillTile;
         if (self.batch == 0 or self.batch > 4096) return error.InvalidBatch;
         for ([_]u32{ self.decode_rows, self.prefill_rows }) |r| if (r != 1 and r != 2 and r != 4 and r != 8) return error.InvalidLinearRows;
         for ([_]u32{ self.decode_tokens, self.prefill_tokens }) |t| if (t != 1 and t != 2 and t != 4) return error.InvalidLinearTokens;
@@ -145,7 +180,6 @@ pub const Knobs = struct {
         if (self.mm_group == 0 or self.mm_group % 32 != 0 or self.mm_group > 1024) return error.InvalidMmGroup;
         if (self.decode_attention != 0 and self.decode_attention != 2) return error.InvalidDecodeAttention;
         if (self.decode_argmax > 1) return error.InvalidDecodeArgmax;
-
     }
 
     /// Apply `name=value` (flag form) to the knob of that name.
