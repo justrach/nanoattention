@@ -50,6 +50,8 @@ The prompt is the argument, `--prompt TEXT`, `--file PATH`, or standard input. O
 | `--context N` | positions the state holds (default 4096; the model allows far more, memory grows by about 24 KB a position) |
 | `--prefill exact\|mlx` | see below |
 | `--knobs FILE`, `--knob name=value` | engine knobs (docs/MEGAKERNEL.md): `--knobs` replaces the preset, `--knob` applies on top |
+| `--twodsd 0\|1` | opt-in 2DSD (token + depth speculation). Default `0`. `1` fails closed: Flint/LFM are not looped; Inkling looping is sequential per token (docs/TWOSD.md) |
+| `--twodsd-k`, `--twodsd-stage`, `--twodsd-d1`, `--twodsd-d2`, `--twodsd-kv`, `--twodsd-window` | 2DSD tuning; rejected unless `--twodsd 1` |
 
 A reply ends at the model's stop token (`<|im_end|>`, from `config.json` through the front end), at `--max-tokens`, or when the context is full, which is said on standard error. Special tokens are never printed.
 

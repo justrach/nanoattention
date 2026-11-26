@@ -1,0 +1,12 @@
+{
+  "host": "Linux x86_64, 4× Intel Xeon, no Metal",
+  "zig": "0.17.0 ReleaseFast",
+  "model": "tiny exact looped CPU (R=4, vocab=97, oracle drafter when k>1)",
+  "note": "Call speedup counts loop-steps vs sequential AR. Not Metal, not a checkpoint, not the paper's GPU 7.6×.",
+  "runs": [
+    {"host":"cpu","metal":false,"causal":true,"prompt":8,"tokens":64,"k":4,"stage":"stage2b","repeats":7,"ar_decode_loop_calls":252,"twodsd_mean_calls":64.000,"call_speedup_vs_ar":3.938,"twodsd_mean_decode_ns":825189,"twodsd_decode_tok_s":76346.2,"commit_sources":{"main":0,"frozen":48,"fork":0,"bonus":15},"kv_bytes":{"full":28311552,"shared_last_w64":32243712,"ratio":1.139},"kv_bytes_inkling_seq4096":{"full":1207959552,"shared_last_w64":421527552,"ratio":0.349}},
+    {"host":"cpu","metal":false,"causal":true,"prompt":8,"tokens":64,"k":1,"stage":"stage1","repeats":7,"ar_decode_loop_calls":252,"twodsd_mean_calls":252.000,"call_speedup_vs_ar":1.000,"twodsd_mean_decode_ns":249625,"twodsd_decode_tok_s":252378.7,"commit_sources":{"main":0,"frozen":0,"fork":0,"bonus":63},"kv_bytes":{"full":28311552,"shared_last_w64":32243712,"ratio":1.139},"kv_bytes_inkling_seq4096":{"full":1207959552,"shared_last_w64":421527552,"ratio":0.349}},
+    {"host":"cpu","metal":false,"causal":true,"prompt":16,"tokens":128,"k":16,"stage":"stage2b","repeats":5,"ar_decode_loop_calls":508,"twodsd_mean_calls":32.000,"call_speedup_vs_ar":15.875,"twodsd_mean_decode_ns":2052923,"twodsd_decode_tok_s":61863.0,"commit_sources":{"main":0,"frozen":120,"fork":0,"bonus":7},"kv_bytes":{"full":56623104,"shared_last_w64":39321600,"ratio":0.694},"kv_bytes_inkling_seq4096":{"full":1207959552,"shared_last_w64":421527552,"ratio":0.349}},
+    {"host":"cpu","metal":false,"causal":false,"prompt":8,"tokens":64,"k":4,"stage":"stage2b","repeats":5,"ar_decode_loop_calls":252,"twodsd_mean_calls":19.000,"call_speedup_vs_ar":13.263,"twodsd_mean_decode_ns":249199,"twodsd_decode_tok_s":252810.2,"commit_sources":{"main":63,"frozen":0,"fork":0,"bonus":0},"kv_bytes":{"full":28311552,"shared_last_w64":32243712,"ratio":1.139},"kv_bytes_inkling_seq4096":{"full":1207959552,"shared_last_w64":421527552,"ratio":0.349}}
+  ]
+}

@@ -100,3 +100,19 @@ training-free Loop Contrastive Decoding methods from:
 
 All LoopCD IR lowering and Metal kernels here are original implementations written for
 `nano`.
+
+## 2DSD (Two-Dimensional Speculative Decoding)
+
+The opt-in CPU scheduler in `src/twodsd.zig`, the tiny-model bench in
+`src/twodsd_bench.zig`, and the integer contracts in `proofs/TwoDsd.lean`
+follow **2DSD: Two-Dimensional Speculative Decoding for Looped Language
+Models** (Kim, Chavan, Seo, Hu, Lee, Kang, Mahoney, Keutzer, Hooper and
+Gholami, 2026; announced
+[https://x.com/minseokim0525/status/2123533353823662556](https://x.com/minseokim0525/status/2123533353823662556)).
+Reference implementation: [`SqueezeAILab/2DSD`](https://github.com/SqueezeAILab/2DSD)
+(`paper/2DSD.pdf`, `vllm/v1/spec_decode/looped_2d_finalized.py`). The algorithm,
+stage names, last-loop KV window constraint, and rejection-sampling residual
+are from that work. The Zig scheduler, tiny looped target, CLI fail-closed
+path, and Lean contracts are original to this engine. This is not a port of
+their vLLM / CUDA runtime, does not include their drafter or shared-KV
+checkpoints, and does not implement Metal overlapping decode.

@@ -27,6 +27,10 @@ KV ownership, protocol adapters, proofs, tests and tuning tools are kept here.
   attribution and `licenses/qwegn-APACHE-2.0.txt` for the six adapted Inkling 2
   Mini kernel optimization designs (`src/mega/inkling_fast.metal` and
   `THIRD_PARTY_NOTICES.md`).
+- 2DSD (Kim, Chavan, Seo, Hu, Lee, Kang, Mahoney, Keutzer, Hooper and Gholami,
+  2026, [`SqueezeAILab/2DSD`](https://github.com/SqueezeAILab/2DSD)): algorithm
+  and last-loop KV window contract in `src/twodsd.zig` / `proofs/TwoDsd.lean`;
+  see `THIRD_PARTY_NOTICES.md`. This is not a port of their vLLM runtime.
 - Checkpoints and tokenizers: not included in this source repository. Their
   licenses are separate; the source MIT license does not relicense model files.
 
