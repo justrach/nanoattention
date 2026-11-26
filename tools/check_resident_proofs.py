@@ -23,6 +23,7 @@ def main() -> int:
     try:
         subprocess.run(["lake", "build"], cwd=proofs, check=True)
         subprocess.run(["lake", "env", "lean", "Speculative.lean"], cwd=proofs, check=True)
+        subprocess.run(["lake", "env", "lean", "TwoDsd.lean"], cwd=proofs, check=True)
         subprocess.run(["lake", "env", "lean", "Prefetch.lean"], cwd=proofs, check=True)
         subprocess.run(["lake", "env", "lean", "Transpose.lean"], cwd=proofs, check=True)
         subprocess.run(["lake", "env", "lean", "Prepared.lean"], cwd=proofs, check=True)

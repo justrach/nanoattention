@@ -202,6 +202,11 @@ More: [long-context sessions](benchmarks/larger-context-sessions.md),
   target greedy tokens in the tested cases, and can be slower on real coding
   tasks. See [contracts and limitations](docs/SPECULATIVE.md) and
   [workload-dependent results](benchmarks/speculative-hillclimb.md).
+- **2DSD** (token + depth speculation for looped LMs) is a CPU scheduler plus
+  fail-closed `--twodsd 1`. Flint/LFM are not looped; Inkling looping is not
+  overlapping Metal decode. No default path changes. See
+  [fit, algorithm, and limits](docs/TWOSD.md) and
+  [CPU-only numbers](benchmarks/twodsd.md).
 - **Resident execution** interprets the generated plan in one GPU dispatch, with
   `--resident-workers 1..32` and checked dimension/context limits. It is slower than
   the optimized staged path. Ordinary staged execution uses multiple kernels;
@@ -280,6 +285,7 @@ MLX/MLX-LM are optional reference-test dependencies, not runtime dependencies.
 ```sh
 zig build test -Doptimize=ReleaseSafe
 zig build test-mega -Doptimize=ReleaseSafe
+zig build test-twodsd
 zig build proofs
 python3 -B proofs/test_verifier.py
 zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig

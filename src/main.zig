@@ -35,8 +35,11 @@ const usage =
     \\It requires staged D128 attention and conflicts with --attention-chunk.
     \\Opt-in: --kv-bf16 1 stores global KV as BF16 (sliding KV stays FP32).
     \\It requires --mlx-attention 1 and may change logits/tokens; default is FP32 KV.
-    \\Opt-in: --speculative-tokens 1..32 enables greedy history drafts and batched target verification.
-    \\It requires matched staged INT4/g64 projections; 0 disables speculation (default).
+\\Opt-in: --speculative-tokens 1..32 enables greedy history drafts and batched target verification.
+\\It requires matched staged INT4/g64 projections; 0 disables speculation (default).
+\\Opt-in: --twodsd 0|1 requests 2DSD (token+depth speculation). Flint is not looped, so 1 fails closed.
+\\Optional: --twodsd-k 1..16, --twodsd-stage stage1|stage2a|stage2b, --twodsd-d1 N, --twodsd-d2 N,
+\\--twodsd-kv full|shared_last, --twodsd-window N. Tuning without --twodsd 1 is rejected.
     \\Optional: --resident-workers N (1..32) selects the Lean-plan single-kernel path.
     \\Tuning: --resident-row-tile 1|2|4|8 (requires resident mode).
     \\Tuning: --staged-row-tile 1|2|4|8 (default 1; nondefault requires staged mode).
@@ -93,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     var speculative_query_group: u32 = 2;
     var speculative_expert_tile: u32 = 0;
     var speculative_weight_reuse = false;
+    var twodsd_cli: @import("twodsd.zig").Cli = .{};
     var trace_position: ?u32 = null;
     var tokens: std.ArrayList(u32) = .empty;
     var has_tokens = false;
@@ -128,6 +132,20 @@ pub fn main(init: std.process.Init) !void {
             if (speculative_expert_tile != 0 and !@import("resident.zig").certified.validRowTile(speculative_expert_tile)) return error.InvalidStagedRowTile;
         } else if (std.mem.eql(u8, flag, "--speculative-weight-reuse")) {
             speculative_weight_reuse = (try std.fmt.parseInt(u1, value, 10)) != 0;
+        } else if (std.mem.eql(u8, flag, "--twodsd")) {
+            twodsd_cli.enabled = @import("twodsd.zig").parseEnable(value) orelse return error.InvalidTwoDsdFlag;
+        } else if (std.mem.eql(u8, flag, "--twodsd-k")) {
+            twodsd_cli.k = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-stage")) {
+            twodsd_cli.stage = @import("twodsd.zig").parseStage(value) orelse return error.InvalidTwoDsdStage;
+        } else if (std.mem.eql(u8, flag, "--twodsd-d1")) {
+            twodsd_cli.d1 = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-d2")) {
+            twodsd_cli.d2 = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-kv")) {
+            twodsd_cli.kv_policy = @import("twodsd.zig").parseKvPolicy(value) orelse return error.InvalidTwoDsdKvPolicy;
+        } else if (std.mem.eql(u8, flag, "--twodsd-window")) {
+            twodsd_cli.kv_window = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--trace-position")) {
             trace_position = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--logits-from")) {
@@ -156,6 +174,15 @@ pub fn main(init: std.process.Init) !void {
     if (mlx_attention and (resident_workers != 0 or attention_chunk != null)) return error.ConflictingAttentionMode;
     if (kv_bf16 and !mlx_attention) return error.Bf16KvRequiresMatchedStaged;
     if (speculative_tokens != 0 and (!mlx_attention or evaluate)) return error.SpeculationRequiresMatchedGeneration;
+    if (evaluate and twodsd_cli.enabled) return error.TwoDsdRequiresGeneration;
+    if (twodsd_cli.enabled or twodsd_cli.anyTuning()) {
+        const path = try std.fs.path.join(a, &.{ directory, "config.json" });
+        const map = try metal.Mapping.open(a, path);
+        defer map.deinit();
+        const parsed = try config.parse(a, map.bytes);
+        defer parsed.deinit();
+        try twodsd_cli.apply(parsed.value.model_type);
+    }
     if (trace_position != null and (!evaluate or resident_workers != 0)) return error.TraceRequiresStagedEval;
     if (trace_position != null and trace_position.? >= tokens.items.len) return error.InvalidTracePosition;
     if (logits_from != null and !evaluate) return error.LogitsFromRequiresEval;
@@ -221,6 +248,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("twodsd.zig");
     _ = @import("speculative.zig");
     _ = @import("token_batch_tests.zig");
     _ = @import("token_batch_attention_tests.zig");

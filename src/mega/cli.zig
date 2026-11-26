@@ -14,6 +14,7 @@ const sample = @import("sample.zig");
 const io = @import("io.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const metal = @import("weights").metal;
+const twodsd = @import("../twodsd.zig");
 const Allocator = std.mem.Allocator;
 
 pub const version = "0.2.0";
@@ -56,6 +57,9 @@ const run_help =
     \\  --loopcd MODE            Inkling LoopCD: off, hidden, logits, logits-adaptive
     \\  --loopcd-omega W         LoopCD contrast scale omega >= 0 (default 1.0)
     \\  --loopcd-weak-pass N     1-based weak pass index < loop passes (default 1)
+    \\  --twodsd 0|1             opt-in 2DSD (fails closed until overlapping looped decode is wired)
+    \\  --twodsd-k N  --twodsd-stage stage1|stage2a|stage2b  --twodsd-d1 N  --twodsd-d2 N
+    \\  --twodsd-kv full|shared_last  --twodsd-window N
     \\  --knobs FILE.json, --knob name=value   engine knobs instead of / over the preset
     \\Sampling (default greedy: deterministic, the engine's GPU argmax):
     \\  --temperature T  --top-k K  --top-p P  --repetition-penalty R  --seed S
@@ -80,7 +84,8 @@ const chat_help =
     \\Options: --system TEXT, --max-tokens N (per reply, default 1024), --think, --no-think,
     \\--no-thinking-output, --json (one JSON line per turn: fed ids, reply ids, text, timings),
     \\--stats (after every reply), --context N, --prefill exact|mlx, --loop-passes,
-    \\--loopcd, --loopcd-omega, --loopcd-weak-pass, --knobs, --knob, and the
+    \\--loopcd, --loopcd-omega, --loopcd-weak-pass, --twodsd, --twodsd-k, --twodsd-stage,
+    \\--twodsd-d1, --twodsd-d2, --twodsd-kv, --twodsd-window, --knobs, --knob, and the
     \\sampling options of `nano run --help`.
     \\
 ;
@@ -182,6 +187,7 @@ const Options = struct {
     loopcd: frontend.LoopCdMode = .off,
     loopcd_omega: f32 = 1.0,
     loopcd_weak_pass: u32 = 1,
+    twodsd_cli: twodsd.Cli = .{},
     knobs_file: ?[]const u8 = null,
     knob_flags: std.ArrayList([]const u8) = .empty,
     sampling_model: bool = false,
@@ -199,6 +205,7 @@ const Options = struct {
 const generation_options = [_][]const u8{
     "--system",       "--max-tokens",   "--raw",          "--json",               "--stats",           "--think",      "--no-think", "--no-thinking-output",
     "--context",      "--prefill",      "--loop-passes",  "--loopcd",             "--loopcd-omega",    "--loopcd-weak-pass",
+    "--twodsd",       "--twodsd-k",     "--twodsd-stage", "--twodsd-d1",          "--twodsd-d2",       "--twodsd-kv", "--twodsd-window",
     "--knobs",        "--knob",         "--sampling",     "--temperature",
     "--top-k",        "--top-p",        "--repetition-penalty", "--seed",
 };
@@ -215,7 +222,7 @@ fn allowed(command: Command, name: []const u8) bool {
 }
 
 fn takesValue(name: []const u8) bool {
-    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
+    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--twodsd", "--twodsd-k", "--twodsd-stage", "--twodsd-d1", "--twodsd-d2", "--twodsd-kv", "--twodsd-window", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
         if (eql(v, name)) return true;
     return false;
 }
@@ -299,6 +306,20 @@ fn parseOptions(a: Allocator, command: Command, args: []const []const u8) !Optio
             const wp = try parseNumber(u32, name, value);
             if (wp == 0) return usageError("--loopcd-weak-pass must be positive", .{});
             o.loopcd_weak_pass = wp;
+        } else if (eql(name, "--twodsd")) {
+            o.twodsd_cli.enabled = twodsd.parseEnable(value) orelse return usageError("--twodsd is 0 or 1, not \"{s}\"", .{value});
+        } else if (eql(name, "--twodsd-k")) {
+            o.twodsd_cli.k = try parseNumber(u32, name, value);
+        } else if (eql(name, "--twodsd-stage")) {
+            o.twodsd_cli.stage = twodsd.parseStage(value) orelse return usageError("--twodsd-stage is stage1, stage2a, or stage2b, not \"{s}\"", .{value});
+        } else if (eql(name, "--twodsd-d1")) {
+            o.twodsd_cli.d1 = try parseNumber(u32, name, value);
+        } else if (eql(name, "--twodsd-d2")) {
+            o.twodsd_cli.d2 = try parseNumber(u32, name, value);
+        } else if (eql(name, "--twodsd-kv")) {
+            o.twodsd_cli.kv_policy = twodsd.parseKvPolicy(value) orelse return usageError("--twodsd-kv is full or shared_last, not \"{s}\"", .{value});
+        } else if (eql(name, "--twodsd-window")) {
+            o.twodsd_cli.kv_window = try parseNumber(u32, name, value);
         } else if (eql(name, "--knobs")) {
             o.knobs_file = value;
         } else if (eql(name, "--knob")) {
@@ -410,8 +431,14 @@ fn execute(ctx: *Context, command: Command, args: []const []const u8) !void {
     switch (command) {
         .tokenize => return cmdTokenize(ctx, dir, &o),
         .detokenize => return cmdDetokenize(ctx, dir, &o),
-        .run => return cmdRun(ctx, dir, &o),
-        .chat => return cmdChat(ctx, dir, &o),
+        .run => {
+            try applyTwoDsd(ctx, dir, &o);
+            return cmdRun(ctx, dir, &o);
+        },
+        .chat => {
+            try applyTwoDsd(ctx, dir, &o);
+            return cmdChat(ctx, dir, &o);
+        },
     }
 }
 
@@ -772,6 +799,14 @@ fn samplingFor(ctx: *Context, dir: []const u8, o: *const Options) !sample.Params
     return p;
 }
 
+fn applyTwoDsd(ctx: *Context, dir: []const u8, o: *const Options) !void {
+    if (!o.twodsd_cli.enabled and !o.twodsd_cli.anyTuning()) return;
+    const path = try std.fs.path.join(ctx.a, &.{ dir, "config.json" });
+    const config = loader.readFile(ctx.a, path) catch return fail("cannot read {s}", .{path});
+    const model_type = exec.modelType(ctx.a, config) catch return fail("{s} has no model_type", .{path});
+    o.twodsd_cli.apply(model_type) catch |err| return fail("2DSD: {s}", .{@errorName(err)});
+}
+
 fn loadEngine(ctx: *Context, dir: []const u8, o: *const Options) !*loader.Loaded {
     const knobs = try knobsFor(ctx, o);
     if (o.context == 0) return usageError("--context must be positive", .{});
@@ -1069,6 +1104,18 @@ test "options: model-free parsing, values, unknown options" {
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd", "invalid" }));
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd-omega", "-0.5" }));
     try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--loopcd-weak-pass", "0" }));
+    const off = try parseOptions(a, .run, &.{"hello"});
+    try std.testing.expect(!off.twodsd_cli.enabled);
+    try std.testing.expectEqual(@as(u32, 1), off.twodsd_cli.k);
+    const td = try parseOptions(a, .run, &.{ "hello", "--twodsd", "1", "--twodsd-k", "4", "--twodsd-stage", "stage1", "--twodsd-kv", "shared_last", "--twodsd-window", "64" });
+    try std.testing.expect(td.twodsd_cli.enabled);
+    try std.testing.expectEqual(@as(u32, 4), td.twodsd_cli.k);
+    try std.testing.expectEqual(twodsd.Stage.stage1, td.twodsd_cli.stage);
+    try std.testing.expectEqual(twodsd.KvPolicy.shared_last, td.twodsd_cli.kv_policy);
+    try std.testing.expectEqual(@as(u32, 64), td.twodsd_cli.kv_window);
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--twodsd", "2" }));
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "--twodsd-stage", "nope" }));
+    try std.testing.expectError(error.Usage, parseOptions(a, .tokenize, &.{ "--twodsd", "1" }));
 }
 
 test "the embedded presets are valid knob sets" {

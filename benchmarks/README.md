@@ -1,5 +1,7 @@
 # Benchmark evidence
 
+CPU-only 2DSD vs plain AR on the tiny looped model (no Metal): [`twodsd.md`](twodsd.md).
+
 [`local-flint-int4.json`](local-flint-int4.json) records a fresh build and rerun from this standalone repository folder. It contains numerical results and methodology, without model weights, raw local logs, or machine paths.
 
 ## Standalone rerun

@@ -11,6 +11,7 @@ python3 tools/check_resident_proofs.py             # build proofs + exact drift 
 PYTHONDONTWRITEBYTECODE=1 python3 proofs/test_verifier.py
 zig test --dep plan -Mroot=proofs/check_bindings.zig -Mplan=src/resident_plan.zig
 (cd proofs && lake env lean Audit.lean)            # inspect proof axiom dependencies
+(cd proofs && lake env lean TwoDsd.lean)           # 2DSD window / KV / rejection contracts
 ```
 
 The verifier invokes `lake build` in this directory, executes the built Lean

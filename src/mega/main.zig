@@ -27,6 +27,9 @@ const usage =
     \\        --sliding-visible N, --embed-round none|bf16,
     \\        --loop-passes 1..N, --loopcd off|hidden|logits|logits-adaptive,
     \\        --loopcd-omega W (default 1.0), --loopcd-weak-pass N (default 1).
+    \\        --twodsd 0|1 (opt-in 2DSD; 1 fails closed until overlapping looped decode is wired),
+    \\        --twodsd-k 1..16, --twodsd-stage stage1|stage2a|stage2b, --twodsd-d1 N, --twodsd-d2 N,
+    \\        --twodsd-kv full|shared_last, --twodsd-window N.
     \\Token files are a JSON array or {"tokens":[...]}. eval feeds T tokens per
     \\forward (default 1) and writes raw little-endian float32: logits
     \\[positions, vocab] and residual streams [traces, tokens, width].
@@ -112,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
     var attention_out: ?[]const u8 = null;
     var max_tokens: u32 = 32;
     var bench_input: bench.Input = .{};
+    var twodsd_cli: @import("../twodsd.zig").Cli = .{};
     // --knob flags apply after --knobs FILE whatever their order on the line.
     var knob_flags: std.ArrayList([]const u8) = .empty;
     while (args.next()) |flag| {
@@ -178,6 +182,20 @@ pub fn main(init: std.process.Init) !void {
             bench_input.decode_detail = std.mem.eql(u8, value, "1"); // decode climb 2
         } else if (std.mem.eql(u8, flag, "--repeats")) {
             bench_input.repeats = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd")) {
+            twodsd_cli.enabled = @import("../twodsd.zig").parseEnable(value) orelse return error.InvalidTwoDsdFlag;
+        } else if (std.mem.eql(u8, flag, "--twodsd-k")) {
+            twodsd_cli.k = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-stage")) {
+            twodsd_cli.stage = @import("../twodsd.zig").parseStage(value) orelse return error.InvalidTwoDsdStage;
+        } else if (std.mem.eql(u8, flag, "--twodsd-d1")) {
+            twodsd_cli.d1 = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-d2")) {
+            twodsd_cli.d2 = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--twodsd-kv")) {
+            twodsd_cli.kv_policy = @import("../twodsd.zig").parseKvPolicy(value) orelse return error.InvalidTwoDsdKvPolicy;
+        } else if (std.mem.eql(u8, flag, "--twodsd-window")) {
+            twodsd_cli.kv_window = try std.fmt.parseInt(u32, value, 10);
         } else {
             std.debug.print("Unknown flag {s}\n", .{flag});
             return error.UnknownFlag;
@@ -190,6 +208,12 @@ pub fn main(init: std.process.Init) !void {
     try common.knobs.validate();
 
     if (std.mem.eql(u8, command, "inspect")) return inspect(gpa, a, directory, common);
+    if ((twodsd_cli.enabled or twodsd_cli.anyTuning()) and std.mem.eql(u8, command, "eval"))
+        return error.TwoDsdRequiresGeneration;
+    if (twodsd_cli.enabled or twodsd_cli.anyTuning()) {
+        const config_bytes = try loader.readFile(a, try std.fs.path.join(a, &.{ directory, "config.json" }));
+        try twodsd_cli.apply(try exec.modelType(a, config_bytes));
+    }
     const loaded = try loader.load(gpa, a, directory, common.knobs, common.context, common.options);
     defer {
         loaded.deinit();
@@ -384,6 +408,7 @@ fn evaluate(engine: *exec.Engine, a: std.mem.Allocator, prompt: []const u32, pos
 }
 
 test {
+    _ = @import("../twodsd.zig");
     _ = @import("ir.zig");
     _ = @import("lfm3.zig");
     _ = @import("inkling2_loop.zig");

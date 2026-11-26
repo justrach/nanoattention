@@ -11,11 +11,33 @@ fn addMetalSdk(b: *std.Build, module: *std.Build.Module, sdk: ?[]const u8) void 
     module.linkFramework("Metal", .{});
 }
 
+fn addTwoDsdCpu(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const twodsd_mod = b.createModule(.{
+        .root_source_file = b.path("src/twodsd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const twodsd_tests = b.addTest(.{ .name = "twodsd", .root_module = twodsd_mod });
+    const run_twodsd = b.addRunArtifact(twodsd_tests);
+    b.step("test-twodsd", "Run CPU 2DSD scheduler, losslessness and KV accounting tests").dependOn(&run_twodsd.step);
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/twodsd_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const bench = b.addExecutable(.{ .name = "nano-twodsd-bench", .root_module = bench_mod });
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    b.step("twodsd-bench", "Benchmark 2DSD vs plain AR on the tiny looped CPU model").dependOn(&run_bench.step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    addTwoDsdCpu(b, target, optimize);
     if (target.result.os.tag != .macos or target.result.cpu.arch != .aarch64)
-        @panic("Flint Metal currently requires Apple Silicon macOS");
+        return; // Metal artifacts need Apple Silicon; CPU 2DSD steps remain.
     const sdk: ?[]const u8 = if (b.option([]const u8, "sdk", "macOS SDK path for non-native macOS target builds")) |s|
         s
     else if (!target.query.isNative())
