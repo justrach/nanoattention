@@ -4246,3 +4246,326 @@ test "grouped MoE and multi-row striped attention match T=1 kernels bit-for-bit"
         }
     }
 }
+
+test "Gemma 4: gelu_tanh activation and row_transform scale / weight_scale" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+
+    const inputs = [_]f32{ -100.0, -10.0, -3.5, -1.0, -0.25, 0.0, 0.25, 1.0, 3.5, 10.0, 100.0 };
+    const n: u32 = inputs.len;
+    const buf = try ctx.alloc(n * 4);
+    defer buf.deinit();
+    const f = buf.floats();
+    @memcpy(f[0..n], &inputs);
+
+    var pa: gpu.Params = .{ .rows = 1, .x = 0, .xs = n, .z = n, .zs = n, .n = n, .act_a = 4 };
+    try gpu.dispatch(ctx, "mk_activate", &.{buf}, &pa, n, 32);
+
+    @memcpy(f[2 * n .. 3 * n], &[_]f32{ 1.0, 2.0, -0.5, 0.25, 4.0, -2.0, 0.5, 1.5, -1.0, 0.1, 0.25 });
+    var pb: gpu.Params = .{ .rows = 1, .x = 0, .xs = n, .y = 2 * n, .ys = n, .z = 3 * n, .zs = n, .n = n, .every = 1, .kind = 1, .act_a = 4 };
+    try gpu.dispatch(ctx, "mk_binary", &.{buf}, &pb, n, 32);
+    try ctx.finish();
+
+    const k = @sqrt(2.0 / std.math.pi);
+    for (inputs, 0..) |x, i| {
+        const xf: f64 = x;
+        const exp_g = 0.5 * xf * (1.0 + std.math.tanh(k * (xf + 0.044715 * xf * xf * xf)));
+        try testing.expect(std.math.isFinite(f[n + i]));
+        try testing.expect(std.math.isFinite(f[3 * n + i]));
+        try close(exp_g, f[n + i], 1e-5);
+        try close(exp_g * @as(f64, f[2 * n + i]), f[3 * n + i], 1e-5);
+    }
+
+    // row_transform: constant scale, f32 scalar at unaligned offset 1, bf16 scalar at odd offset 3.
+    const rows: u32 = 3;
+    const width: u32 = 8;
+    const rbuf = try ctx.alloc(rows * width * 4);
+    defer rbuf.deinit();
+    const rf = rbuf.floats();
+    var r = rng(701);
+    for (rf[0 .. rows * width]) |*v| v.* = r.random().floatNorm(f32);
+
+    const wbuf = try ctx.alloc(16);
+    defer wbuf.deinit();
+    const wb = std.mem.sliceAsBytes(wbuf.floats());
+    @memset(wb, 0);
+    const f32_scalar: f32 = 0.375;
+    @memcpy(wb[1..5], std.mem.asBytes(&f32_scalar));
+    const bf16_scalar_bits: u16 = bf16(-1.25);
+    @memcpy(wb[7..9], std.mem.asBytes(&bf16_scalar_bits));
+
+    var ps: gpu.Params = .{ .rows = rows, .x = 0, .xs = width, .y = rows * width, .ys = width, .n = width, .kind = 3, .scale = 61.9677335 };
+    try gpu.dispatch(ctx, "mk_row_transform", &.{ rbuf, wbuf }, &ps, rows * width, 64);
+    var pwf: gpu.Params = .{ .rows = rows, .x = 0, .xs = width, .y = 2 * rows * width, .ys = width, .n = width, .kind = 4, .w = 1, .dtype = 0 };
+    try gpu.dispatch(ctx, "mk_row_transform", &.{ rbuf, wbuf }, &pwf, rows * width, 64);
+    var pwb: gpu.Params = .{ .rows = rows, .x = 0, .xs = width, .y = 3 * rows * width, .ys = width, .n = width, .kind = 4, .w = 7, .dtype = 2 };
+    try gpu.dispatch(ctx, "mk_row_transform", &.{ rbuf, wbuf }, &pwb, rows * width, 64);
+    try ctx.finish();
+
+    for (0..rows * width) |i| {
+        const xv: f64 = rf[i];
+        try close(xv * 61.9677335, rf[rows * width + i], 1e-6);
+        try close(xv * @as(f64, f32_scalar), rf[2 * rows * width + i], 1e-6);
+        try close(xv * @as(f64, fromBf16(bf16_scalar_bits)), rf[3 * rows * width + i], 1e-6);
+    }
+}
+
+test "Gemma 4: mk_attention_d512 and mk_dec_scores_e16_sub{1,2,4} match CPU reference and each other" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(702);
+
+    const Case = struct { heads: u32, kv_heads: u32, dim: u32, window: u32, positions: u32 };
+    for ([_]Case{
+        .{ .heads = 16, .kv_heads = 1, .dim = 512, .window = 0, .positions = 18 },
+        .{ .heads = 6, .kv_heads = 1, .dim = 512, .window = 7, .positions = 14 },
+        .{ .heads = 3, .kv_heads = 1, .dim = 300, .window = 0, .positions = 11 },
+    }) |tc| {
+        const cap: u32 = if (tc.window == 0) tc.positions else tc.window + 3;
+        const span: u32 = if (tc.window == 0) cap else tc.window;
+        const K = try ctx.alloc(cap * tc.kv_heads * tc.dim);
+        defer K.deinit();
+        const V = try ctx.alloc(cap * tc.kv_heads * tc.dim);
+        defer V.deinit();
+        const S = try ctx.alloc(tc.heads * span);
+        defer S.deinit();
+        const qw = tc.heads * tc.dim;
+        const buf = try ctx.alloc(3 * qw);
+        defer buf.deinit();
+        const f = buf.floats();
+
+        const cpu_k = try a.alloc(f32, K.floats().len);
+        const cpu_v = try a.alloc(f32, V.floats().len);
+        const scores_cpu = try a.alloc(f64, tc.positions);
+
+        for (0..tc.positions) |pos_u| {
+            const pos: u32 = @intCast(pos_u);
+            const slot = pos % cap;
+            for (0..tc.kv_heads * tc.dim) |j| {
+                const kv_v = r.random().floatNorm(f32) * 0.5;
+                const vv_v = r.random().floatNorm(f32) * 0.5;
+                K.floats()[slot * tc.kv_heads * tc.dim + j] = kv_v;
+                V.floats()[slot * tc.kv_heads * tc.dim + j] = vv_v;
+                cpu_k[slot * tc.kv_heads * tc.dim + j] = kv_v;
+                cpu_v[slot * tc.kv_heads * tc.dim + j] = vv_v;
+            }
+            for (f[0..qw]) |*v| v.* = r.random().floatNorm(f32) * 0.5;
+
+            var p: gpu.Params = .{
+                .rows = 1,
+                .pos = pos,
+                .x = 0,
+                .xs = qw,
+                .y = qw,
+                .ys = qw,
+                .heads = tc.heads,
+                .kv_heads = tc.kv_heads,
+                .dim = tc.dim,
+                .window = tc.window,
+                .capacity = cap,
+                .scale = 1.0,
+                .every = span,
+            };
+            try gpu.dispatch(ctx, "mk_attention_d512", &.{ buf, K, V }, &p, tc.heads * 256, 256);
+
+            const start: u32 = if (tc.window != 0 and pos + 1 > tc.window) pos + 1 - tc.window else 0;
+            const chunks = (pos - start + 1 + 7) / 8;
+            p.m = chunks;
+            const E = (tc.dim + 31) / 32;
+            if (E == 16) {
+                const G = tc.heads / tc.kv_heads;
+                const g_sub: u32 = if (G % 4 == 0) 4 else if (G % 2 == 0) 2 else 1;
+                const n_sub = G / g_sub;
+                const kname: [:0]const u8 = switch (g_sub) {
+                    4 => "mk_dec_scores_e16_sub4",
+                    2 => "mk_dec_scores_e16_sub2",
+                    else => "mk_dec_scores_e16_sub1",
+                };
+                try gpu.dispatch(ctx, kname, &.{ buf, K, S }, &p, @as(usize, tc.kv_heads) * n_sub * chunks * 32, 256);
+                p.y = 2 * qw;
+                try gpu.dispatch(ctx, "mk_dec_chain_block", &.{ buf, V, S }, &p, @as(usize, tc.heads) * E * 256, 256);
+            }
+            try ctx.finish();
+
+            if (E == 16) {
+                const u = buf.structs(u32);
+                try testing.expectEqualSlices(u32, u[qw .. 2 * qw], u[2 * qw .. 3 * qw]);
+            }
+
+            if (pos + 1 == tc.positions) {
+                const G = tc.heads / tc.kv_heads;
+                for (0..tc.heads) |h| {
+                    const kvh = h / G;
+                    var mscore: f64 = -std.math.inf(f64);
+                    for (start..pos + 1) |t| {
+                        const s = t % cap;
+                        var dot: f64 = 0;
+                        for (0..tc.dim) |d| dot += @as(f64, f[h * tc.dim + d]) * cpu_k[s * tc.kv_heads * tc.dim + kvh * tc.dim + d];
+                        scores_cpu[t - start] = dot;
+                        mscore = @max(mscore, dot);
+                    }
+                    var denom: f64 = 0;
+                    for (start..pos + 1) |t| denom += @exp(scores_cpu[t - start] - mscore);
+                    for (0..tc.dim) |d| {
+                        var acc: f64 = 0;
+                        for (start..pos + 1) |t| {
+                            const w = @exp(scores_cpu[t - start] - mscore) / denom;
+                            acc += w * @as(f64, cpu_v[(t % cap) * tc.kv_heads * tc.dim + kvh * tc.dim + d]);
+                        }
+                        try close(acc, f[qw + h * tc.dim + d], 1e-4);
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "Gemma 4: mk_mlx2_attention_d{256,512} match reference attention across sliding & causal prefill" {
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(703);
+
+    const Case = struct { kernel: [:0]const u8, ref_kernel: [:0]const u8, heads: u32, kv_heads: u32, dim: u32, window: u32 };
+    for ([_]Case{
+        .{ .kernel = "mk_mlx2_attention_d256", .ref_kernel = "mk_attention", .heads = 16, .kv_heads = 8, .dim = 256, .window = 12 },
+        .{ .kernel = "mk_mlx2_attention_d256", .ref_kernel = "mk_attention", .heads = 16, .kv_heads = 8, .dim = 256, .window = 0 },
+        .{ .kernel = "mk_mlx2_attention_d512", .ref_kernel = "mk_attention_d512", .heads = 16, .kv_heads = 1, .dim = 512, .window = 0 },
+    }) |tc| {
+        const pos0: u32 = 6;
+        const rows: u32 = 40;
+        const total = pos0 + rows;
+        const cap: u32 = if (tc.window == 0) total else tc.window + rows;
+        const kvw = tc.kv_heads * tc.dim;
+        const qw = tc.heads * tc.dim;
+        const K = try ctx.alloc(cap * kvw);
+        defer K.deinit();
+        const V = try ctx.alloc(cap * kvw);
+        defer V.deinit();
+        for (0..total) |t| {
+            const slot = t % cap;
+            for (0..kvw) |d| {
+                K.floats()[slot * kvw + d] = r.random().floatNorm(f32) * 0.35;
+                V.floats()[slot * kvw + d] = r.random().floatNorm(f32) * 0.35;
+            }
+        }
+        const arena = try ctx.alloc(rows * qw * 3);
+        defer arena.deinit();
+        const f = arena.floats();
+        for (f[0 .. rows * qw]) |*v| v.* = r.random().floatNorm(f32) * 0.35;
+
+        const pref: gpu.Params = .{
+            .rows = rows,
+            .pos = pos0,
+            .x = 0,
+            .xs = qw,
+            .y = rows * qw,
+            .ys = qw,
+            .heads = tc.heads,
+            .kv_heads = tc.kv_heads,
+            .dim = tc.dim,
+            .window = tc.window,
+            .capacity = cap,
+            .scale = 1.0,
+        };
+        try gpu.dispatch(ctx, tc.ref_kernel, &.{ arena, K, V }, &pref, @as(usize, rows) * tc.heads * 256, 256);
+
+        var pwide = pref;
+        pwide.y = 2 * rows * qw;
+        const nd: usize = if (tc.dim == 512) 2 else 1;
+        const tgs = @as(usize, (rows + 31) / 32) * tc.heads * nd;
+        try gpu.dispatch(ctx, tc.kernel, &.{ arena, K, V }, &pwide, tgs * 128, 128);
+        try ctx.finish();
+
+        var max_abs: f32 = 0;
+        for (0..rows * qw) |i| {
+            const diff = @abs(f[rows * qw + i] - f[2 * rows * qw + i]);
+            if (diff > max_abs) max_abs = diff;
+        }
+        try testing.expect(max_abs < 1e-4);
+    }
+}
+
+test "Gemma 4: static-K Q4 linear, multi, and gelu_tanh GLU kernels equal tiled reference bit for bit" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ctx = try gpu.open();
+    defer ctx.deinit();
+    var r = rng(704);
+
+    for ([_]struct { k: usize, name: [:0]const u8 }{
+        .{ .k = 3840, .name = "mk_linear_q4_static_3840" },
+        .{ .k = 4096, .name = "mk_linear_q4_static_4096" },
+        .{ .k = 15360, .name = "mk_linear_q4_static_15360" },
+    }) |tc| {
+        const m: usize = 8;
+        const q = try quantize(ctx, a, &r, m, tc.k, 64);
+        defer {
+            q.w.deinit();
+            q.s.deinit();
+            q.b.deinit();
+        }
+        const buf = try ctx.alloc(tc.k + 2 * m);
+        defer buf.deinit();
+        const f = buf.floats();
+        for (f[0..tc.k]) |*v| v.* = r.random().floatNorm(f32);
+        var p: gpu.Params = .{ .rows = 1, .x = 0, .xs = @intCast(tc.k), .y = @intCast(tc.k), .ys = @intCast(m), .n = @intCast(tc.k), .m = @intCast(m), .bits = 4, .group = 64, .sdtype = 2, .bdtype = 2 };
+        try gpu.dispatch(ctx, "mk_linear_q4_r2_t1", &.{ q.w, q.s, q.b, buf }, &p, ((m + 1) / 2) * 32, 128);
+        p.y = @intCast(tc.k + m);
+        try gpu.dispatch(ctx, tc.name, &.{ q.w, q.s, q.b, buf }, &p, ((m + 1) / 2) * 32, 128);
+        try ctx.finish();
+        const u = buf.structs(u32);
+        try testing.expectEqualSlices(u32, u[tc.k .. tc.k + m], u[tc.k + m .. tc.k + 2 * m]);
+    }
+
+    // Fused multi & gelu_tanh GLU static_3840.
+    const m: usize = 8;
+    const k: usize = 3840;
+    const qs = [2]Quant{ try quantize(ctx, a, &r, m, k, 64), try quantize(ctx, a, &r, m, k, 64) };
+    defer for (qs) |q| {
+        q.w.deinit();
+        q.s.deinit();
+        q.b.deinit();
+    };
+    const wbytes = m * k / 2;
+    const sbytes = (m * k / 64) * 2;
+    const stride = wbytes + 2 * sbytes;
+    const packed_buf = try ctx.alloc((2 * stride + 64) / 4);
+    defer packed_buf.deinit();
+    const bytes = std.mem.sliceAsBytes(packed_buf.floats());
+    for (qs, 0..) |q, idx| {
+        const off = 4 + idx * stride;
+        @memcpy(bytes[off..][0..wbytes], std.mem.sliceAsBytes(q.w.floats())[0..wbytes]);
+        @memcpy(bytes[off + wbytes ..][0..sbytes], std.mem.sliceAsBytes(q.s.floats())[0..sbytes]);
+        @memcpy(bytes[off + wbytes + sbytes ..][0..sbytes], std.mem.sliceAsBytes(q.b.floats())[0..sbytes]);
+    }
+    const buf = try ctx.alloc(k + 6 * m);
+    defer buf.deinit();
+    const f = buf.floats();
+    for (f[0..k]) |*v| v.* = r.random().floatNorm(f32);
+
+    var xm: gpu.ParamsX = .{ .p = .{ .rows = 1, .xs = k, .n = k, .group = 64 }, .count = 2 };
+    xm.mat[0] = .{ .w = 4, .s = 4 + wbytes, .b = 4 + wbytes + sbytes, .m = m, .y = k, .ys = m, .sdtype = 2, .bdtype = 2 };
+    xm.mat[1] = .{ .w = 4 + stride, .s = 4 + stride + wbytes, .b = 4 + stride + wbytes + sbytes, .m = m, .y = k + m, .ys = m, .sdtype = 2, .bdtype = 2 };
+    try gpu.dispatch(ctx, "mk_multi_q4_r2_t1", &.{ packed_buf, buf }, &xm, 2 * ((m + 1) / 2) * 32, 128);
+    xm.mat[0].y = k + 2 * m;
+    xm.mat[1].y = k + 3 * m;
+    try gpu.dispatch(ctx, "mk_multi_q4_static_3840", &.{ packed_buf, buf }, &xm, 2 * ((m + 1) / 2) * 32, 128);
+
+    var xg: gpu.ParamsX = .{ .p = .{ .rows = 1, .xs = k, .y = k + 4 * m, .ys = m, .n = k, .group = 64 }, .count = 2, .act_a = 4, .act_b = 0, .kind = 1 };
+    xg.mat[0] = .{ .w = 4, .s = 4 + wbytes, .b = 4 + wbytes + sbytes, .m = m, .sdtype = 2, .bdtype = 2 };
+    xg.mat[1] = .{ .w = 4 + stride, .s = 4 + stride + wbytes, .b = 4 + stride + wbytes + sbytes, .m = m, .sdtype = 2, .bdtype = 2 };
+    try gpu.dispatch(ctx, "mk_glu_q4_r2_t1", &.{ packed_buf, buf }, &xg, ((m + 1) / 2) * 32, 128);
+    xg.p.y = k + 5 * m;
+    try gpu.dispatch(ctx, "mk_glu_q4_static_3840", &.{ packed_buf, buf }, &xg, ((m + 1) / 2) * 32, 128);
+    try ctx.finish();
+
+    const u = buf.structs(u32);
+    try testing.expectEqualSlices(u32, u[k .. k + 2 * m], u[k + 2 * m .. k + 4 * m]);
+    try testing.expectEqualSlices(u32, u[k + 4 * m .. k + 5 * m], u[k + 5 * m .. k + 6 * m]);
+}

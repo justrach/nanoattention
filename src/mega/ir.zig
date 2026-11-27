@@ -84,7 +84,7 @@ pub const View = struct {
     width: u32,
 };
 
-pub const Act = enum(u8) { identity = 0, silu = 1, sigmoid = 2, tanh = 3 };
+pub const Act = enum(u8) { identity = 0, silu = 1, sigmoid = 2, tanh = 3, gelu_tanh = 4 };
 pub const BinaryKind = enum(u8) { add = 0, mul = 1, sub = 2 };
 /// Optional output rounding, used where a reference materialises a narrower dtype.
 pub const Round = enum(u8) { none = 0, bf16 = 1 };
@@ -92,6 +92,8 @@ pub const RowTransform = union(enum) {
     copy,
     softcap: f32,
     log_position_scale: struct { floor: u32, alpha: f32 },
+    scale: f32,
+    weight_scale: WeightId,
 };
 
 pub const Op = union(enum) {
@@ -294,6 +296,11 @@ pub const Program = struct {
                     .copy => {},
                     .softcap => |cap| if (!std.math.isFinite(cap) or !(cap > 0)) return error.ShapeMismatch,
                     .log_position_scale => |p| if (p.floor == 0 or !std.math.isFinite(p.alpha) or p.alpha < 0) return error.ShapeMismatch,
+                    .scale => |s| if (!std.math.isFinite(s)) return error.InvalidScale,
+                    .weight_scale => |id| {
+                        const w = try self.weight(id);
+                        if (w.raw_dtype != null or w.shape.len != 1 or w.shape[0] != 1) return error.ShapeMismatch;
+                    },
                 }
             },
             .grouped_project => |p| {
@@ -397,7 +404,7 @@ pub const Program = struct {
                 try self.checkView(a.out, .scratch);
                 const k = try self.checkCache(a.keys);
                 const v = try self.checkCache(a.values);
-                if (a.kv_heads == 0 or a.heads % a.kv_heads != 0 or a.dim == 0 or a.dim > 256) return error.ShapeMismatch;
+                if (a.kv_heads == 0 or a.heads % a.kv_heads != 0 or a.dim == 0 or a.dim > 512) return error.ShapeMismatch;
                 if (a.q.width != a.heads * a.dim or a.out.width != a.q.width or k.width != a.kv_heads * a.dim or v.width != k.width or k.kind != v.kind) return error.ShapeMismatch;
                 if (k.kind == .ring and (a.window == 0 or k.horizon + 1 < a.window or v.horizon != k.horizon)) return error.RingTooShort;
                 if (a.q.state == a.out.state) return error.AttentionAliasing;

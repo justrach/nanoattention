@@ -15,6 +15,7 @@
   <a href="#quick-start">Quick start</a> ·
   <a href="#what-it-does">What it does</a> ·
   <a href="#inkling-2-mini-nano">Inkling 2 Mini</a> ·
+  <a href="#gemma-4-12b-nano">Gemma 4 12B</a> ·
   <a href="#use-with-nanoharness--codegraff">NanoHarness &amp; CodeGraff</a> ·
   <a href="#performance">Performance</a> ·
   <a href="#correctness-and-proofs">Proofs</a> ·
@@ -23,9 +24,10 @@
 </p>
 
 Run [Thinking Machines Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini),
-[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint), and Liquid AI
-(`LFM3-1.7B` / `LFM2.5-1.2B`) locally on Apple Silicon with a small, inspectable
-Zig + Metal stack. `nano` runs Inkling 2 Mini and Liquid AI models through a
+[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint), Liquid AI
+(`LFM3-1.7B` / `LFM2.5-1.2B`), and Google **Gemma 4 12B** (`gemma4_unified` /
+`gemma4`, text path) locally on Apple Silicon with a small, inspectable
+Zig + Metal stack. `nano` runs Inkling 2 Mini, Liquid AI, and Gemma 4 12B models through a
 model-agnostic megakernel; `flint` drives Recursive Flint. Zig maps the checkpoint,
 owns buffers and KV/ring state, and schedules execution; Metal kernels run attention,
 quantized projections, expert routing, and the vocabulary head on the GPU.
@@ -272,6 +274,35 @@ See [`src/mega/presets/inkling.json`](src/mega/presets/inkling.json), the MAP-El
 
 **Parity & limits:** `inkling.json` is bit-identical (`max_abs = 0.0`) to pre-Qwegn `megakernel-v1` across `cake_toks` (`feed=1, 8`), `real_512` (`feed=512`, `560/560` top-1, `32/32` greedy), and `long_real` (`feed=512`, `568/568` top-1, `32/32` greedy), matches `64/64` greedy tokens on `cake_toks` against baseline, and passes [`tools/nano_inkling_attention_check.py`](tools/nano_inkling_attention_check.py) (`24/24` top-1 agreement across six arm pairs). Note that `nano` runs the text path only: the vision tower and the checkpoint's bundled `mtp.safetensors` block-diffusion drafter are not yet wired.
 
+## Gemma 4 12B (`nano`)
+
+`nano` natively runs dense 4-bit MLX checkpoints of **Gemma 4 12B** (`gemma4_unified` / `gemma4`, text-only path ignoring vision/audio weights — e.g. `lmstudio-community/gemma-4-12B-it-MLX-4bit`, 4-bit affine group 64, 48 decoder layers alternating `5× sliding_attention` (`window=1024, head_dim=256, kv_heads=8`) + `1× full_attention` (`k_eq_v`, `global_head_dim=512, kv_heads=1`, `ProportionalRoPE`), `gelu_pytorch_tanh` GeGLU, `layer_scalar`, tied `embed_tokens`, `final_logit_softcapping=30.0`):
+
+```bash
+./zig-out/bin/nano inspect "$GEMMA4_CKPT"
+./zig-out/bin/nano bench "$GEMMA4_CKPT" --knobs src/mega/presets/gemma4.json \
+  --prompt-tokens 1024 --decode-tokens 64 --decode-mode greedy --context 4224
+./zig-out/bin/nano generate "$GEMMA4_CKPT" --knobs src/mega/presets/gemma4.json \
+  --tokens-file prompt.json --max-tokens 128 --context 4224
+```
+
+Head-to-head on an **Apple M3 Ultra (256 GiB)** against stock `mlx-lm` (`0.32.3.dev17` / `mlx 0.32.4`, `async_eval` with `wired_limit`), noting that `nano` runs **FP32 activations and FP32 KV caches** while stock `mlx-lm` defaults to **BF16** (`mlx_f32` matches `nano`'s FP32 precision):
+
+| Prompt length | Engine | Precision | Prefill (tok/s) | Decode (tok/s) | Peak RSS (MiB) |
+| ---: | --- | --- | ---: | ---: | ---: |
+| 64 | `nano` (`presets/gemma4.json`, greedy) | FP32 act / FP32 KV | **547.9** | 49.67 | **4,871** |
+| 64 | `mlx-lm` BF16 (`async_eval`) | BF16 act / BF16 KV | 493.4 | **72.30** | 6,500 |
+| 64 | `mlx-lm` FP32 (`async_eval`) | FP32 act / FP32 KV | 444.1 | 66.34 | 6,499 |
+| 1,024 | `nano` (`presets/gemma4.json`, greedy) | FP32 act / FP32 KV | 622.4 | 45.03 | **4,871** |
+| 1,024 | `mlx-lm` BF16 (`async_eval`) | BF16 act / BF16 KV | **743.3** | **68.32** | 6,500 |
+| 1,024 | `mlx-lm` FP32 (`async_eval`) | FP32 act / FP32 KV | 542.1 | 56.23 | 6,499 |
+| 4,096 | `nano` (`presets/gemma4.json`, greedy) | FP32 act / FP32 KV | 647.1 | 43.48 | **4,871** |
+| 4,096 | `mlx-lm` BF16 (`async_eval`) | BF16 act / BF16 KV | **652.5** | **67.48** | 6,500 |
+| 4,096 | `mlx-lm` FP32 (`async_eval`) | FP32 act / FP32 KV | 509.8 | 56.20 | 6,499 |
+
+- In matched **FP32**, `nano` beats `mlx-lm` prefill by **1.15×–1.27×** across `L = 64..4096` (with wide-head MMA prefill kernels `mk_mlx2_attention_d{256,512}` giving **3.07×** over fallback attention at `L=4096`) and uses **~25% less host RSS** (`4.87 GiB` vs `6.50 GiB`, and `2.84 GiB` with `presets/exact.json`; MLX Metal peak `8.28 GiB` BF16 / `10.87 GiB` FP32).
+- **Parity & checks**: Full 12B parity vs FP32 `mlx-lm` gives `max_abs = 3.34e-04` (`24/24` top-1, `32/32` greedy match on chat prompt) and `max_abs = 1.48e-03` (`5/5` top-1 across `sliding_window=1024` at `L=1280`), with `cos_min = 1.00000000` and exact `prediction_checksum` agreement across `L=64, 1024, 4096`. See [benchmarks/gemma4-12b-mlx-comparison.md](benchmarks/gemma4-12b-mlx-comparison.md), [tools/gemma4_verify.py](tools/gemma4_verify.py), and [tools/gemma4_benchmark.py](tools/gemma4_benchmark.py).
+
 ## Development
 
 Run from the repository root. NumPy is needed for synthetic numerical checks;
@@ -315,7 +346,7 @@ does not remove physical-memory or Metal-buffer limits.
 - **`mlx-lm` Inkling 2 support** ([`ml-explore/mlx-lm#2086`](https://github.com/ml-explore/mlx-lm/pull/2086) / [`jundot/mlx-lm`](https://github.com/jundot/mlx-lm)) — authored by **Jun Kim** ([`@jundot`](https://github.com/jundot)), with contributions from **Pedro Cuenca** ([`@pcuenca`](https://github.com/pcuenca)) and **Lucas Gelfond** ([`@lucasgelfond`](https://github.com/lucasgelfond)) (MIT, Apple Inc.): batched relative attention tile kernel adapted in [`src/mega/inkling_tiles.metal`](src/mega/inkling_tiles.metal) and the `mlx-lm` reference baseline.
 - **MLX** ([`ml-explore/mlx`](https://github.com/ml-explore/mlx)) — Apple Inc. and the MLX contributors (MIT): INT4 `qmv_fast` / `qdot`, vector SDPA, Steel GEMM, and Steel attention kernel designs.
 - **Recursive `rec`** ([`recursive-oss/rec`](https://github.com/recursive-oss/rec)) — Recursive (**Chris Cummins** [`@ChrisCummins`](https://github.com/ChrisCummins), **Audrey Tang** [`@audreyt`](https://github.com/audreyt), **Oliver Yu** [`@tc3oliver`](https://github.com/tc3oliver); Apache-2.0): resident decode and atomic arrival/phase barrier design adapted in [`src/resident.metal`](src/resident.metal).
-- **Model & architecture authors** — **Thinking Machines Lab** ([Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), **Recursive** ([Flint](https://huggingface.co/RecursiveSI/flint), Apache-2.0), and **Liquid AI** (`LFM3-1.7B` / `LFM2.5-1.2B-Instruct`).
+- **Model & architecture authors** — **Thinking Machines Lab** ([Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)), **Recursive** ([Flint](https://huggingface.co/RecursiveSI/flint), Apache-2.0), **Liquid AI** (`LFM3-1.7B` / `LFM2.5-1.2B-Instruct`), and **Google DeepMind** (Gemma 4 12B).
 
 ## License
 
@@ -324,7 +355,7 @@ Original code and contributions are **[MIT licensed](LICENSE)**. Adapted Recursi
 retain Apache-2.0 terms; adapted MLX and `mlx-lm` components retain MIT terms
 and notices. The top-level MIT license does not replace those upstream obligations.
 Model weights are not bundled and remain separately licensed; Recursive Flint,
-Thinking Machines Inkling 2 Mini, and Liquid AI checkpoints retain their
+Thinking Machines Inkling 2 Mini, Liquid AI, and Gemma 4 checkpoints retain their
 respective upstream licenses.
 
 See [third-party notices](THIRD_PARTY_NOTICES.md), [provenance](PROVENANCE.md), and

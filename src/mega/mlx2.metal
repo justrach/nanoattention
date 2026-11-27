@@ -372,6 +372,160 @@ inline void mk_mlx2_attention_tile(device float *arena, device const float *Kc, 
 }
 MK_MLX2_ATT(mk_mlx2_attention, false) MK_MLX2_ATT(mk_mlx2_attention_gated, true)
 
+// Wide-head MMA prefill attention for dim = 256 or 512: shares one 20 KiB K/V staging buffer
+// and streams Q from device memory so register usage fits without spilling.
+template <uint DIM, uint D_OUT>
+inline void mk_mlx2_attention_wide(device float *arena, device const float *Kc, device const float *Vc, constant MK &p,
+                                   uint tgid, uint simd, uint lane, uint lid, threadgroup float *KVs) {
+    constexpr uint ND = DIM / D_OUT;
+    constexpr uint LDK = 20;
+    constexpr uint LDV = D_OUT + 4;
+    uint slice = tgid % ND;
+    uint rem = tgid / ND;
+    uint NQ = (p.rows + 31) / 32;
+    uint q0 = (NQ - 1 - rem / p.heads) * 32, h = rem % p.heads;
+    uint kvh = h / (p.heads / p.kv_heads);
+    uint d_out_base = slice * D_OUT;
+    uint first = p.pos + p.row0;
+    uint kL = first + p.rows;
+    uint origin = (p.window != 0 && first + 1 > p.window) ? first + 1 - p.window : 0;
+    uint qpos0 = first + q0;
+    uint qlast = first + min(q0 + 32, p.rows) - 1;
+    uint slot_words = p.kv_heads * DIM;
+    uint qid = lane / 4;
+    uint sm = (qid & 4) + (lane / 2) % 4, sn = (qid & 2) * 2 + (lane % 2) * 2;
+    uint tm = 8 * simd;
+    uint r = q0 + tm + sm;
+    uint row_pos = qpos0 + tm + sm;
+    bool live_q = r < p.rows;
+    device const float *qp = arena + p.x + (p.row0 + (live_q ? r : p.rows - 1)) * p.xs + h * DIM + sn;
+    uint kb_first = 0;
+    if (p.window != 0 && qpos0 + 1 > p.window) kb_first = (qpos0 + 1 - p.window - origin) / 16;
+    uint kb_end = min((kL - origin + 15) / 16, (qlast + 1 - origin + 15) / 16);
+    const float scale = p.scale * M_LOG2E_F;
+    const float neg = -FLT_MAX;
+    float max_score = neg, sum_score = 0;
+    simdgroup_float8x8 O[D_OUT / 8];
+    MK_UNROLL
+    for (uint id = 0; id < D_OUT / 8; ++id) O[id] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint kb = kb_first; kb < kb_end; ++kb) {
+        simdgroup_float8x8 S[2];
+        S[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        S[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        uint j = lid / 8, d0 = (lid % 8) * 32, key = origin + kb * 16 + j;
+        for (uint dc = 0; dc < DIM; dc += 256) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (key < kL) {
+                ulong kslot = ulong(key < p.capacity ? key : key % p.capacity) * slot_words + kvh * DIM + dc + d0;
+                device const float4 *ks = (device const float4 *)(Kc + kslot);
+                MK_UNROLL
+                for (uint e = 0; e < 8; ++e) {
+                    float4 v = ks[e];
+                    KVs[(d0 + 4 * e) * LDK + j] = v.x;
+                    KVs[(d0 + 4 * e + 1) * LDK + j] = v.y;
+                    KVs[(d0 + 4 * e + 2) * LDK + j] = v.z;
+                    KVs[(d0 + 4 * e + 3) * LDK + j] = v.w;
+                }
+            } else {
+                for (uint e = 0; e < 32; ++e) KVs[(d0 + e) * LDK + j] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            MK_UNROLL
+            for (uint dd = 0; dd < 32; ++dd) {
+                simdgroup_float8x8 Qf, Kf[2];
+                float2 qv = live_q ? *(device const float2 *)(qp + dc + 8 * dd) : float2(0.0f);
+                Qf.thread_elements()[0] = qv.x;
+                Qf.thread_elements()[1] = qv.y;
+                simdgroup_barrier(mem_flags::mem_none);
+                MK_UNROLL
+                for (uint jj = 0; jj < 2; ++jj) {
+                    threadgroup const float *k = KVs + (dd * 8 + sm) * LDK + jj * 8 + sn;
+                    Kf[jj].thread_elements()[0] = k[0];
+                    Kf[jj].thread_elements()[1] = k[1];
+                }
+                simdgroup_barrier(mem_flags::mem_none);
+                MK_UNROLL
+                for (uint jj = 0; jj < 2; ++jj) simdgroup_multiply_accumulate(S[jj], Qf, Kf[jj], S[jj]);
+            }
+        }
+        uint c0 = origin + kb * 16;
+        bool all_visible = c0 + 15 < kL && c0 + 15 <= qpos0 && (p.window == 0 || qlast < c0 + p.window);
+        MK_UNROLL
+        for (uint jj = 0; jj < 2; ++jj) for (uint kk = 0; kk < 2; ++kk) {
+            float s = S[jj].thread_elements()[kk] * scale;
+            uint col = c0 + jj * 8 + sn + kk;
+            bool visible = all_visible || (col < kL && col <= row_pos && (p.window == 0 || row_pos < col + p.window));
+            S[jj].thread_elements()[kk] = visible ? s : neg;
+        }
+        float new_max = max_score;
+        MK_UNROLL
+        for (uint jj = 0; jj < 2; ++jj) {
+            float thr = max(S[jj].thread_elements()[0], S[jj].thread_elements()[1]);
+            float qgr = max(thr, simd_shuffle_xor(thr, ushort(1)));
+            float sgr = max(qgr, simd_shuffle_xor(qgr, ushort(8)));
+            new_max = max(new_max, sgr);
+        }
+        MK_UNROLL
+        for (uint jj = 0; jj < 2; ++jj) for (uint kk = 0; kk < 2; ++kk)
+            S[jj].thread_elements()[kk] = fast::exp2(S[jj].thread_elements()[kk] - new_max);
+        float factor = fast::exp2(max_score - new_max);
+        max_score = new_max;
+        float sum_tmp = 0;
+        MK_UNROLL
+        for (uint jj = 0; jj < 2; ++jj) {
+            float thr = S[jj].thread_elements()[0] + S[jj].thread_elements()[1];
+            float qgr = thr + simd_shuffle_xor(thr, ushort(1));
+            float sgr = qgr + simd_shuffle_xor(qgr, ushort(8));
+            sum_tmp = sum_tmp + sgr;
+        }
+        sum_score = sum_score * factor + sum_tmp;
+        MK_UNROLL
+        for (uint id = 0; id < D_OUT / 8; ++id) {
+            O[id].thread_elements()[0] = O[id].thread_elements()[0] * factor;
+            O[id].thread_elements()[1] = O[id].thread_elements()[1] * factor;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            threadgroup float4 *vd = (threadgroup float4 *)(KVs + j * LDV + d0);
+            if (key < kL) {
+                ulong vslot = ulong(key < p.capacity ? key : key % p.capacity) * slot_words + kvh * DIM + d_out_base + d0;
+                device const float4 *vs = (device const float4 *)(Vc + vslot);
+                MK_UNROLL
+                for (uint e = 0; e < 8; ++e) vd[e] = vs[e];
+            } else {
+                for (uint e = 0; e < 8; ++e) vd[e] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        MK_UNROLL
+        for (uint id = 0; id < D_OUT / 8; ++id) for (uint ik = 0; ik < 2; ++ik) {
+            simdgroup_float8x8 Vf;
+            simdgroup_barrier(mem_flags::mem_none);
+            threadgroup const float *v = KVs + (ik * 8 + sm) * LDV + id * 8 + sn;
+            Vf.thread_elements()[0] = v[0];
+            Vf.thread_elements()[1] = v[1];
+            simdgroup_barrier(mem_flags::mem_none);
+            simdgroup_multiply_accumulate(O[id], S[ik], Vf, O[id]);
+        }
+    }
+    if (!live_q) return;
+    uint row = p.row0 + r;
+    device float *out = arena + p.y + row * p.ys + h * DIM + d_out_base;
+    MK_UNROLL
+    for (uint id = 0; id < D_OUT / 8; ++id) for (uint jj = 0; jj < 2; ++jj)
+        out[id * 8 + sn + jj] = O[id].thread_elements()[jj] / sum_score;
+}
+#define MK_MLX2_ATT_WIDE(NAME, DIM, D_OUT) \
+[[kernel, max_total_threads_per_threadgroup(128)]] void NAME(device float *arena [[buffer(0)]], device const float *K [[buffer(1)]], \
+        device const float *V [[buffer(2)]], constant MK &p [[buffer(8)]], uint tgid [[threadgroup_position_in_grid]], \
+        uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
+        uint lid [[thread_index_in_threadgroup]]) { \
+    threadgroup float KVs[5120]; \
+    mk_mlx2_attention_wide<DIM, D_OUT>(arena, K, V, p, tgid, simd, lane, lid, KVs); \
+}
+MK_MLX2_ATT_WIDE(mk_mlx2_attention_d256, 256, 256)
+MK_MLX2_ATT_WIDE(mk_mlx2_attention_d512, 512, 256)
+
 // ---- c2-prefill-mlx (knob conv_rows2): mk_gated_conv_rows without a modulo per tap ----
 // Same arithmetic as mk_gated_conv_rows (prefill.metal), operation for operation:
 // acc = 0; for k ascending: acc += w[c][k] * u(q = position - taps + 1 + k), u = 0 for

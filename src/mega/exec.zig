@@ -1816,8 +1816,11 @@ pub const Engine = struct {
                     const kernel = if (self.knobs.decode_q4_static and rows == 1 and R == 2 and TT == 1 and p.group == 64 and p.sdtype == 2 and p.bdtype == 2)
                         switch (p.n) {
                             2048 => "mk_linear_q4_static_2048",
+                            3840 => "mk_linear_q4_static_3840",
+                            4096 => "mk_linear_q4_static_4096",
                             7680 => "mk_linear_q4_static_7680",
                             8192 => "mk_linear_q4_static_8192",
+                            15360 => "mk_linear_q4_static_15360",
                             else => tileKernel("mk_linear_q4", R, TT),
                         }
                     else
@@ -1892,6 +1895,7 @@ pub const Engine = struct {
                 p.ys = y.stride;
                 p.n = t.out.width;
                 p.flags = @backingInt(t.round);
+                var wbuf = self.arena;
                 switch (t.transform) {
                     .copy => {},
                     .softcap => |cap| {
@@ -1903,8 +1907,20 @@ pub const Engine = struct {
                         p.m = s.floor;
                         p.scale = s.alpha;
                     },
+                    .scale => |s| {
+                        p.kind = 3;
+                        p.scale = s;
+                    },
+                    .weight_scale => |id| {
+                        const w = self.bound[id];
+                        if (w.quant != null or !w.tensor.dtype.isFloat()) return error.InvalidScale;
+                        p.kind = 4;
+                        p.w = w.tensor.offset;
+                        p.dtype = @backingInt(w.tensor.dtype);
+                        wbuf = w.buffer;
+                    },
                 }
-                try gpu.dispatch(self.ctx, "mk_row_transform", &.{self.arena}, &p, @as(usize, rows) * p.n, 256);
+                try gpu.dispatch(self.ctx, "mk_row_transform", &.{ self.arena, wbuf }, &p, @as(usize, rows) * p.n, 256);
             },
             .grouped_project => |g| {
                 const x = self.words(g.x);
@@ -2143,7 +2159,7 @@ pub const Engine = struct {
                 p.window = a.window;
                 p.scale = a.scale;
                 p.capacity = k.capacity(self.batch, self.context);
-                try gpu.dispatch(self.ctx, "mk_attention", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 256, 256);
+                try gpu.dispatch(self.ctx, if (a.dim > 256) "mk_attention_d512" else "mk_attention", &.{ self.arena, self.caches[a.keys].?, self.caches[a.values].? }, &p, @as(usize, rows) * a.heads * 256, 256);
             },
             .relative_attention => |a| {
                 const q = self.words(a.q);
@@ -2732,7 +2748,7 @@ fn mat(self: *const Engine, w: weights.Weight, out: ir.View) gpu.Mat {
 
 fn staticFusedQ4(self: *const Engine, x: *const gpu.ParamsX) bool {
     if (!self.knobs.decode_q4_static or self.knobs.decode_rows != 2 or self.knobs.decode_tokens != 1 or
-        x.p.rows != 1 or x.p.n != 2048 or x.p.group != 64) return false;
+        x.p.rows != 1 or (x.p.n != 2048 and x.p.n != 3840) or x.p.group != 64) return false;
     for (x.mat[0..x.count]) |m| if (m.sdtype != 2 or m.bdtype != 2) return false;
     return true;
 }
@@ -2801,7 +2817,10 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
                 x.mat[k] = mat(self, self.bound[l.w], l.out);
                 simds += ((@as(usize, l.out.width) + tile.r - 1) / tile.r) * tiles_t;
             }
-            const kernel = if (staticFusedQ4(self, &x)) "mk_multi_q4_static_2048" else tileKernel("mk_multi_q4", tile.r, tile.t);
+            const kernel = if (staticFusedQ4(self, &x))
+                (if (x.p.n == 3840) "mk_multi_q4_static_3840" else "mk_multi_q4_static_2048")
+            else
+                tileKernel("mk_multi_q4", tile.r, tile.t);
             try gpu.dispatch(self.ctx, kernel, &.{ self.bound[l0.w].buffer, self.arena }, &x, simds * 32, self.knobs.linear_group);
         },
         .glu => |i| {
@@ -2854,7 +2873,10 @@ fn encodeFused(self: *Engine, step: plan.Step, row0: u32, rows: u32) !void {
             }
             const tile = linearTile(self, rows);
             const simds = ((@as(usize, l0.out.width) + tile.r - 1) / tile.r) * ((@as(usize, rows) + tile.t - 1) / tile.t);
-            const kernel = if (staticFusedQ4(self, &x)) "mk_glu_q4_static_2048" else tileKernel("mk_glu_q4", tile.r, tile.t);
+            const kernel = if (staticFusedQ4(self, &x))
+                (if (x.p.n == 3840) "mk_glu_q4_static_3840" else "mk_glu_q4_static_2048")
+            else
+                tileKernel("mk_glu_q4", tile.r, tile.t);
             try gpu.dispatch(self.ctx, kernel, &.{ self.bound[l0.w].buffer, self.arena }, &x, simds * 32, self.knobs.linear_group);
         },
         .norms => |i| {
@@ -3530,10 +3552,12 @@ fn encodeRelativeStriped(self: *Engine, a: @FieldType(ir.Op, "relative_attention
 /// Returns false (caller encodes the reference kernel) when it does not apply.
 fn encodeDecodeAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
     if (self.knobs.decode_attention == 0 or rows != 1 or self.scores == null) return false;
-    if (a.dim == 0 or a.dim > 256 or a.heads % a.kv_heads != 0) return false;
+    if (a.dim == 0 or a.dim > 512 or a.heads % a.kv_heads != 0) return false;
     const E = (a.dim + 31) / 32;
     const G = a.heads / a.kv_heads;
-    if (!pow2upto8(E) or !pow2upto8(G)) return false;
+    if (E == 16) {
+        if (G == 0 or G > 16) return false;
+    } else if (!pow2upto8(E) or !pow2upto8(G)) return false;
     const k = self.program.states[a.keys];
     const capacity = k.capacity(self.batch, self.context);
     const position = self.position + row0;
@@ -3563,11 +3587,20 @@ fn encodeDecodeAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate:
     const scores = self.scores.?;
     const linear = self.knobs.decode_attention == 3 and a.window == 0 and position < capacity and
         k.kind == .sequence and self.program.states[a.values].kind == .sequence and G == 4 and (a.dim == 64 or a.dim == 128);
+    var scores_grid: usize = @as(usize, a.kv_heads) * chunks * 32;
     const scores_name = if (linear)
         (if (a.dim == 64) "mk_dec_scores_linear_e2_g4" else "mk_dec_scores_linear_e4_g4")
-    else
-        names[std.math.log2_int(u32, E)][std.math.log2_int(u32, G)];
-    try gpu.dispatch(self.ctx, scores_name, &.{ self.arena, self.caches[a.keys].?, scores }, &p, @as(usize, a.kv_heads) * chunks * 32, 256);
+    else if (E == 16) blk: {
+        const g_sub: u32 = if (G % 4 == 0) 4 else if (G % 2 == 0) 2 else 1;
+        const n_sub = G / g_sub;
+        scores_grid = @as(usize, a.kv_heads) * n_sub * chunks * 32;
+        break :blk switch (g_sub) {
+            4 => "mk_dec_scores_e16_sub4",
+            2 => "mk_dec_scores_e16_sub2",
+            else => "mk_dec_scores_e16_sub1",
+        };
+    } else names[std.math.log2_int(u32, E)][std.math.log2_int(u32, G)];
+    try gpu.dispatch(self.ctx, scores_name, &.{ self.arena, self.caches[a.keys].?, scores }, &p, scores_grid, 256);
     const o = if (gate) |b| self.words(b.out) else self.words(a.out);
     p.y = o.off;
     p.ys = o.stride;
@@ -4197,7 +4230,9 @@ pub fn mlxAttention(ctx: metal.Context, arena: metal.Buffer, keys: metal.Buffer,
 /// knobs.mlx_attention: MLX's attention for a multi-row forward, with the
 /// sigmoid-gate epilogue when `gate` is given; false when it does not apply.
 fn encodeMlxAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@FieldType(ir.Op, "binary"), row0: u32, rows: u32) !bool {
-    if (!self.knobs.mlx_attention or !mlxAttentionApplies(rows, a.heads, a.kv_heads, a.dim)) return false;
+    if (!self.knobs.mlx_attention) return false;
+    const wide = gate == null and self.knobs.mlx_attention2 and rows > 8 and (a.dim == 256 or a.dim == 512) and a.kv_heads != 0 and a.heads % a.kv_heads == 0;
+    if (!wide and !mlxAttentionApplies(rows, a.heads, a.kv_heads, a.dim)) return false;
     const q = self.words(a.q);
     var p: gpu.Params = .{ .rows = rows, .row0 = row0, .pos = self.position };
     p.x = q.off;
@@ -4217,6 +4252,11 @@ fn encodeMlxAttention(self: *Engine, a: @FieldType(ir.Op, "attention"), gate: ?@
     p.window = a.window;
     p.scale = a.scale;
     p.capacity = self.program.states[a.keys].capacity(self.batch, self.context);
+    if (wide) {
+        if (!mlx2AttentionApplies(&p)) return false;
+        try mlx2WideAttention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, &p);
+        return true;
+    }
     // c2-prefill-mlx (knob mlx_attention2): the same arithmetic, rescheduled.
     if (self.knobs.mlx_attention2 and mlx2AttentionApplies(&p)) {
         try mlx2Attention(self.ctx, self.arena, self.caches[a.keys].?, self.caches[a.values].?, &p, gate != null);
@@ -4440,6 +4480,15 @@ pub fn mlx2Attention(ctx: metal.Context, arena: metal.Buffer, keys: metal.Buffer
     if (!mlx2AttentionApplies(p)) return error.NotPorted;
     const tgs = @as(usize, (p.rows + 31) / 32) * p.heads;
     try gpu.dispatch(ctx, if (gated) "mk_mlx2_attention_gated" else "mk_mlx2_attention", &.{ arena, keys, values }, p, tgs * 128, 128);
+}
+
+/// mk_mlx2_attention_d{256,512}: wide-head prefill MMA attention for dim 256 or 512.
+pub fn mlx2WideAttention(ctx: metal.Context, arena: metal.Buffer, keys: metal.Buffer, values: metal.Buffer, p: *const gpu.Params) !void {
+    if (!mlx2AttentionApplies(p) or (p.dim != 256 and p.dim != 512)) return error.NotPorted;
+    const nd: usize = if (p.dim == 512) 2 else 1;
+    const tgs = @as(usize, (p.rows + 31) / 32) * p.heads * nd;
+    const name: [:0]const u8 = if (p.dim == 512) "mk_mlx2_attention_d512" else "mk_mlx2_attention_d256";
+    try gpu.dispatch(ctx, name, &.{ arena, keys, values }, p, tgs * 128, 128);
 }
 
 /// Slices per row of the two-stage argmax.

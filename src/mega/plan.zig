@@ -556,6 +556,7 @@ fn matchConv(p: *const ir.Program, i: u32) bool {
         else => return false,
     };
     if (m0.kind != .mul or m0.b_every != 1 or m1.kind != .mul or m1.b_every != 1) return false;
+    if (@backingInt(m0.a_act) >= 4 or @backingInt(m0.b_act) >= 4 or @backingInt(m1.a_act) >= 4 or @backingInt(m1.b_act) >= 4) return false;
     if (!sameView(st.src, m0.out) or st.dst != cv.src or p.states[cv.src].kind != .ring) return false;
     const conv_left = sameView(m1.a, cv.out);
     if (!conv_left and !sameView(m1.b, cv.out)) return false;

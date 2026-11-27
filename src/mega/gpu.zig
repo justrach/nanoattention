@@ -183,7 +183,11 @@ pub fn openForModel(model_type: []const u8) !metal.Context {
     if (std.mem.eql(u8, model_type, "lfm2") or
         std.mem.eql(u8, model_type, "lfm3") or
         std.mem.eql(u8, model_type, "qwen3_5") or
-        std.mem.eql(u8, model_type, "qwen3_5_text"))
+        std.mem.eql(u8, model_type, "qwen3_5_text") or
+        std.mem.eql(u8, model_type, "gemma4") or
+        std.mem.eql(u8, model_type, "gemma4_text") or
+        std.mem.eql(u8, model_type, "gemma4_unified") or
+        std.mem.eql(u8, model_type, "gemma4_unified_text"))
     {
         return openSource(lfm_source);
     }

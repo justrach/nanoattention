@@ -53,10 +53,17 @@ inline float mk_sigmoid(float x) {
     float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
     return x < 0 ? y : 1.0f - y;
 }
+inline float mk_gelu_tanh(float x) {
+    constexpr float k = 0.7978845608028654f; // sqrt(2 / pi)
+    float u = k * (x + 0.044715f * x * x * x);
+    float t = metal::abs(u) > 20.0f ? (u > 0.0f ? 1.0f : -1.0f) : tanh(u);
+    return 0.5f * x * (1.0f + t);
+}
 inline float mk_act(float x, uint act) {
     if (act == 1) return x * mk_sigmoid(x);
     if (act == 2) return mk_sigmoid(x);
     if (act == 3) return tanh(x);
+    if (act == 4) return mk_gelu_tanh(x);
     return x;
 }
 // Packed code word i of a weight at byte `offset`. Safetensors data in
@@ -223,7 +230,7 @@ kernel void mk_linear_q4_static_##K(device const uchar *w [[buffer(0)]], device 
         uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) { \
     mk_q4_tile<2, 1, K>(w, s, b, arena, p, i / 32, lane); \
 }
-MK_Q4_STATIC(2048) MK_Q4_STATIC(7680) MK_Q4_STATIC(8192)
+MK_Q4_STATIC(2048) MK_Q4_STATIC(3840) MK_Q4_STATIC(4096) MK_Q4_STATIC(7680) MK_Q4_STATIC(8192) MK_Q4_STATIC(15360)
 
 // Any affine width/group and dense F32/F16/BF16: lane-strided columns, one
 // SIMD per (row, token). Reference for shapes outside the 4-bit fast form.
@@ -337,11 +344,11 @@ kernel void mk_rope(device float *arena [[buffer(0)]], device const float *table
 // The visit order is fixed by the row's own position range, so batching
 // cannot change it.
 constant uint MK_ATT_SIMDS = 8;
-kernel void mk_attention(device float *arena [[buffer(0)]], device const float *K [[buffer(1)]],
-                         device const float *V [[buffer(2)]], constant MK &p [[buffer(8)]],
-                         uint tgid [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float maxes[MK_ATT_SIMDS], sums[MK_ATT_SIMDS], outs[MK_ATT_SIMDS][256];
+template <uint MAX_E>
+inline void mk_attention_impl(device float *arena, device const float *K, device const float *V,
+                              constant MK &p, uint tgid, uint simd, uint lane,
+                              threadgroup float *maxes, threadgroup float *sums,
+                              threadgroup float (*outs)[MAX_E * 32]) {
     uint r = tgid / p.heads, h = tgid % p.heads;
     if (r >= p.rows) return;
     uint row = p.row0 + r;
@@ -349,9 +356,9 @@ kernel void mk_attention(device float *arena [[buffer(0)]], device const float *
     uint kvh = h / (p.heads / p.kv_heads);
     uint start = p.window && position + 1 > p.window ? position + 1 - p.window : 0;
     uint E = (p.dim + 31) / 32;
-    float q[8], o[8];
+    float q[MAX_E], o[MAX_E];
     device const float *qp = arena + p.x + row * p.xs + h * p.dim;
-    for (uint e = 0; e < 8; ++e) {
+    for (uint e = 0; e < MAX_E; ++e) {
         uint d = lane + 32 * e;
         q[e] = (e < E && d < p.dim) ? p.scale * qp[d] : 0;
         o[e] = 0;
@@ -375,7 +382,8 @@ kernel void mk_attention(device float *arena [[buffer(0)]], device const float *
     float M = maxes[0];
     for (uint s = 1; s < MK_ATT_SIMDS; ++s) M = max(M, maxes[s]);
     float total = 0;
-    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float acc[MAX_E];
+    for (uint e = 0; e < MAX_E; ++e) acc[e] = 0;
     for (uint s = 0; s < MK_ATT_SIMDS; ++s) {
         float f = sums[s] == 0 ? 0.0f : metal::precise::exp(maxes[s] - M);
         total += sums[s] * f;
@@ -383,6 +391,20 @@ kernel void mk_attention(device float *arena [[buffer(0)]], device const float *
     }
     device float *out = arena + p.y + row * p.ys + h * p.dim;
     for (uint e = 0; e < E; ++e) { uint d = lane + 32 * e; if (d < p.dim) out[d] = acc[e] / total; }
+}
+kernel void mk_attention(device float *arena [[buffer(0)]], device const float *K [[buffer(1)]],
+                         device const float *V [[buffer(2)]], constant MK &p [[buffer(8)]],
+                         uint tgid [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float maxes[MK_ATT_SIMDS], sums[MK_ATT_SIMDS], outs[MK_ATT_SIMDS][256];
+    mk_attention_impl<8>(arena, K, V, p, tgid, simd, lane, maxes, sums, outs);
+}
+kernel void mk_attention_d512(device float *arena [[buffer(0)]], device const float *K [[buffer(1)]],
+                              device const float *V [[buffer(2)]], constant MK &p [[buffer(8)]],
+                              uint tgid [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float maxes[MK_ATT_SIMDS], sums[MK_ATT_SIMDS], outs[MK_ATT_SIMDS][512];
+    mk_attention_impl<16>(arena, K, V, p, tgid, simd, lane, maxes, sums, outs);
 }
 
 // ---- argmax ----------------------------------------------------------------------
@@ -527,4 +549,17 @@ kernel void mk_copy_slot(
     uint r = uint(gid / p.n);
     uint c = uint(gid % p.n);
     dst[ulong(p.row0 + r) * p.ys + p.y + c] = arena[ulong(p.x) + ulong(p.pos + r) * p.xs + c];
+}
+
+kernel void mk_row_transform(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
+                              constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
+    uint r = i / p.n, c = i % p.n;
+    if (r >= p.rows) return;
+    uint row = p.row0 + r;
+    float x = arena[p.x + row * p.xs + c];
+    if (p.kind == 1) x = tanh(x / p.scale) * p.scale;
+    if (p.kind == 2) x *= 1.0f + p.scale * metal::precise::log(max(float(p.pos + row + 1) / float(p.m), 1.0f));
+    if (p.kind == 3) x *= p.scale;
+    if (p.kind == 4) x *= mk_load(w, p.w, p.dtype, 0);
+    arena[p.y + row * p.ys + c] = (p.flags & MK_ROUND_BF16) ? mk_bf16(x) : x;
 }

@@ -1,0 +1,452 @@
+{
+  "benchmark": "gemma4-12b-mlx-comparison",
+  "checkpoint": "lmstudio-community/gemma-4-12B-it-MLX-4bit",
+  "lengths": [
+    64,
+    1024,
+    4096
+  ],
+  "decode_tokens": 64,
+  "repeats": 3,
+  "context": 4224,
+  "input_sha256": "cdd9df220ad8fd8418c0d264a665db65a34c8dcdae19a45d81e7b34d6ff0c8d5",
+  "mlx_version": "0.32.4",
+  "mlx_lm_version": "0.32.3.dev17+g736ab0d8c",
+  "system": {
+    "machine": "arm64",
+    "os": "macOS 27.0",
+    "cpu_brand": "Apple M3 Ultra",
+    "memsize_gb": 256.0,
+    "git_commit": "f875890",
+    "python": "3.12.10"
+  },
+  "results": {
+    "nano_gemma4_greedy": {
+      "64": {
+        "prefill_tokens_per_second": 547.9217499352243,
+        "prefill_ms": 116.80499999783933,
+        "decode_tokens_per_second": 49.673782953242274,
+        "decode_ms_per_tok": 20.1313437501085,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 896,
+        "prediction_checksum": 2113204,
+        "peak_rss_mb": 4871.3,
+        "prefill_samples_s": [
+          0.11680499999783933,
+          0.11711300001479685,
+          0.11668300000019372
+        ],
+        "decode_samples_s": [
+          1.3018620000220835,
+          1.2811679998412728,
+          1.288406000006944
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 622.389111107283,
+        "prefill_ms": 1645.2730000019073,
+        "decode_tokens_per_second": 45.02558719016353,
+        "decode_ms_per_tok": 22.209593753359513,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 586,
+        "prediction_checksum": 3902761,
+        "peak_rss_mb": 4871.4,
+        "prefill_samples_s": [
+          1.7729379998054355,
+          1.6375540001317859,
+          1.6452730000019073
+        ],
+        "decode_samples_s": [
+          1.4214140002150089,
+          1.4363289999309927,
+          1.3956430000253022
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 647.1259691496017,
+        "prefill_ms": 6329.525000182912,
+        "decode_tokens_per_second": 43.475898049677006,
+        "decode_ms_per_tok": 23.001249999651918,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 2,
+        "dispatches_per_prefill_forward": 579,
+        "prediction_checksum": 2746543,
+        "peak_rss_mb": 4871.3,
+        "prefill_samples_s": [
+          6.319103000219911,
+          6.329525000182912,
+          6.335679000010714
+        ],
+        "decode_samples_s": [
+          1.4701779999304563,
+          1.4720799999777228,
+          1.4723839999642223
+        ]
+      }
+    },
+    "nano_gemma4_tf": {
+      "64": {
+        "prefill_tokens_per_second": 548.236221501023,
+        "prefill_ms": 116.73799995332956,
+        "decode_tokens_per_second": 50.445178695605804,
+        "decode_ms_per_tok": 19.823500002530636,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 896,
+        "prediction_checksum": 2757057,
+        "peak_rss_mb": 4871.4,
+        "prefill_samples_s": [
+          0.11681999987922609,
+          0.11664199992083013,
+          0.11673799995332956
+        ],
+        "decode_samples_s": [
+          1.2687040001619607,
+          1.2685140001121908,
+          1.2826769999228418
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 585.529976169568,
+        "prefill_ms": 1748.842999804765,
+        "decode_tokens_per_second": 44.81146277181899,
+        "decode_ms_per_tok": 22.31571875017835,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 586,
+        "prediction_checksum": 1627004,
+        "peak_rss_mb": 4871.5,
+        "prefill_samples_s": [
+          1.79974599997513,
+          1.6924789999611676,
+          1.748842999804765
+        ],
+        "decode_samples_s": [
+          1.4282060000114143,
+          1.4486050000414252,
+          1.4133090001996607
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 612.5592594289076,
+        "prefill_ms": 6686.699999962002,
+        "decode_tokens_per_second": 43.4686339849402,
+        "decode_ms_per_tok": 23.005093749816297,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 2,
+        "dispatches_per_prefill_forward": 579,
+        "prediction_checksum": 1767253,
+        "peak_rss_mb": 4871.7,
+        "prefill_samples_s": [
+          6.686699999962002,
+          6.665690999943763,
+          7.315584000200033
+        ],
+        "decode_samples_s": [
+          1.4717800000216812,
+          1.6176630000118166,
+          1.472325999988243
+        ]
+      }
+    },
+    "nano_exact_greedy": {
+      "64": {
+        "prefill_tokens_per_second": 203.42452486851747,
+        "prefill_ms": 314.61299979127944,
+        "decode_tokens_per_second": 44.02522645336774,
+        "decode_ms_per_tok": 22.714250000717584,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 1035,
+        "prediction_checksum": 2113204,
+        "peak_rss_mb": 2836.3,
+        "prefill_samples_s": [
+          0.3145210000220686,
+          0.3147690000478178,
+          0.31461299979127944
+        ],
+        "decode_samples_s": [
+          1.4542600000277162,
+          1.4537120000459254,
+          1.4531150001566857
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 224.83677925029022,
+        "prefill_ms": 4554.415000136942,
+        "decode_tokens_per_second": 41.256279495646524,
+        "decode_ms_per_tok": 24.238734375103377,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 1,
+        "dispatches_per_prefill_forward": 1275,
+        "prediction_checksum": 3902761,
+        "peak_rss_mb": 2836.3,
+        "prefill_samples_s": [
+          4.514748999848962,
+          4.554415000136942,
+          4.590913000050932
+        ],
+        "decode_samples_s": [
+          1.5507060000672936,
+          1.5512790000066161,
+          1.5539170000702143
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 161.7285496847291,
+        "prefill_ms": 25326.38800004497,
+        "decode_tokens_per_second": 38.62047657397324,
+        "decode_ms_per_tok": 25.89300000181538,
+        "dispatches_per_decode_token": 633.984375,
+        "prefill_forwards": 4,
+        "dispatches_per_prefill_forward": 1264.5,
+        "prediction_checksum": 2746543,
+        "peak_rss_mb": 2836.4,
+        "prefill_samples_s": [
+          24.857430999865755,
+          25.32638800004497,
+          26.25
+        ],
+        "decode_samples_s": [
+          1.6571520001161844,
+          1.7984019999857992,
+          1.637786999810487
+        ]
+      }
+    },
+    "mlx_bf16_async": {
+      "64": {
+        "prefill_tokens_per_second": 493.3752461333103,
+        "prefill_ms": 129.71870903857052,
+        "decode_tokens_per_second": 72.29705390149948,
+        "decode_ms_per_tok": 13.83182226709323,
+        "prediction_checksum": 2113204,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          0.12945179105736315,
+          0.12971870903857052,
+          0.1304182920139283
+        ],
+        "decode_samples_s": [
+          0.883133125025779,
+          0.8852366250939667,
+          0.8860839160624892
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 743.274711229649,
+        "prefill_ms": 1377.6871250011027,
+        "decode_tokens_per_second": 68.32341758464706,
+        "decode_ms_per_tok": 14.636270188930212,
+        "prediction_checksum": 811990,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          1.380850541871041,
+          1.3774792081676424,
+          1.3776871250011027
+        ],
+        "decode_samples_s": [
+          0.9367212920915335,
+          0.9395186249166727,
+          0.9364147090818733
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 652.4520645761907,
+        "prefill_ms": 6277.855833992362,
+        "decode_tokens_per_second": 67.48479680926545,
+        "decode_ms_per_tok": 14.818152343650581,
+        "prediction_checksum": 2812771,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          6.533396458020434,
+          6.269408625084907,
+          6.277855833992362
+        ],
+        "decode_samples_s": [
+          0.948138833977282,
+          0.9483617499936372,
+          0.9509431249462068
+        ]
+      },
+      "peak_rss_mb": 6500.2,
+      "peak_metal_mb": 8281.5
+    },
+    "mlx_bf16_sync": {
+      "64": {
+        "prefill_tokens_per_second": 491.03179886335494,
+        "prefill_ms": 130.3377910517156,
+        "decode_tokens_per_second": 60.71436140612259,
+        "decode_ms_per_tok": 16.470567701617256,
+        "prediction_checksum": 2113204,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          0.13033712492324412,
+          0.1303377910517156,
+          0.13066241703927517
+        ],
+        "decode_samples_s": [
+          1.0398395829834044,
+          1.0631985000800341,
+          1.0541163329035044
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 725.6613133363496,
+        "prefill_ms": 1411.126625025645,
+        "decode_tokens_per_second": 58.67391007863319,
+        "decode_ms_per_tok": 17.04335024987813,
+        "prediction_checksum": 811990,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          1.416807166999206,
+          1.4043392920866609,
+          1.411126625025645
+        ],
+        "decode_samples_s": [
+          1.0907744159922004,
+          1.09679895802401,
+          1.0874063749797642
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 634.1579151230633,
+        "prefill_ms": 6458.959042094648,
+        "decode_tokens_per_second": 57.64237510346183,
+        "decode_ms_per_tok": 17.34834829767351,
+        "prediction_checksum": 2812771,
+        "kv_dtype": "mlx.core.bfloat16",
+        "prefill_samples_s": [
+          6.458959042094648,
+          6.482759000035003,
+          6.387438083067536
+        ],
+        "decode_samples_s": [
+          1.1102942910511047,
+          1.1026811669580638,
+          1.2174596248660237
+        ]
+      },
+      "peak_rss_mb": 6499.8,
+      "peak_metal_mb": 8281.5
+    },
+    "mlx_f32_async": {
+      "64": {
+        "prefill_tokens_per_second": 444.1168803482447,
+        "prefill_ms": 144.10620904527605,
+        "decode_tokens_per_second": 66.33648997873021,
+        "decode_ms_per_tok": 15.074659517267719,
+        "prediction_checksum": 2113204,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          0.14410620904527605,
+          0.1445930830668658,
+          0.1421715000178665
+        ],
+        "decode_samples_s": [
+          0.9909784579649568,
+          0.964778209105134,
+          0.9532018341124058
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 542.1069724335287,
+        "prefill_ms": 1888.926082989201,
+        "decode_tokens_per_second": 56.2286767541104,
+        "decode_ms_per_tok": 17.78451953214244,
+        "prediction_checksum": 3902761,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          1.888926082989201,
+          1.8837184580042958,
+          1.8934791251085699
+        ],
+        "decode_samples_s": [
+          1.1403429999481887,
+          1.1382092500571162,
+          1.1376163749955595
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 509.78353289596976,
+        "prefill_ms": 8034.782874863595,
+        "decode_tokens_per_second": 56.19624104790979,
+        "decode_ms_per_tok": 17.79478451499017,
+        "prediction_checksum": 2746543,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          7.998446583049372,
+          8.034782874863595,
+          8.044191166060045
+        ],
+        "decode_samples_s": [
+          1.1388662089593709,
+          1.1388655409682542,
+          1.1486879589501768
+        ]
+      },
+      "peak_rss_mb": 6499.4,
+      "peak_metal_mb": 10873.6
+    },
+    "mlx_f32_sync": {
+      "64": {
+        "prefill_tokens_per_second": 451.0733681588978,
+        "prefill_ms": 141.88379212282598,
+        "decode_tokens_per_second": 58.159847399399425,
+        "decode_ms_per_tok": 17.19399284411338,
+        "prediction_checksum": 2113204,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          0.14207783294841647,
+          0.14169070799835026,
+          0.14188379212282598
+        ],
+        "decode_samples_s": [
+          1.0989261250942945,
+          1.1004155420232564,
+          1.1005118328612298
+        ]
+      },
+      "1024": {
+        "prefill_tokens_per_second": 566.4983313944283,
+        "prefill_ms": 1807.5957919936627,
+        "decode_tokens_per_second": 49.80579630206871,
+        "decode_ms_per_tok": 20.07798437625752,
+        "prediction_checksum": 3902761,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          1.6375951659865677,
+          1.8075957919936627,
+          1.8556448330637068
+        ],
+        "decode_samples_s": [
+          1.275631417054683,
+          1.2849910000804812,
+          1.29185412498191
+        ]
+      },
+      "4096": {
+        "prefill_tokens_per_second": 501.8767076593328,
+        "prefill_ms": 8161.367000080645,
+        "decode_tokens_per_second": 49.53993174905453,
+        "decode_ms_per_tok": 20.185736328130588,
+        "prediction_checksum": 2746543,
+        "kv_dtype": "mlx.core.float32",
+        "prefill_samples_s": [
+          8.113062833901495,
+          8.161367000080645,
+          8.282860708190128
+        ],
+        "decode_samples_s": [
+          1.2918871250003576,
+          1.2884758338332176,
+          1.3203076249919832
+        ]
+      },
+      "peak_rss_mb": 6499.1,
+      "peak_metal_mb": 10873.6
+    }
+  }
+}

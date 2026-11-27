@@ -68,6 +68,55 @@ MK_DEC_SCORES(1, 8) MK_DEC_SCORES(2, 8) MK_DEC_SCORES(4, 8) MK_DEC_SCORES(8, 8)
 MK_DEC_SCORES_KERNEL(mk_dec_scores_linear_e2_g4, 2, 4, true)
 MK_DEC_SCORES_KERNEL(mk_dec_scores_linear_e4_g4, 4, 4, true)
 
+// E = 16 (head dim 481..512): chunk heads of a KV head into G_SUB-wide slices to bound register pressure.
+template <uint G_SUB>
+inline void mk_dec_scores_e16_sub_impl(device const float *arena, device const float *K, device float *S, constant MK &p,
+                                       uint simd, uint lane) {
+    uint G = p.heads / p.kv_heads;
+    uint n_sub = G / G_SUB;
+    uint chunk = simd % p.m;
+    uint tmp = simd / p.m;
+    uint sub = tmp % n_sub;
+    uint kvh = tmp / n_sub;
+    if (kvh >= p.kv_heads) return;
+    uint position = p.pos + p.row0;
+    uint start = p.window && position + 1 > p.window ? position + 1 - p.window : 0;
+    uint t0 = start + chunk * MK_DEC_CHUNK;
+    if (t0 > position) return;
+    uint h0 = kvh * G + sub * G_SUB;
+    float q[G_SUB][16];
+    for (uint g = 0; g < G_SUB; ++g) {
+        device const float *qp = arena + p.x + p.row0 * p.xs + (h0 + g) * p.dim;
+        for (uint e = 0; e < 16; ++e) {
+            uint d = lane + 32 * e;
+            q[g][e] = d < p.dim ? p.scale * qp[d] : 0;
+        }
+    }
+    for (uint c = 0; c < MK_DEC_CHUNK; ++c) {
+        uint t = t0 + c;
+        if (t > position) break;
+        ulong base = ulong(t % p.capacity) * (p.kv_heads * p.dim) + kvh * p.dim;
+        float k[16];
+        for (uint e = 0; e < 16; ++e) {
+            uint d = lane + 32 * e;
+            k[e] = d < p.dim ? K[base + d] : 0;
+        }
+        for (uint g = 0; g < G_SUB; ++g) {
+            float dot = 0;
+            for (uint e = 0; e < 16; ++e) if (lane + 32 * e < p.dim) dot += q[g][e] * k[e];
+            dot = simd_sum(dot);
+            if (lane == 0) S[(h0 + g) * p.every + (t - start)] = dot;
+        }
+    }
+}
+#define MK_DEC_SCORES_E16_SUB(G_SUB) \
+kernel void mk_dec_scores_e16_sub##G_SUB(device const float *arena [[buffer(0)]], device const float *K [[buffer(1)]], \
+        device float *S [[buffer(2)]], constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]], \
+        uint lane [[thread_index_in_simdgroup]]) { \
+    mk_dec_scores_e16_sub_impl<G_SUB>(arena, K, S, p, i / 32, lane); \
+}
+MK_DEC_SCORES_E16_SUB(1) MK_DEC_SCORES_E16_SUB(2) MK_DEC_SCORES_E16_SUB(4)
+
 // ---- attention prep (knob fuse_attn_prep): q/k per-head RMSNorm, both ropes, K/V stores ----
 // Replaces rmsnorm(q), rmsnorm(k), rope(q), rope(k), store(k), store(v): one
 // threadgroup of mk_norm_threads(dim) threads per (row, unit), unit = a query

@@ -525,6 +525,7 @@ test {
     _ = @import("ir.zig");
     _ = @import("lfm3.zig");
     _ = @import("qwen3_5.zig");
+    _ = @import("gemma4.zig");
     _ = @import("inkling2_loop.zig");
     _ = @import("packed.zig");
     _ = @import("knobs.zig");

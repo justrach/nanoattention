@@ -39,6 +39,15 @@ pub fn build(gpa: std.mem.Allocator, model_type: []const u8, config_bytes: []con
         if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedQwen35Options;
         return @import("qwen3_5.zig").build(gpa, config_bytes, checkpoint);
     }
+    if (std.mem.eql(u8, model_type, "gemma4") or
+        std.mem.eql(u8, model_type, "gemma4_text") or
+        std.mem.eql(u8, model_type, "gemma4_unified") or
+        std.mem.eql(u8, model_type, "gemma4_unified_text"))
+    {
+        if (has_loop_opts) return error.UnsupportedLoopOptions;
+        if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedGemma4Options;
+        return @import("gemma4.zig").build(gpa, config_bytes, checkpoint);
+    }
     if (std.mem.eql(u8, model_type, "inkling2_loop")) {
         if (options.sliding_visible != null or options.embed_round != .none) return error.UnsupportedInklingOptions;
         return inkling2_loop.buildWithOptions(gpa, config_bytes, .{

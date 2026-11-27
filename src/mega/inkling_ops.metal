@@ -485,17 +485,6 @@ kernel void mk_expert_down(device float *arena [[buffer(0)]], device const uchar
     arena[p.y + r * p.ys + j] = p.round_bf16 ? mk_bf16(value) : value;
 }
 
-kernel void mk_row_transform(device float *arena [[buffer(0)]], constant MK &p [[buffer(8)]],
-                              uint i [[thread_position_in_grid]]) {
-    uint r = i / p.n, c = i % p.n;
-    if (r >= p.rows) return;
-    uint row = p.row0 + r;
-    float x = arena[p.x + row * p.xs + c];
-    if (p.kind == 1) x = tanh(x / p.scale) * p.scale;
-    if (p.kind == 2) x *= 1.0f + p.scale * metal::precise::log(max(float(p.pos + row + 1) / float(p.m), 1.0f));
-    arena[p.y + row * p.ys + c] = (p.flags & MK_ROUND_BF16) ? mk_bf16(x) : x;
-}
-
 kernel void mk_grouped_project(device float *arena [[buffer(0)]], device const uchar *w [[buffer(1)]],
                                 constant MK &p [[buffer(8)]], uint i [[thread_position_in_grid]]) {
     const uint width = p.n / p.m * p.taps;

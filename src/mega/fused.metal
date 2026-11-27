@@ -169,6 +169,14 @@ kernel void mk_glu_q4_static_2048(device const uchar *w [[buffer(0)]], device fl
         constant MKX &x [[buffer(8)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
     mk_glu_tile<2, 1, 2048>(w, arena, x, i / 32, lane);
 }
+kernel void mk_multi_q4_static_3840(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+        constant MKX &x [[buffer(8)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    mk_multi_tile<2, 1, 3840>(w, arena, x, i / 32, lane);
+}
+kernel void mk_glu_q4_static_3840(device const uchar *w [[buffer(0)]], device float *arena [[buffer(1)]],
+        constant MKX &x [[buffer(8)]], uint i [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    mk_glu_tile<2, 1, 3840>(w, arena, x, i / 32, lane);
+}
 
 // ---- sandwich residual: r = r (+) norm(y) * w0; out = norm(r) * w1 --------------
 // One threadgroup per row with mk_rmsnorm's size; each thread owns the same
