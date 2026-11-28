@@ -1,6 +1,5 @@
 //! Native text graph for the pinned Inkling-2 Mini checkpoint.
-//! The language-model path intentionally excludes vision until it has its own
-//! validated tensor/operator implementation.
+//! Vision encoding lives in `inkling_vision.zig` and splices into the post-embed_norm hidden state.
 const std = @import("std");
 const chat = @import("chat.zig");
 const ir = @import("ir.zig");
@@ -3390,6 +3389,49 @@ fn nextTurn(a: std.mem.Allocator, closed: bool, user: []const u8, _: chat.Option
     });
 }
 
+/// Render an Inkling 2 user turn with one or more images (matching chat_template.jinja):
+/// each image emits `<|message_user|><|content_image|><|unused_200054|>...<|end_message|>`
+/// with `image_token_counts[i]` placeholder tokens, followed by the text part (if non-empty).
+pub fn renderImageTurn(
+    a: std.mem.Allocator,
+    system: ?[]const u8,
+    user: []const u8,
+    image_token_counts: []const u32,
+    thinking: bool,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (system) |s| try out.print(a, "<|message_system|><|content_text|>{s}<|end_message|>", .{s});
+    try emitEffort(&out, a, thinking);
+    for (image_token_counts) |count| {
+        try out.appendSlice(a, "<|message_user|><|content_image|>");
+        for (0..count) |_| try out.appendSlice(a, "<|unused_200054|>");
+        try out.appendSlice(a, "<|end_message|>");
+    }
+    if (user.len > 0 or image_token_counts.len == 0) {
+        try out.print(a, "<|message_user|><|content_text|>{s}<|end_message|>", .{user});
+    }
+    return out.items;
+}
+
+pub fn renderImageNextTurn(
+    a: std.mem.Allocator,
+    closed: bool,
+    user: []const u8,
+    image_token_counts: []const u32,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (!closed) try out.appendSlice(a, "<|end_message|><|content_model_end_sampling|>");
+    for (image_token_counts) |count| {
+        try out.appendSlice(a, "<|message_user|><|content_image|>");
+        for (0..count) |_| try out.appendSlice(a, "<|unused_200054|>");
+        try out.appendSlice(a, "<|end_message|>");
+    }
+    if (user.len > 0 or image_token_counts.len == 0) {
+        try out.print(a, "<|message_user|><|content_text|>{s}<|end_message|>", .{user});
+    }
+    return out.items;
+}
+
 test "Inkling chat template matches HuggingFace text-only chat_template.jinja" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3431,4 +3473,15 @@ test "Inkling chat template matches HuggingFace text-only chat_template.jinja" {
         "<|message_model|><|content_text|>Hello.",
         next_open,
     }));
+
+    const img_turn = try renderImageTurn(a, "Sys.", "Describe", &.{ 2, 1 }, false);
+    try std.testing.expectEqualStrings(
+        "<|message_system|><|content_text|>Sys.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_image|><|unused_200054|><|unused_200054|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>Describe<|end_message|>",
+        img_turn,
+    );
+    const img_next = try renderImageNextTurn(a, false, "Again", &.{3});
+    try std.testing.expectEqualStrings(
+        "<|end_message|><|content_model_end_sampling|><|message_user|><|content_image|><|unused_200054|><|unused_200054|><|unused_200054|><|end_message|><|message_user|><|content_text|>Again<|end_message|>",
+        img_next,
+    );
 }

@@ -27,6 +27,14 @@ typedef struct NanoStats {
     uint64_t dispatches;
 } NanoStats;
 
+typedef struct NanoImageInput {
+    /* Local path, file://, data:...;base64,..., or http(s):// URL (NULL when using bytes). */
+    const char *source;
+    /* Encoded image bytes (PNG/JPEG/WebP/HEIC/etc.), NULL when using source. */
+    const uint8_t *bytes;
+    size_t bytes_len;
+} NanoImageInput;
+
 /* Return 0 to continue generation, non-zero to stop early. */
 typedef int (*NanoTokenCallback)(
     uint32_t token_id,
@@ -42,6 +50,7 @@ void nano_close(NanoSession *session);
 
 const char *nano_device_name(const NanoSession *session);
 const char *nano_model_type(const NanoSession *session);
+int nano_has_vision(const NanoSession *session);
 
 int nano_reset(NanoSession *session);
 
@@ -54,11 +63,35 @@ int nano_generate_tokens(
     void *user_data,
     NanoStats *out_stats);
 
+int nano_generate_tokens_with_images(
+    NanoSession *session,
+    const uint32_t *prompt_tokens,
+    size_t prompt_len,
+    const NanoImageInput *images,
+    size_t image_count,
+    uint32_t max_image_tokens,
+    uint32_t max_tokens,
+    NanoTokenCallback cb,
+    void *user_data,
+    NanoStats *out_stats);
+
 int nano_generate_text(
     NanoSession *session,
     const char *system_prompt,
     const char *user_prompt,
     int32_t raw_prompt,
+    uint32_t max_tokens,
+    NanoTokenCallback cb,
+    void *user_data,
+    NanoStats *out_stats);
+
+int nano_generate_multimodal(
+    NanoSession *session,
+    const char *system_prompt,
+    const char *user_prompt,
+    const NanoImageInput *images,
+    size_t image_count,
+    uint32_t max_image_tokens,
     uint32_t max_tokens,
     NanoTokenCallback cb,
     void *user_data,

@@ -44,6 +44,52 @@ def positive(value, name):
     return value
 
 
+def _validate_image_url(url):
+    if not isinstance(url, str):
+        raise AdapterError('image url must be a string')
+    url = url.strip()
+    if not url:
+        raise AdapterError('image url must be non-empty')
+    lower = url.lower()
+    if lower.startswith('data:'):
+        comma = url.find(',')
+        if comma < 0:
+            raise AdapterError('malformed image data URI')
+        params = [p.strip().lower() for p in url[5:comma].split(';')]
+        if 'base64' not in params:
+            raise AdapterError('image data URI must be base64-encoded')
+        return url
+    if '://' in url:
+        scheme = lower.split('://', 1)[0]
+        if scheme not in ('http', 'https', 'file'):
+            raise AdapterError('unsupported image URL scheme')
+        return url
+    if ':' in url.split('/', 1)[0]:
+        raise AdapterError('unsupported image URL scheme')
+    return url
+
+
+def _normalize_image_part(part):
+    detail = part.get('detail', 'auto')
+    raw_img = part.get('image_url')
+    if isinstance(raw_img, dict):
+        url = raw_img.get('url')
+        detail = raw_img.get('detail', detail)
+    elif isinstance(raw_img, str):
+        url = raw_img
+    elif isinstance(part.get('url'), str):
+        url = part['url']
+    elif isinstance(part.get('image'), str):
+        url = part['image']
+    else:
+        raise AdapterError('invalid image content part')
+    if detail is None:
+        detail = 'auto'
+    if detail not in ('auto', 'low', 'high'):
+        raise AdapterError('image detail must be auto, low, or high')
+    return dict(type='image_url', image_url=dict(url=_validate_image_url(url), detail=detail))
+
+
 def content_text(value):
     if value is None:
         return ''
@@ -55,14 +101,49 @@ def content_text(value):
     raise AdapterError('only text message content is supported')
 
 
-def normalize_messages(messages):
+def normalize_content(value, role, allow_images=False):
+    if not allow_images:
+        return content_text(value)
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        raise AdapterError('message content must be text or an array of content parts')
+    parts = []
+    has_image = False
+    for item in value:
+        if isinstance(item, str):
+            parts.append(dict(type='text', text=item))
+            continue
+        if not isinstance(item, dict):
+            raise AdapterError('invalid message content part')
+        ptype = item.get('type')
+        if ptype in ('text', 'input_text'):
+            text = item.get('text')
+            if not isinstance(text, str):
+                raise AdapterError('text content part requires a string text field')
+            parts.append(dict(type='text', text=text))
+        elif ptype in ('image_url', 'input_image', 'image'):
+            if role not in ('user', 'tool'):
+                raise AdapterError('image content is only supported for user and tool messages')
+            parts.append(_normalize_image_part(item))
+            has_image = True
+        else:
+            raise AdapterError('unsupported message content part type')
+    if not has_image:
+        return '\n'.join(p['text'] for p in parts)
+    return parts
+
+
+def normalize_messages(messages, allow_images=False):
     if not isinstance(messages, list) or not 0 < len(messages) <= 4096:
         raise AdapterError('messages must be a nonempty bounded array')
     result = []
     for raw in messages:
         if not isinstance(raw, dict) or raw.get('role') not in ('system', 'developer', 'user', 'assistant', 'tool'):
             raise AdapterError('unsupported message role')
-        message = dict(role=raw['role'], content=content_text(raw.get('content')))
+        message = dict(role=raw['role'], content=normalize_content(raw.get('content'), raw['role'], allow_images=allow_images))
         if 'reasoning_content' in raw:
             if not isinstance(raw['reasoning_content'], str):
                 raise AdapterError('reasoning_content must be text')
@@ -106,7 +187,7 @@ def assistant_signature(message):
     return result
 
 
-def validate_options(payload, maximum):
+def validate_options(payload, maximum, allow_images=False):
     if not isinstance(payload, dict) or payload.get('model', MODEL_ID) != MODEL_ID:
         raise AdapterError('unknown model; use flint')
     if type(payload.get('n', 1)) is not int or payload.get('n', 1) != 1 or type(payload.get('stream', False)) is not bool:
@@ -152,7 +233,7 @@ def validate_options(payload, maximum):
             raise AdapterError('forced function is not available')
     if choice == 'required' and not tools:
         raise AdapterError('required tool_choice has no tools')
-    return normalize_messages(payload.get('messages')), tools, min(budget, maximum)
+    return normalize_messages(payload.get('messages'), allow_images=allow_images), tools, min(budget, maximum)
 
 
 class Backend:
@@ -204,14 +285,15 @@ class Backend:
         return dict(payload=payload, messages=messages, tools=tools, budget=budget,
                     ids=ids, suffix=suffix, reused=reused, reset=not hit, epoch=self.epoch)
 
-    def _check_native(self, response, request, before):
+    def _check_native(self, response, request, before, expected_prefill=None):
         tokens = response.get('tokens') if isinstance(response, dict) else None
         if (not isinstance(tokens, list) or len(tokens) > request['max_tokens'] or
                 any(type(t) is not int or not 0 <= t < self.vocab_size for t in tokens)):
             raise AdapterError('invalid native token response', 502)
+        prefill = len(request['tokens']) if expected_prefill is None else expected_prefill
         expected = dict(id=request['id'], cache_before=before,
-                        cache_after=before+len(request['tokens'])+len(tokens),
-                        prefill_tokens=len(request['tokens']), decode_forward_tokens=len(tokens),
+                        cache_after=before+prefill+len(tokens),
+                        prefill_tokens=prefill, decode_forward_tokens=len(tokens),
                         reused_prefix_tokens=before)
         if any(type(response.get(k)) is not int or response[k] != v for k, v in expected.items()):
             raise AdapterError('native cache accounting mismatch', 502)
@@ -280,7 +362,8 @@ class Backend:
                 message['reasoning_content'] = parsed['reasoning_content']
             if parsed['tool_calls']:
                 message['tool_calls'] = parsed['tool_calls']
-            normalized = normalize_messages(plan['messages'] + [message, dict(role='user', content='')])[-2]
+            normalized = normalize_messages(plan['messages'] + [message, dict(role='user', content='')],
+                                            allow_images=getattr(self, 'allow_images', False))[-2]
             if list(self.tokenizer.encode(raw, add_special_tokens=False)) == generated:
                 self.records.append(dict(index=len(plan['messages']), prefix=fingerprint(plan['messages']),
                                          signature=assistant_signature(normalized), raw=raw,
@@ -359,8 +442,8 @@ class AdapterServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, address, backend, api_key):
-        self.backend, self.api_key = backend, api_key
+    def __init__(self, address, backend, api_key, max_body=MAX_BODY):
+        self.backend, self.api_key, self.max_body = backend, api_key, max_body
         super().__init__(address, Handler)
 
 
@@ -417,7 +500,7 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get('Content-Length', '0'))
             except ValueError:
                 raise AdapterError('invalid Content-Length')
-            if not 0 < length <= MAX_BODY:
+            if not 0 < length <= self.server.max_body:
                 raise AdapterError('request body exceeds limit', 413)
             data = self.rfile.read(length)
             if len(data) != length:

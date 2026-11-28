@@ -12,6 +12,8 @@ const chat = @import("chat.zig");
 const tokenizer = @import("tokenizer.zig");
 const sample = @import("sample.zig");
 const dflash2 = @import("dflash2.zig");
+const inkling2_loop = @import("inkling2_loop.zig");
+const inkling_vision = @import("inkling_vision.zig");
 const io = @import("io.zig");
 const Knobs = @import("knobs.zig").Knobs;
 const metal = @import("weights").metal;
@@ -60,6 +62,8 @@ const run_help =
     \\  --loopcd-weak-pass N     1-based weak pass index < loop passes (default 1)
     \\  --nope MODE              Inkling relative position bias ablation: off, global, all
     \\  --draft PATH             DFlash 2 speculative draft folder (greedy decoding only)
+    \\  --image SOURCE           attach an image path, file://, data:...;base64,..., or http(s):// URL (repeatable)
+    \\  --max-image-tokens N     visual token budget per image (default 1024)
     \\  --knobs FILE.json, --knob name=value   engine knobs instead of / over the preset
     \\Sampling (default greedy: deterministic, the engine's GPU argmax):
     \\  --temperature T  --top-k K  --top-p P  --repetition-penalty R  --seed S
@@ -76,7 +80,7 @@ const chat_help =
     \\usage: nano chat [MODEL] [options]
     \\Type a message and press Enter. Ctrl-C stops the current reply; Ctrl-D leaves.
     \\  /reset          start over          /system TEXT   set the system message and start over
-    \\  /stats          last reply's timings and the state's size
+    \\  /image SOURCE   attach an image     /stats         last reply's timings and the state's size
     \\  /help           this help           /exit          leave
     \\A line starting with // sends the text after the first /. When standard input is not a
     \\terminal, each non-empty line is one turn. The model keeps its state between turns and
@@ -188,6 +192,8 @@ const Options = struct {
     loopcd_weak_pass: u32 = 1,
     nope: frontend.NoPeMode = .off,
     draft: ?[]const u8 = null,
+    images: std.ArrayList([]const u8) = .empty,
+    max_image_tokens: u32 = inkling_vision.default_max_image_tokens,
     knobs_file: ?[]const u8 = null,
     knob_flags: std.ArrayList([]const u8) = .empty,
     sampling_model: bool = false,
@@ -205,7 +211,7 @@ const Options = struct {
 const generation_options = [_][]const u8{
     "--system",       "--max-tokens",   "--raw",          "--json",               "--stats",           "--think",      "--no-think", "--no-thinking-output",
     "--context",      "--prefill",      "--loop-passes",  "--loopcd",             "--loopcd-omega",    "--loopcd-weak-pass", "--nope",
-    "--draft",        "--knobs",        "--knob",         "--sampling",           "--temperature",
+    "--draft",        "--image",        "--max-image-tokens", "--knobs",          "--knob",            "--sampling",   "--temperature",
     "--top-k",        "--top-p",        "--repetition-penalty", "--seed",
 };
 
@@ -221,7 +227,7 @@ fn allowed(command: Command, name: []const u8) bool {
 }
 
 fn takesValue(name: []const u8) bool {
-    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--nope", "--draft", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
+    for ([_][]const u8{ "--system", "--max-tokens", "--context", "--prefill", "--loop-passes", "--loopcd", "--loopcd-omega", "--loopcd-weak-pass", "--nope", "--draft", "--image", "--max-image-tokens", "--knobs", "--knob", "--sampling", "--temperature", "--top-k", "--top-p", "--repetition-penalty", "--seed", "--prompt", "--file", "--batch" }) |v|
         if (eql(v, name)) return true;
     return false;
 }
@@ -309,6 +315,12 @@ fn parseOptions(a: Allocator, command: Command, args: []const []const u8) !Optio
             o.nope = frontend.parseNoPeMode(value) orelse return usageError("--nope is off, global, or all, not \"{s}\"", .{value});
         } else if (eql(name, "--draft")) {
             o.draft = value;
+        } else if (eql(name, "--image")) {
+            try o.images.append(a, value);
+        } else if (eql(name, "--max-image-tokens")) {
+            const mt = try parseNumber(u32, name, value);
+            if (mt == 0) return usageError("--max-image-tokens must be positive", .{});
+            o.max_image_tokens = mt;
         } else if (eql(name, "--knobs")) {
             o.knobs_file = value;
         } else if (eql(name, "--knob")) {
@@ -574,6 +586,7 @@ const Turn = struct {
     prompt_tokens: usize = 0,
     reply: std.ArrayList(u32) = .empty,
     stop: Stop = .eos,
+    vision_seconds: f64 = 0,
     prefill_seconds: f64 = 0,
     first_token_seconds: f64 = 0,
     decode_seconds: f64 = 0,
@@ -723,6 +736,10 @@ const Generator = struct {
     /// `commit`, every generated token (the stop token included) enters the
     /// state, as `nano session` does, so the next turn continues after it.
     fn turn(self: *Generator, a: Allocator, prompt: []const u32, max_tokens: u32, commit: bool, t: *Turn) !void {
+        return self.turnWithVision(a, prompt, null, max_tokens, commit, t);
+    }
+
+    fn turnWithVision(self: *Generator, a: Allocator, prompt: []const u32, vis: ?*exec.VisionStream, max_tokens: u32, commit: bool, t: *Turn) !void {
         const engine = self.engine;
         t.prompt_tokens = prompt.len;
         t.reply.clearRetainingCapacity();
@@ -732,7 +749,7 @@ const Generator = struct {
         if (self.sampler) |s| s.observe(prompt);
         const start = try io.now();
         if (self.draft) |d| {
-            const pf = try d.prefill(engine, prompt);
+            const pf = try d.prefillWithVision(engine, prompt, vis);
             t.prefill_seconds = try io.now() - start;
             t.stop = .max_tokens;
             if (max_tokens > 0) {
@@ -766,11 +783,16 @@ const Generator = struct {
         var row: u32 = 0;
         while (i < prompt.len) {
             const n = @min(engine.batch, prompt.len - i);
+            const chunk = prompt[i..][0..n];
             const last = i + n == prompt.len;
-            try engine.forward(prompt[i..][0..n], if (last) @intCast(n - 1) else @intCast(n));
+            var ov_val: ?exec.EmbedOverride = if (vis) |vs| try vs.prepareChunk(chunk) else null;
+            engine.embed_override = if (ov_val) |*ov| ov else null;
+            defer engine.embed_override = null;
+            try engine.forward(chunk, if (last) @intCast(n - 1) else @intCast(n));
             row = @intCast(n - 1);
             i += n;
         }
+        if (vis) |vs| try vs.finish();
         t.prefill_seconds = try io.now() - start;
         var first: f64 = 0;
         t.stop = .max_tokens;
@@ -867,6 +889,22 @@ fn loadDraft(ctx: *Context, engine: *const exec.Engine, o: *const Options) !?*df
     return dflash2.Draft.init(ctx.gpa, engine, dd) catch |err| return fail("cannot load draft {s}: {s}", .{ dd, @errorName(err) });
 }
 
+fn loadVision(ctx: *Context, dir: []const u8, loaded: *const loader.Loaded, required: bool) !?inkling_vision.VisionEncoder {
+    const cfg_path = try std.fs.path.join(ctx.a, &.{ dir, "config.json" });
+    const cfg_bytes = loader.readFile(ctx.a, cfg_path) catch |err| {
+        if (required) return fail("cannot read {s}: {s}", .{ cfg_path, @errorName(err) });
+        return null;
+    };
+    if (!inkling_vision.hasVisionConfig(ctx.a, cfg_bytes)) {
+        if (required) return fail("{s} has no vision_config (--image requires a vision-capable model)", .{dir});
+        return null;
+    }
+    return inkling_vision.VisionEncoder.init(ctx.gpa, loaded.ctx, loaded.store, cfg_bytes) catch |err| {
+        if (required) return fail("cannot load vision encoder for {s}: {s}", .{ dir, @errorName(err) });
+        return null;
+    };
+}
+
 fn stopName(s: Stop) []const u8 {
     return switch (s) {
         .eos => "stop-token",
@@ -878,6 +916,7 @@ fn stopName(s: Stop) []const u8 {
 
 fn printStats(load_seconds: ?f64, t: *const Turn) void {
     if (load_seconds) |l| printErr("load {d:.2} s | ", .{l});
+    if (t.vision_seconds > 0) printErr("vision {d:.3} s | ", .{t.vision_seconds});
     printErr("prompt {d} tokens, {d:.3} s, {d:.1} tok/s | first token {d:.3} s | reply {d} tokens, {d:.1} tok/s", .{
         t.prompt_tokens, t.prefill_seconds, t.promptRate(), t.first_token_seconds, t.reply.items.len, t.replyRate(),
     });
@@ -947,20 +986,15 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
         loader.readFile(ctx.a, path) catch return fail("cannot read {s}", .{path})
     else if (!tty(0))
         try readAll(ctx.a, 0)
+    else if (o.images.items.len > 0)
+        ""
     else
-        return usageError("no prompt: nano run [MODEL] \"prompt\" (or --prompt, --file, standard input)", .{});
+        return usageError("no prompt: nano run [MODEL] \"prompt\" (or --prompt, --file, --image, standard input)", .{});
 
     var tok = try loadTokenizer(ctx, dir);
     defer tok.deinit();
     var template: ?chat.Template = null;
-    const text = if (o.raw) prompt_text else blk: {
-        template = try templateFor(ctx, dir);
-        break :blk try renderTurn(ctx.a, template.?, o.system, try sanitize(ctx.a, prompt_text), o.thinking);
-    };
-    var ids: std.ArrayList(u32) = .empty;
-    try tok.encode(ctx.a, text, &ids);
-    if (ids.items.len == 0) return usageError("the prompt is empty", .{});
-    if (ids.items.len > o.context) return fail("the prompt is {d} tokens; the context holds {d} (--context N)", .{ ids.items.len, o.context });
+    if (!o.raw) template = try templateFor(ctx, dir);
     const params = try samplingFor(ctx, dir, o);
     if (o.draft != null and !params.greedy()) return usageError("--draft requires greedy decoding (omit sampling flags)", .{});
 
@@ -971,9 +1005,41 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
     }
     const draft = try loadDraft(ctx, &loaded.engine, o);
     defer if (draft) |d| d.deinit();
+    var vision = try loadVision(ctx, dir, loaded, o.images.items.len > 0);
+    defer if (vision) |*v| v.deinit();
     var sampler: ?sample.Sampler = if (params.greedy()) null else try sample.Sampler.init(ctx.gpa, params, loaded.program.meta.vocab);
     defer if (sampler) |*s| s.deinit(ctx.gpa);
     const load_seconds = try io.now() - ctx.start;
+
+    var encoded_batch: ?inkling_vision.EncodedBatch = null;
+    defer if (encoded_batch) |*eb| eb.deinit(ctx.gpa);
+    var vision_seconds: f64 = 0;
+    if (o.images.items.len > 0) {
+        if (!std.mem.eql(u8, loaded.program.meta.model_type, "inkling2_loop"))
+            return fail("--image is currently supported for inkling2_loop models only", .{});
+        const v_start = try io.now();
+        encoded_batch = vision.?.encodeFiles(ctx.a, o.images.items, o.max_image_tokens) catch |err|
+            return fail("image encoding failed: {s}", .{@errorName(err)});
+        vision_seconds = (try io.now()) - v_start;
+    }
+
+    const text = if (o.raw)
+        prompt_text
+    else if (encoded_batch) |eb|
+        try inkling2_loop.renderImageTurn(ctx.a, if (o.system) |s| try sanitize(ctx.a, s) else null, try sanitize(ctx.a, prompt_text), eb.counts, o.thinking)
+    else
+        try renderTurn(ctx.a, template.?, o.system, try sanitize(ctx.a, prompt_text), o.thinking);
+
+    var ids: std.ArrayList(u32) = .empty;
+    try tok.encode(ctx.a, text, &ids);
+    if (ids.items.len == 0) return usageError("the prompt is empty", .{});
+    if (ids.items.len > o.context) return fail("the prompt is {d} tokens; the context holds {d} (--context N)", .{ ids.items.len, o.context });
+
+    var vis_stream: ?exec.VisionStream = if (encoded_batch) |eb|
+        try exec.VisionStream.init(loaded.ctx, loaded.engine.batch, eb.buffer, eb.width, eb.total_tokens, inkling_vision.image_token_id)
+    else
+        null;
+    defer if (vis_stream) |*vs| vs.deinit();
 
     const out_tty = tty(1);
     var display: Display = .{
@@ -985,8 +1051,8 @@ fn cmdRun(ctx: *Context, dir: []const u8, o: *Options) !void {
     };
     display.begin(template != null and template.?.starts_in_think and o.thinking);
     var gen: Generator = .{ .engine = &loaded.engine, .draft = draft, .tok = &tok, .sampler = if (sampler) |*s| s else null, .display = &display, .eos = loaded.program.meta.eos, .gpa = ctx.gpa };
-    var turn: Turn = .{};
-    try gen.turn(ctx.a, ids.items, o.max_tokens, false, &turn);
+    var turn: Turn = .{ .vision_seconds = vision_seconds };
+    try gen.turnWithVision(ctx.a, ids.items, if (vis_stream) |*vs| vs else null, o.max_tokens, false, &turn);
     if (o.json) {
         try io.out(try jsonTurn(ctx.a, &display, &turn, load_seconds, ids.items));
         try io.out("\n");
@@ -1043,6 +1109,8 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
     }
     const draft = try loadDraft(ctx, &loaded.engine, o);
     defer if (draft) |d| d.deinit();
+    var vision = try loadVision(ctx, dir, loaded, o.images.items.len > 0);
+    defer if (vision) |*v| v.deinit();
     var sampler: ?sample.Sampler = if (params.greedy()) null else try sample.Sampler.init(ctx.gpa, params, loaded.program.meta.vocab);
     defer if (sampler) |*s| s.deinit(ctx.gpa);
     const load_seconds = try io.now() - ctx.start;
@@ -1062,6 +1130,8 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
     if (in_tty) printErr("nano chat: {s} (load {d:.2} s). /help for commands, Ctrl-D to leave.\n", .{ dir, load_seconds });
 
     var system: ?[]const u8 = o.system;
+    var pending_images: std.ArrayList([]const u8) = .empty;
+    for (o.images.items) |img| try pending_images.append(ctx.a, img);
     var started = false;
     var closed = true;
     var full = false;
@@ -1094,6 +1164,7 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
                     engine.reset();
                     if (draft) |d| d.reset();
                     if (sampler) |*s| s.reset();
+                    pending_images.clearRetainingCapacity();
                     started = false;
                     full = false;
                     printErr("(conversation reset)\n", .{});
@@ -1103,9 +1174,22 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
                     engine.reset();
                     if (draft) |d| d.reset();
                     if (sampler) |*s| s.reset();
+                    pending_images.clearRetainingCapacity();
                     started = false;
                     full = false;
                     printErr("(system message {s}; conversation reset)\n", .{if (system != null) "set" else "cleared"});
+                } else if (eql(cmd, "/image")) {
+                    if (vision == null) {
+                        printErr("nano: this model has no vision encoder\n", .{});
+                        continue;
+                    }
+                    const img_path = std.mem.trim(u8, line["/image".len..], " \t");
+                    if (img_path.len == 0) {
+                        printErr("usage: /image PATH\n", .{});
+                        continue;
+                    }
+                    try pending_images.append(ctx.a, try ctx.a.dupe(u8, img_path));
+                    printErr("(attached image {s}; send your message next)\n", .{img_path});
                 } else if (eql(cmd, "/stats")) {
                     if (turns > 0) printStats(null, &turn) else printErr("no reply yet\n", .{});
                     printErr("state: {d} of {d} positions\n", .{ engine.position, engine.context });
@@ -1117,8 +1201,27 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
             printErr("nano: the context is full ({d} positions); /reset to start over\n", .{engine.context});
             continue;
         }
+        var encoded_batch: ?inkling_vision.EncodedBatch = null;
+        defer if (encoded_batch) |*eb| eb.deinit(ctx.gpa);
+        turn.vision_seconds = 0;
+        if (pending_images.items.len > 0) {
+            const v_start = try io.now();
+            encoded_batch = vision.?.encodeFiles(ctx.a, pending_images.items, o.max_image_tokens) catch |err| {
+                printErr("nano: image encoding failed: {s}\n", .{@errorName(err)});
+                pending_images.clearRetainingCapacity();
+                continue;
+            };
+            turn.vision_seconds = (try io.now()) - v_start;
+            pending_images.clearRetainingCapacity();
+        }
+
         const user = try sanitize(ctx.a, message);
-        const text = if (!started)
+        const text = if (encoded_batch) |eb|
+            (if (!started)
+                try inkling2_loop.renderImageTurn(ctx.a, if (system) |s| try sanitize(ctx.a, s) else null, user, eb.counts, o.thinking)
+            else
+                try inkling2_loop.renderImageNextTurn(ctx.a, closed, user, eb.counts))
+        else if (!started)
             try renderTurn(ctx.a, template, system, user, o.thinking)
         else
             try template.next_turn(ctx.a, closed, user, .{ .thinking = o.thinking });
@@ -1132,8 +1235,14 @@ fn cmdChat(ctx: *Context, dir: []const u8, o: *Options) !void {
             engine.reset();
             if (draft) |d| d.reset();
         }
+        var vis_stream: ?exec.VisionStream = if (encoded_batch) |eb|
+            try exec.VisionStream.init(loaded.ctx, engine.batch, eb.buffer, eb.width, eb.total_tokens, inkling_vision.image_token_id)
+        else
+            null;
+        defer if (vis_stream) |*vs| vs.deinit();
+
         display.begin(template.starts_in_think and o.thinking);
-        gen.turn(ctx.a, ids.items, o.max_tokens, true, &turn) catch |err| {
+        gen.turnWithVision(ctx.a, ids.items, if (vis_stream) |*vs| vs else null, o.max_tokens, true, &turn) catch |err| {
             printErr("\nnano: {s}; the conversation was reset\n", .{@errorName(err)});
             engine.reset();
             if (draft) |d| d.reset();
@@ -1175,8 +1284,13 @@ test "options: model-free parsing, values, unknown options" {
     try std.testing.expectEqual(@as(f32, 1.25), lc.loopcd_omega);
     try std.testing.expectEqual(@as(u32, 1), lc.loopcd_weak_pass);
     try std.testing.expectEqual(frontend.NoPeMode.global, lc.nope);
-    const dr = try parseOptions(a, .run, &.{ "hi", "--draft", "/tmp/draft", "--loopcd", "hidden" });
+    const dr = try parseOptions(a, .run, &.{ "hi", "--draft", "/tmp/draft", "--loopcd", "hidden", "--image", "a.png", "--image=b.jpg", "--max-image-tokens", "256" });
     try std.testing.expectEqualStrings("/tmp/draft", dr.draft.?);
+    try std.testing.expectEqual(@as(usize, 2), dr.images.items.len);
+    try std.testing.expectEqualStrings("a.png", dr.images.items[0]);
+    try std.testing.expectEqualStrings("b.jpg", dr.images.items[1]);
+    try std.testing.expectEqual(@as(u32, 256), dr.max_image_tokens);
+    try std.testing.expectError(error.Usage, parseOptions(a, .run, &.{ "hi", "--max-image-tokens", "0" }));
     const drc = try parseOptions(a, .chat, &.{"--draft=/tmp/draft"});
     try std.testing.expectEqualStrings("/tmp/draft", drc.draft.?);
     try std.testing.expectError(error.Usage, parseOptions(a, .tokenize, &.{ "--draft", "/tmp/draft" }));

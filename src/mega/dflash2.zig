@@ -1221,6 +1221,10 @@ pub const Draft = struct {
     }
 
     pub fn prefill(self: *Draft, target: *exec.Engine, prompt: []const u32) !PrefillResult {
+        return self.prefillWithVision(target, prompt, null);
+    }
+
+    pub fn prefillWithVision(self: *Draft, target: *exec.Engine, prompt: []const u32, vis: ?*exec.VisionStream) !PrefillResult {
         if (prompt.len == 0) return error.EmptyPrompt;
         const pos0: u64 = target.position;
         const total_end: u64 = pos0 + prompt.len;
@@ -1233,13 +1237,18 @@ pub const Draft = struct {
         var i: usize = 0;
         while (i < prompt.len) {
             const n = @min(target.batch, prompt.len - i);
+            const chunk = prompt[i..][0..n];
             const chunk_start_pos: u64 = pos0 + i;
             const chunk_end_pos: u64 = chunk_start_pos + n;
             const last = i + n == prompt.len;
             const req_out: u32 = if (last) @intCast(n - 1) else @intCast(n);
 
+            var ov_val: ?exec.EmbedOverride = if (vis) |vs| try vs.prepareChunk(chunk) else null;
+            target.embed_override = if (ov_val) |*ov| ov else null;
+            defer target.embed_override = null;
+
             if (chunk_end_pos <= window_start) {
-                try target.forward(prompt[i..][0..n], req_out);
+                try target.forward(chunk, req_out);
                 self.ctx_pos = @intCast(chunk_end_pos);
             } else {
                 const cap_start: u64 = @max(chunk_start_pos, window_start);
@@ -1248,7 +1257,7 @@ pub const Draft = struct {
                 var cap = self.makeCapture(row0, rows, 0);
                 target.capture = &cap;
                 defer target.capture = null;
-                try target.forward(prompt[i..][0..n], req_out);
+                try target.forward(chunk, req_out);
                 self.ctx_pos = @intCast(cap_start);
                 try self.commitContext(target.ctx, rows, true);
             }
@@ -1257,6 +1266,7 @@ pub const Draft = struct {
             last_row = @intCast(n - 1);
             i += n;
         }
+        if (vis) |vs| try vs.finish();
         return .{ .last_row = last_row, .dispatches = dispatches, .forwards = forwards };
     }
 

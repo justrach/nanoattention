@@ -26,6 +26,7 @@ reuse, seconds); the replay tool feeds those back to either engine.
 """
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from pathlib import Path
 import signal
 import threading
 import time
+import uuid
 
 import codegraff_adapter as base
 from codegraff_adapter import AdapterError, AdapterServer, Backend
@@ -44,8 +46,46 @@ base.parse_completion = inkling_tool_protocol.parse_completion  # Backend.execut
 EFFORT = "low"
 CHUNK = 4096  # prefill rows a forward, for both engines (tools/nano_inkling_tasks.py)
 WARM_TOKENS = 300
+MAX_BODY = 64 * 1024 * 1024  # allow high-res base64 image_url payloads
+IMAGE_TOKEN_ID = 200054
+DEFAULT_MAX_IMAGE_TOKENS = 1024
+LOW_DETAIL_MAX_IMAGE_TOKENS = 256
 SENTINEL = "\x00recorded-{}\x00"
 WRAPPER = "<|message_model|><|content_text|>{}<|end_message|><|content_model_end_sampling|>"
+
+
+def extract_images(messages):
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                spec = part["image_url"]
+                url = spec["url"]
+                detail = spec.get("detail", "auto")
+                images.append(dict(
+                    url=url,
+                    detail=detail,
+                    fingerprint=hashlib.sha256(url.encode("utf-8")).hexdigest(),
+                ))
+    return images
+
+
+def expand_image_tokens(tokens, counts, token_id=IMAGE_TOKEN_ID):
+    placeholders = sum(1 for t in tokens if t == token_id)
+    if placeholders != len(counts):
+        raise AdapterError("native image token count mismatch", 502)
+    out = []
+    img_idx = 0
+    for t in tokens:
+        if t == token_id:
+            out.extend([token_id] * counts[img_idx])
+            img_idx += 1
+        else:
+            out.append(t)
+    return out
 
 
 def native_command(
@@ -107,14 +147,35 @@ def mlx_command(python, checkpoint, context):
 
 
 class InklingBackend(Backend):
-    def __init__(self, *args, record=None, **kwargs):
+    allow_images = True
+
+    def __init__(self, *args, record=None, max_image_tokens=DEFAULT_MAX_IMAGE_TOKENS, engine="native", **kwargs):
         super().__init__(*args, **kwargs)
         self.record = record
+        self.max_image_tokens = max_image_tokens
+        self.engine = engine
+        self.cached_images = []  # [(start_pos, count, fingerprint, max_image_tokens), ...]
+
+    def abort(self):
+        self.cached_images = []
+        super().abort()
+
+    def close(self):
+        self.cached_images = []
+        super().close()
 
     def prepare(self, payload):
         if self.closed:
             raise AdapterError("adapter is closed", 503)
-        messages, tools, budget = base.validate_options(payload, self.maximum)
+        messages, tools, budget = base.validate_options(payload, self.maximum, allow_images=True)
+        images = extract_images(messages)
+        if images and self.engine != "native":
+            raise AdapterError("image input requires --engine native", 400)
+        req_max_image_tokens = (
+            min(self.max_image_tokens, LOW_DETAIL_MAX_IMAGE_TOKENS)
+            if images and all(img["detail"] == "low" for img in images)
+            else self.max_image_tokens
+        )
         rendered = copy.deepcopy(messages)
         splices = {}
         for record in self.records:
@@ -135,19 +196,58 @@ class InklingBackend(Backend):
             if text.count(wrapper) != 1:
                 raise AdapterError("recorded model turn did not render as expected", 500)
             text = text.replace(wrapper, raw)
-        ids = list(self.tokenizer.encode(text, add_special_tokens=False))
-        if not ids or any(type(t) is not int or not 0 <= t < self.vocab_size for t in ids):
+        raw_ids = list(self.tokenizer.encode(text, add_special_tokens=False))
+        if not raw_ids or any(type(t) is not int or not 0 <= t < self.vocab_size for t in raw_ids):
             raise AdapterError("invalid template token IDs", 500)
+        placeholder_count = sum(1 for t in raw_ids if t == IMAGE_TOKEN_ID)
+        if placeholder_count != len(images):
+            raise AdapterError("image placeholder count does not match image inputs", 400)
+
+        # Expand leading images that match the currently cached KV prefix so
+        # multi-turn follow-ups reuse cached image KV without re-encoding.
+        expanded_ids = []
+        matched_images = 0
+        prefix_ok = not self.needs_reset
+        img_cursor = 0
+        for tok in raw_ids:
+            if tok == IMAGE_TOKEN_ID:
+                img = images[img_cursor]
+                if prefix_ok and img_cursor < len(self.cached_images):
+                    c_start, c_count, c_fp, c_max = self.cached_images[img_cursor]
+                    if c_start == len(expanded_ids) and c_fp == img["fingerprint"] and c_max == req_max_image_tokens:
+                        expanded_ids.extend([IMAGE_TOKEN_ID] * c_count)
+                        matched_images += 1
+                    else:
+                        prefix_ok = False
+                        expanded_ids.append(tok)
+                else:
+                    expanded_ids.append(tok)
+                img_cursor += 1
+            else:
+                expanded_ids.append(tok)
+
+        hit = (prefix_ok and matched_images == len(self.cached_images)
+               and len(expanded_ids) >= len(self.cached_ids)
+               and expanded_ids[:len(self.cached_ids)] == self.cached_ids)
+        if hit:
+            reused = len(self.cached_ids)
+            ids = expanded_ids
+            suffix = ids[reused:]
+            suffix_images = images[matched_images:]
+            prefix_images = list(self.cached_images)
+        else:
+            reused = 0
+            ids = raw_ids
+            suffix = raw_ids
+            suffix_images = images
+            prefix_images = []
         if len(ids) + budget > self.context:
             raise AdapterError("prompt plus reserved committed output exceeds context")
-        hit = (not self.needs_reset and len(ids) >= len(self.cached_ids)
-               and ids[:len(self.cached_ids)] == self.cached_ids)
-        reused = len(self.cached_ids) if hit else 0
-        suffix = ids[reused:]
         if not suffix:
             raise AdapterError("request has no new template suffix")
         return dict(payload=payload, messages=messages, tools=tools, budget=budget, ids=ids, suffix=suffix,
-                    reused=reused, reset=not hit, epoch=self.epoch)
+                    reused=reused, reset=not hit, epoch=self.epoch, suffix_images=suffix_images,
+                    prefix_images=prefix_images, max_image_tokens=req_max_image_tokens)
 
     def _warm(self):
         """A throwaway request on a fresh worker: kernels built, weights paged in."""
@@ -155,6 +255,149 @@ class InklingBackend(Backend):
         response = self.worker.request(dict(id=0, tokens=ids, max_tokens=4, reset=True, return_logits=False))
         if not isinstance(response, dict) or "tokens" not in response:
             raise AdapterError("warm-up failed", 502)
+
+    def _execute_multimodal(self, plan):
+        self.active = True
+        try:
+            if plan["epoch"] != self.epoch or self.closed:
+                raise AdapterError("request cancelled", 499)
+            prefill_seconds, decode_seconds = 0.0, 0.0
+            before = plan["reused"]
+            suffix = plan["suffix"]
+            suffix_images = plan["suffix_images"]
+            actual_ids = list(plan["ids"][:plan["reused"]])
+            actual_images = list(plan["prefix_images"])
+            img_cursor = 0
+            response = None
+            generated = []
+            for start in range(0, len(suffix), base.NATIVE_CHUNK):
+                if plan["epoch"] != self.epoch or self.closed:
+                    raise AdapterError("request cancelled", 499)
+                chunk = suffix[start:start + base.NATIVE_CHUNK]
+                final = start + len(chunk) == len(suffix)
+                n_chunk_imgs = sum(1 for t in chunk if t == IMAGE_TOKEN_ID)
+                chunk_images = suffix_images[img_cursor:img_cursor + n_chunk_imgs]
+                img_cursor += n_chunk_imgs
+                self.sequence += 1
+                request = dict(
+                    id=self.sequence,
+                    tokens=chunk,
+                    max_tokens=plan["budget"] if final else 0,
+                    reset=plan["reset"] and start == 0,
+                    return_logits=False,
+                )
+                if chunk_images:
+                    request["images"] = [img["url"] for img in chunk_images]
+                    request["max_image_tokens"] = plan["max_image_tokens"]
+                response = self.worker.request(request)
+                if chunk_images:
+                    counts = response.get("image_token_counts") if isinstance(response, dict) else None
+                    if (not isinstance(counts, list) or len(counts) != len(chunk_images) or
+                            any(type(c) is not int or c <= 0 for c in counts)):
+                        raise AdapterError("invalid native image token accounting", 502)
+                    expanded_chunk = expand_image_tokens(chunk, counts)
+                    pos = len(actual_ids)
+                    ci = 0
+                    for tok in chunk:
+                        if tok == IMAGE_TOKEN_ID:
+                            cnt = counts[ci]
+                            actual_images.append((pos, cnt, chunk_images[ci]["fingerprint"], plan["max_image_tokens"]))
+                            pos += cnt
+                            ci += 1
+                        else:
+                            pos += 1
+                else:
+                    expanded_chunk = chunk
+                generated = self._check_native(response, request, before, expected_prefill=len(expanded_chunk))
+                actual_ids.extend(expanded_chunk)
+                before = response["cache_after"]
+                prefill_seconds += response["prefill_seconds"]
+                decode_seconds += response["decode_seconds"]
+            if img_cursor != len(suffix_images):
+                raise AdapterError("unconsumed image inputs in multimodal prefill", 502)
+            if plan["epoch"] != self.epoch or self.closed:
+                raise AdapterError("request cancelled", 499)
+            plan["ids"] = actual_ids
+            plan["suffix"] = actual_ids[plan["reused"]:]
+            self.cached_ids = actual_ids + generated
+            self.cached_images = actual_images
+            self.needs_reset = False
+            raw = self.tokenizer.decode(generated, skip_special_tokens=False,
+                                        clean_up_tokenization_spaces=False)
+            visible_ids = generated[:-1] if generated and generated[-1] in self.eos else generated
+            text = self.tokenizer.decode(visible_ids, skip_special_tokens=False,
+                                         clean_up_tokenization_spaces=False)
+            parsed = base.parse_completion(text, plan["tools"], stopped=response["eos"])
+            if response["eos"] and plan["payload"].get("tool_choice") == "required" and not parsed["tool_calls"]:
+                raise AdapterError("model did not produce the required function call", 502)
+            if plan["payload"].get("parallel_tool_calls") is False and len(parsed["tool_calls"]) > 1:
+                raise AdapterError("model produced multiple calls when disabled", 502)
+            request_id = "chatcmpl-" + uuid.uuid4().hex
+            for index, call in enumerate(parsed["tool_calls"]):
+                call["id"] = "call_{}_{}".format(request_id[9:], index)
+            message = dict(role="assistant", content=parsed["content"])
+            if parsed["reasoning_content"]:
+                message["reasoning_content"] = parsed["reasoning_content"]
+            if parsed["tool_calls"]:
+                message["tool_calls"] = parsed["tool_calls"]
+            normalized = base.normalize_messages(
+                plan["messages"] + [message, dict(role="user", content="")],
+                allow_images=True,
+            )[-2]
+            if list(self.tokenizer.encode(raw, add_special_tokens=False)) == generated:
+                self.records.append(dict(
+                    index=len(plan["messages"]),
+                    prefix=base.fingerprint(plan["messages"]),
+                    signature=base.assistant_signature(normalized),
+                    raw=raw,
+                    reasoning=parsed["reasoning_content"],
+                ))
+                self.records = self.records[-256:]
+            result = dict(
+                id=request_id,
+                object="chat.completion",
+                created=int(time.time()),
+                model=base.MODEL_ID,
+                choices=[dict(index=0, message=message, finish_reason=parsed["finish_reason"])],
+                usage=dict(
+                    prompt_tokens=len(actual_ids),
+                    completion_tokens=len(generated),
+                    total_tokens=len(actual_ids) + len(generated),
+                    prompt_tokens_details=dict(cached_tokens=plan["reused"]),
+                ),
+                nanoattention=dict(
+                    cache_reset=plan["reset"],
+                    reused_prefix_tokens=plan["reused"],
+                    new_prefill_tokens=len(plan["suffix"]),
+                    cache_after=response["cache_after"],
+                    prefill_seconds=prefill_seconds,
+                    decode_seconds=decode_seconds,
+                    kv_allocated_bytes=response["kv_allocated_bytes"],
+                    kv_valid_bytes=response["kv_valid_bytes"],
+                    kv_storage=response.get("kv_storage", "fp32"),
+                    speculative_batches=response.get("speculative_batches", 0),
+                    speculative_proposed=response.get("speculative_proposed", 0),
+                    speculative_accepted=response.get("speculative_accepted", 0),
+                    effective_max_tokens=plan["budget"],
+                    sampling="greedy",
+                ),
+            )
+            self.metrics.append(dict(
+                result["nanoattention"],
+                prompt_tokens=len(actual_ids),
+                completion_tokens=len(generated),
+                finish_reason=parsed["finish_reason"],
+                tool_call_count=len(parsed["tool_calls"]),
+                worker_starts=self.worker_starts,
+            ))
+            self.metrics = self.metrics[-256:]
+            return result
+        except BaseException:
+            self.failures += 1
+            self.abort()
+            raise
+        finally:
+            self.active = False
 
     def execute(self, plan):
         if self.worker is None and not self.closed:
@@ -165,7 +408,11 @@ class InklingBackend(Backend):
             except BaseException:
                 self.abort()
                 raise
-        result = super().execute(plan)
+        if plan.get("suffix_images"):
+            result = self._execute_multimodal(plan)
+        else:
+            result = super().execute(plan)
+            self.cached_images = list(plan.get("prefix_images", []))
         if self.record:
             generated = self.cached_ids[len(plan["ids"]):]
             na = result["nanoattention"]
@@ -199,6 +446,8 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="loopback only; 0 chooses a disposable port")
     parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--max-tokens", type=int, default=2048, help="server output cap, including committed EOS")
+    parser.add_argument("--max-image-tokens", type=int, default=DEFAULT_MAX_IMAGE_TOKENS,
+                        help="visual token budget per image (default: 1024)")
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--record", type=Path)
     args = parser.parse_args()
@@ -206,6 +455,8 @@ def main():
     text = config["text_config"]
     if not 0 < args.context <= text["model_max_length"] or not 0 < args.max_tokens < args.context:
         parser.error("invalid context or output cap")
+    if args.max_image_tokens <= 0:
+        parser.error("--max-image-tokens must be positive")
     if not 0 <= args.port <= 65535 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("invalid port or timeout")
     if args.engine == "native":
@@ -237,8 +488,9 @@ def main():
     eos = config["eos_token_id"]
     eos = eos if isinstance(eos, list) else [eos]
     backend = InklingBackend(tokenizer, command, args.context, eos, text["unpadded_vocab_size"], args.max_tokens,
-                             args.timeout, record=args.record)
-    server = AdapterServer(("127.0.0.1", args.port), backend, os.environ.get("NANOATTENTION_API_KEY", "local"))
+                             args.timeout, record=args.record, max_image_tokens=args.max_image_tokens, engine=args.engine)
+    server = AdapterServer(("127.0.0.1", args.port), backend, os.environ.get("NANOATTENTION_API_KEY", "local"),
+                           max_body=MAX_BODY)
     stopped = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *unused: stopped.set())

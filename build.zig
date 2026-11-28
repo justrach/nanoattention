@@ -6,6 +6,7 @@ fn addMetalSdk(b: *std.Build, module: *std.Build.Module, sdk: ?[]const u8) void 
     else
         &.{ "-std=c11", "-fno-objc-arc" };
     module.addCSourceFile(.{ .file = b.path("src/metal.m"), .flags = flags });
+    module.addCSourceFile(.{ .file = b.path("src/image.m"), .flags = flags });
     if (sdk) |dir| {
         module.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ dir, "System/Library/Frameworks" }) });
         module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ dir, "usr/lib" }) });
@@ -13,6 +14,8 @@ fn addMetalSdk(b: *std.Build, module: *std.Build.Module, sdk: ?[]const u8) void 
     }
     module.linkFramework("Foundation", .{});
     module.linkFramework("Metal", .{});
+    module.linkFramework("CoreGraphics", .{});
+    module.linkFramework("ImageIO", .{});
 }
 
 fn addSmokeExe(
@@ -42,6 +45,8 @@ fn addSmokeExe(
     }
     smoke_mod.linkFramework("Foundation", .{});
     smoke_mod.linkFramework("Metal", .{});
+    smoke_mod.linkFramework("CoreGraphics", .{});
+    smoke_mod.linkFramework("ImageIO", .{});
     return b.addExecutable(.{ .name = name, .root_module = smoke_mod });
 }
 

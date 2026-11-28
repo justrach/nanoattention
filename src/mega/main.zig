@@ -9,6 +9,7 @@ const frontend = @import("frontend.zig");
 const session = @import("session.zig");
 const bench = @import("bench.zig");
 const dflash2 = @import("dflash2.zig");
+const inkling_vision = @import("inkling_vision.zig");
 const io = @import("io.zig");
 const kv_cartridge = @import("kv_cartridge.zig");
 const Knobs = @import("knobs.zig").Knobs;
@@ -249,7 +250,15 @@ fn runMain(init: std.process.Init) !void {
     std.debug.print("nano: {s}, {d} ops, {d} states, context={d}, batch={d}, {d} mapped bytes\n", .{ loaded.program.meta.model_type, loaded.program.ops.len, loaded.program.states.len, loaded.engine.context, loaded.engine.batch, loaded.store.bytes });
     if (std.mem.eql(u8, command, "session")) {
         if (kv_in) |path| _ = try kv_cartridge.load(&loaded.engine, a, path);
-        return session.runWithDraft(&loaded.engine, gpa, draft);
+        var vision: ?inkling_vision.VisionEncoder = null;
+        const cfg_path = try std.fs.path.join(a, &.{ directory, "config.json" });
+        if (loader.readFile(a, cfg_path)) |cfg_bytes| {
+            if (inkling_vision.hasVisionConfig(a, cfg_bytes)) {
+                vision = inkling_vision.VisionEncoder.init(gpa, loaded.ctx, loaded.store, cfg_bytes) catch null;
+            }
+        } else |_| {}
+        defer if (vision) |*v| v.deinit();
+        return session.runWithVision(&loaded.engine, gpa, draft, if (vision) |*v| v else null);
     }
     if (std.mem.eql(u8, command, "bench")) return bench.runWithDraft(&loaded.engine, a, bench_input, common.knobs, draft);
     const prompt = tokens orelse return error.MissingTokens;
@@ -306,6 +315,18 @@ fn inspect(gpa: std.mem.Allocator, a: std.mem.Allocator, directory: []const u8, 
         bound += 1;
     }
     try io.print(a, "  bound {d}/{d} weights from {d} mapped bytes\n", .{ bound, program.weights.len, store.bytes });
+    if (inkling_vision.hasVisionConfig(a, config)) {
+        var vis = try inkling_vision.VisionEncoder.init(gpa, ctx, &store, config);
+        defer vis.deinit();
+        try io.print(a, "  vision: inkling2_vision layers={d} hidden={d} heads={d} patch={d} merge={d} text_hidden={d}\n", .{
+            vis.cfg.num_hidden_layers,
+            vis.cfg.hidden_size,
+            vis.cfg.num_attention_heads,
+            vis.cfg.native_patch_size,
+            vis.cfg.adapter_merge_size,
+            vis.cfg.text_hidden_size,
+        });
+    }
 }
 
 /// Prefill in chunks of the engine batch; returns with the last row's logits.
@@ -531,6 +552,7 @@ test {
     _ = @import("session.zig");
     _ = @import("kv_cartridge.zig");
     _ = @import("dflash2.zig");
+    _ = @import("inkling_vision.zig");
     _ = @import("kernel_tests.zig");
 }
 test { _ = @import("plan.zig"); }

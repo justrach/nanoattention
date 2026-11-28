@@ -400,5 +400,241 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(factory.workers[0].close_calls, [True])
 
 
+class InklingVisionAdapterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(TOOLS))
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "inkling_adapter_under_test", TOOLS / "inkling_adapter.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cls.inkling = mod
+        finally:
+            sys.path.pop(0)
+
+    def make_inkling_backend(self, outputs=("ok",), engine="native", max_image_tokens=1024):
+        IMG_TOK = self.inkling.IMAGE_TOKEN_ID
+        EOS_ID = 200006
+
+        class InklingFakeTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                assert add_special_tokens is False
+                ids = []
+                i = 0
+                marker = "<|unused_200054|>"
+                eos_tok = "<|content_model_end_sampling|>"
+                while i < len(text):
+                    if text.startswith(marker, i):
+                        ids.append(IMG_TOK)
+                        i += len(marker)
+                    elif text.startswith(eos_tok, i):
+                        ids.append(EOS_ID)
+                        i += len(eos_tok)
+                    else:
+                        ids.append(ord(text[i]))
+                        i += 1
+                return ids
+
+            def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+                out = []
+                for t in ids:
+                    if t == IMG_TOK:
+                        out.append("<|unused_200054|>")
+                    elif t == EOS_ID:
+                        out.append("<|content_model_end_sampling|>")
+                    else:
+                        out.append(chr(t))
+                return "".join(out)
+
+            def apply_chat_template(self, messages, tools=None, tokenize=False,
+                                    add_generation_prompt=True, reasoning_effort="low"):
+                assert tokenize is False
+                parts = []
+                for m in messages:
+                    role = m["role"]
+                    content = m["content"]
+                    if isinstance(content, list):
+                        for p in content:
+                            if p["type"] == "image_url":
+                                parts.append(f"<|message_{role}|><|content_image|><|unused_200054|><|end_message|>")
+                            else:
+                                parts.append(f"<|message_{role}|><|content_text|>{p['text']}<|end_message|>")
+                    elif role == "assistant":
+                        parts.append(f"<|message_model|><|content_text|>{content}<|end_message|><|content_model_end_sampling|>")
+                    else:
+                        parts.append(f"<|message_{role}|><|content_text|>{content}<|end_message|>")
+                return "".join(parts)
+
+        class VisionFakeWorker:
+            def __init__(self, outs):
+                self.outs = list(outs)
+                self.requests = []
+                self.cache = []
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def request(self, req):
+                self.requests.append(copy.deepcopy(req))
+                if req["reset"]:
+                    self.cache = []
+                before = len(self.cache)
+                tokens = list(req["tokens"])
+                images = req.get("images") or []
+                counts = None
+                if images:
+                    # Simulate 4 visual tokens per image (2 for low detail budget <= 256)
+                    per_img = 2 if req.get("max_image_tokens", 1024) <= 256 else 4
+                    counts = [per_img] * len(images)
+                    expanded = []
+                    for t in tokens:
+                        if t == IMG_TOK:
+                            expanded.extend([IMG_TOK] * per_img)
+                        else:
+                            expanded.append(t)
+                    tokens = expanded
+                if req["id"] == 0:
+                    generated = [ord("w")]
+                elif req["max_tokens"]:
+                    reply = "<|message_model|><|content_text|>" + self.outs.pop(0) + "<|end_message|>"
+                    generated = tok.encode(reply) + [EOS_ID]
+                    generated = generated[:req["max_tokens"]]
+                else:
+                    generated = []
+                self.cache.extend(tokens + generated)
+                return dict(
+                    id=req["id"],
+                    tokens=generated,
+                    cache_before=before,
+                    cache_after=len(self.cache),
+                    prefill_tokens=len(tokens),
+                    decode_forward_tokens=len(generated),
+                    reused_prefix_tokens=before,
+                    eos=bool(generated and generated[-1] == EOS_ID),
+                    prefill_seconds=0.1,
+                    decode_seconds=0.1 if generated else 0.0,
+                    kv_allocated_bytes=8192 * 8,
+                    kv_valid_bytes=len(self.cache) * 8,
+                    image_token_counts=counts,
+                )
+
+            def close(self, graceful=True):
+                self.closed = True
+
+        tok = InklingFakeTokenizer()
+        workers = []
+
+        def factory(command, timeout):
+            w = VisionFakeWorker(outputs)
+            workers.append(w)
+            return w
+
+        backend = self.inkling.InklingBackend(
+            tok, ["fake-nano"], 4096, [EOS_ID], 201024, 512, 5,
+            worker_factory=factory, max_image_tokens=max_image_tokens, engine=engine,
+        )
+        self.addCleanup(backend.close)
+        return backend, workers
+
+    def test_multimodal_validation_accepts_openai_parts_and_rejects_bad_inputs(self):
+        data_uri = "data:image/png;base64,iVBORw0KGgo="
+        msgs = adapter.normalize_messages([
+            dict(role="user", content=[
+                dict(type="text", text="what is this?"),
+                dict(type="image_url", image_url=dict(url=data_uri, detail="low")),
+                dict(type="input_image", image_url="https://example.com/a.png"),
+                dict(type="image", image="file:///tmp/x.jpg"),
+            ]),
+        ], allow_images=True)
+        self.assertEqual(len(msgs[0]["content"]), 4)
+        self.assertEqual(msgs[0]["content"][1]["image_url"]["detail"], "low")
+        self.assertEqual(msgs[0]["content"][2]["image_url"]["url"], "https://example.com/a.png")
+        self.assertEqual(msgs[0]["content"][3]["image_url"]["url"], "file:///tmp/x.jpg")
+
+        # Tool messages may also include images (matching chat_template.jinja)
+        tool_msgs = adapter.normalize_messages([
+            dict(role="user", content="snap"),
+            dict(role="tool", tool_call_id="call_1", content=[
+                dict(type="image_url", image_url=dict(url=data_uri)),
+            ]),
+        ], allow_images=True)
+        self.assertEqual(tool_msgs[1]["content"][0]["type"], "image_url")
+
+        # System/assistant images, non-base64 data URI, javascript scheme, and text-only Flint reject
+        for bad in (
+            [dict(role="system", content=[dict(type="image_url", image_url=dict(url=data_uri))]),
+             dict(role="user", content="hi")],
+            [dict(role="user", content=[dict(type="image_url", image_url=dict(url="javascript:alert(1)"))])],
+            [dict(role="user", content=[dict(type="image_url", image_url=dict(url="data:image/png,raw"))])],
+            [dict(role="user", content=[dict(type="image_url", image_url=dict(url=data_uri, detail="ultra"))])],
+        ):
+            with self.assertRaises(adapter.AdapterError):
+                adapter.normalize_messages(bad, allow_images=True)
+        with self.assertRaises(adapter.AdapterError):
+            adapter.normalize_messages([dict(role="user", content=[dict(type="image_url", image_url=dict(url=data_uri))])],
+                                       allow_images=False)
+
+    def test_inkling_adapter_image_turn_kv_reuse_and_invalidation(self):
+        img_a = "data:image/png;base64,AAAA"
+        img_b = "data:image/png;base64,BBBB"
+        backend, workers = self.make_inkling_backend(outputs=["red pixel", "still red", "blue pixel"])
+
+        # Turn 1: image A with detail=low -> max_image_tokens=256, 2 visual tokens expanded
+        p1 = dict(model="flint", max_tokens=128, messages=[
+            dict(role="user", content=[
+                dict(type="image_url", image_url=dict(url=img_a, detail="low")),
+                dict(type="text", text="color?"),
+            ]),
+        ])
+        r1 = backend.complete(p1)
+        self.assertEqual(r1["choices"][0]["message"]["content"], "red pixel")
+        worker = workers[0]
+        # requests[0] is warm-up, requests[1] is Turn 1
+        req1 = worker.requests[1]
+        self.assertEqual(req1["images"], [img_a])
+        self.assertEqual(req1["max_image_tokens"], 256)
+        self.assertEqual(r1["usage"]["prompt_tokens"], len(req1["tokens"]) + 1)  # 1 placeholder -> 2 visual tokens
+        cached_after_t1 = len(backend.cached_ids)
+
+        # Turn 2: follow-up text referencing same Turn 1 image A -> 100% KV cache hit, no images re-sent
+        p2 = dict(model="flint", max_tokens=128, messages=p1["messages"] + [
+            r1["choices"][0]["message"],
+            dict(role="user", content="sure?"),
+        ])
+        r2 = backend.complete(p2)
+        self.assertEqual(r2["choices"][0]["message"]["content"], "still red")
+        req2 = worker.requests[2]
+        self.assertFalse(req2["reset"])
+        self.assertNotIn("images", req2)
+        self.assertEqual(r2["usage"]["prompt_tokens_details"]["cached_tokens"], cached_after_t1)
+
+        # Turn 3: swap image A for image B (same visual token count!) -> MUST invalidate KV cache
+        p3 = dict(model="flint", max_tokens=128, messages=[
+            dict(role="user", content=[
+                dict(type="image_url", image_url=dict(url=img_b, detail="high")),
+                dict(type="text", text="color?"),
+            ]),
+        ])
+        r3 = backend.complete(p3)
+        self.assertEqual(r3["choices"][0]["message"]["content"], "blue pixel")
+        req3 = worker.requests[3]
+        self.assertTrue(req3["reset"])
+        self.assertEqual(req3["images"], [img_b])
+        self.assertEqual(req3["max_image_tokens"], 1024)
+        self.assertEqual(r3["usage"]["prompt_tokens_details"]["cached_tokens"], 0)
+
+    def test_inkling_adapter_mlx_engine_rejects_images(self):
+        backend, _ = self.make_inkling_backend(engine="mlx")
+        with self.assertRaises(self.inkling.AdapterError) as ctx:
+            backend.complete(dict(model="flint", max_tokens=32, messages=[
+                dict(role="user", content=[
+                    dict(type="image_url", image_url=dict(url="https://example.com/pic.png")),
+                ]),
+            ]))
+        self.assertEqual(ctx.exception.status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

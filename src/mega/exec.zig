@@ -44,6 +44,61 @@ pub const Capture = struct {
     dst_row0: u32 = 0,
 };
 
+/// Optional multimodal embedding override scattered onto post-embed_norm (trace 0)
+/// rows during prefill.
+pub const EmbedOverride = struct {
+    buffer: metal.Buffer,
+    /// T x i32: -1 keeps text embedding; >= 0 copies that row from `buffer`.
+    row_map: metal.Buffer,
+    width: u32,
+};
+
+/// Chunk-aware multimodal prefill helper: binds visual embeddings to `token_id`
+/// positions across chunked `Engine.forward` calls.
+pub const VisionStream = struct {
+    buffer: metal.Buffer,
+    width: u32,
+    total_tokens: u32,
+    token_id: u32,
+    cursor: u32 = 0,
+    row_map_buf: metal.Buffer,
+
+    pub fn init(ctx: metal.Context, batch: u32, buffer: metal.Buffer, width: u32, total_tokens: u32, token_id: u32) !VisionStream {
+        return .{
+            .buffer = buffer,
+            .width = width,
+            .total_tokens = total_tokens,
+            .token_id = token_id,
+            .row_map_buf = try ctx.alloc(batch),
+        };
+    }
+
+    pub fn deinit(self: *VisionStream) void {
+        self.row_map_buf.deinit();
+    }
+
+    pub fn prepareChunk(self: *VisionStream, chunk: []const u32) !?EmbedOverride {
+        const map = self.row_map_buf.structs(i32);
+        var has_img = false;
+        for (chunk, 0..) |t, r| {
+            if (t == self.token_id) {
+                if (self.cursor >= self.total_tokens) return error.VisionTokenCountMismatch;
+                map[r] = @intCast(self.cursor);
+                self.cursor += 1;
+                has_img = true;
+            } else {
+                map[r] = -1;
+            }
+        }
+        if (!has_img) return null;
+        return .{ .buffer = self.buffer, .row_map = self.row_map_buf, .width = self.width };
+    }
+
+    pub fn finish(self: *const VisionStream) !void {
+        if (self.cursor != self.total_tokens) return error.VisionTokenCountMismatch;
+    }
+};
+
 /// prefill objective (prefill search): which input rows `Engine.prep` holds.
 pub const PrepKey = struct { state: u32, col: u32, width: u32, row0: u32, rows: u32 };
 
@@ -131,6 +186,8 @@ pub const Engine = struct {
     tap: ?*Tap = null,
     /// Optional hidden-state capture for speculative draft execution.
     capture: ?*const Capture = null,
+    /// Optional multimodal embedding override scattered right after embed_norm (trace 0).
+    embed_override: ?*const EmbedOverride = null,
     /// knobs.relative_bias16: the distance-bias states one grouped projection writes
     /// and one staged-tile attention reads, and the rows of the one written 16-bit
     /// in this forward until its attention has read them.
@@ -1085,11 +1142,16 @@ pub const Engine = struct {
             const slots: u32 = @intCast(cap.trace_indices.len + @intFromBool(cap.include_final_norm));
             if (@as(u64, slots) * cap.width > cap.stride) return error.InvalidCaptureStride;
         }
+        if (self.embed_override) |ov| {
+            if (self.program.traces.len == 0) return error.MissingEmbedTrace;
+            if (ov.width != self.program.traces[0].view.width) return error.InvalidEmbedOverrideWidth;
+            if (ov.row_map.len < @as(usize, T) * @sizeOf(i32)) return error.InvalidEmbedOverrideMap;
+        }
         errdefer self.failed = true;
         // decode climb 2 (knob d2_gate): single-row forwards with logits go gated;
         // anything else first settles a forward waiting at the gate.
         if (self.d2_gate_buf != null) {
-            if (T == 1 and out_first == 0 and trace == null and self.tap == null and self.capture == null) return d2GatedForward(self, tokens[0]);
+            if (T == 1 and out_first == 0 and trace == null and self.tap == null and self.capture == null and self.embed_override == null) return d2GatedForward(self, tokens[0]);
             try self.d2Settle();
             self.d2_last = null;
         }
@@ -1113,6 +1175,7 @@ pub const Engine = struct {
         self.inline_bias = null;
         self.force_barrier = false;
         var skipped_barrier = false;
+        var embed_override_done = false;
         for (self.steps, 0..) |step, step_i| {
             const first = step.first();
             const head = first >= (if (trace != null) self.program.head_start else self.head_start);
@@ -1184,6 +1247,26 @@ pub const Engine = struct {
                 }
             }
             const end = first + step.len();
+            if (self.embed_override) |ov| {
+                if (!embed_override_done and self.program.traces[0].after_op < end) {
+                    embed_override_done = true;
+                    self.ctx.nano_dispatch_flags = null;
+                    const v = self.program.traces[0].view;
+                    const dst = self.words(v);
+                    var sp: gpu.Params = .{
+                        .rows = T,
+                        .row0 = 0,
+                        .x = 0,
+                        .xs = ov.width,
+                        .y = dst.off,
+                        .ys = dst.stride,
+                        .n = ov.width,
+                        .flags = gpu.flag_round_out,
+                    };
+                    try gpu.dispatch(self.ctx, "mk_scatter_embeds", &.{ self.arena, ov.buffer, ov.row_map }, &sp, @as(usize, T) * ov.width, 256);
+                    self.force_barrier = true;
+                }
+            }
             if (self.tap) |tap| try self.tapStep(tap, step, T);
             if (trace) |t| while (next_trace < self.program.traces.len and self.program.traces[next_trace].after_op < end) : (next_trace += 1) {
                 try self.ctx.finish();

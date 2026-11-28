@@ -9,8 +9,8 @@ bundling model assets.
 
 The repository contains no Rust/CUDA implementation files or Rust/CUDA build
 dependencies from the earlier workspace. `build.zig` compiles local Zig entry
-points and `src/metal.m`, links the macOS Foundation/Metal frameworks, and checks
-the local Lean-generated bindings. Native checkpoint loading, model scheduling,
+points, `src/metal.m`, and `src/image.m`, links the Apple Foundation/Metal/CoreGraphics/ImageIO
+frameworks, and checks the local Lean-generated bindings. Native checkpoint loading, model scheduling,
 KV ownership, protocol adapters, proofs, tests and tuning tools are kept here.
 
 ## Licensing boundaries
